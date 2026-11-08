@@ -16,6 +16,30 @@
       "created_at": "2026-11-08T01:53:44.502Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "df7d8428-bf18-480c-9803-ad775a5331f5",
+      "role": "agent",
+      "content": "**Yes, you can!** And I have just added a **1-tap `🔞 18+ Off / On` toggle button** with an **18+ Age Verification prompt** right at the top of your app and saved your changes.\n\n### How the 18+ Toggle & Age Verification Works\n1. **Top Header Toggle Button (`🔞 18+ Off` / `🔞 18+ On`):**\n   - Look in the top-right corner of the app header in [index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L33-L46) (next to the `📲` install icon).\n   - When it says **`🔞 18+ Off`**, tapping it opens the **18+ Adult Content Verification** prompt ([`openAgeGateModal`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L881-L884)) asking if you are **18 years of age or older** and want to enable 18+ adult video content.\n   - Tapping **\"✅ Yes, I'm 18+ — Enable Adult Content\"** ([`setAdultContentEnabled`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L892-L902)) switches the button to a highlighted **`🔞 18+ On`** state and unlocks 18+ results across the app.\n   - Tapping **`🔞 18+ On`** again at any time immediately turns 18+ content **Off** (back to Safe Mode) with a single tap.\n2. **Synced with Settings:**\n   - The **18+ Adult Content Filter** switch in the **Sources** tab ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L380-L390)) stays in sync with the top header button ([`syncAgeGateUI`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L867-L879)) and also asks for 18+ confirmation before turning on.\n\n### How to Watch & Pull Adult Videos When `🔞 18+ On` Is Active\n* **Quick Search & Multi-Engine Search:** Searching keywords on the **Player** or **Search Web** tab will now include 18+ video results from **Reddit** (`include_over_18=1`), **Internet Archive** (adult collections unlocked), **PeerTube (SepiaSearch)** (`nsfw=both`), **Mastodon**, and **Lemmy**.\n* **Custom Subreddits & Topics:** In the **Sources** tab, you can add any 18+ subreddit or keyword topic so **Shuffle Random** and **Fullscreen Swipe (Reels) Mode** pull directly from them.\n* **Webpage Video Scanner & Safari Bookmarklet:** You can also paste direct video links or use the **\"Send to ReelVault\"** Safari bookmarklet on webpages with downloadable video streams (`.mp4`, `.webm`, `.mov`, `.m3u8`, `.gifv`, etc.).",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "23ac82f8-ee2c-45df-8ee8-e200edfd4534",
+      "created_at": "2026-11-08T01:58:06.846Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "153590bf-1547-415f-ab31-dafc10e56312",
+      "role": "user",
+      "content": "Don’t certain video websites that use like .m3u8 content put the content in little snippets so it makes it hard to capture? How did you get around that?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T02:00:19.981Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }

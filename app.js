@@ -559,6 +559,142 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
   return new Blob([blob], { type: mimeType || blob.type || 'video/mp4' });
 }
 
+// Parse an HLS .m3u8 manifest (Master Playlist or Media Segment Playlist)
+function parseM3u8Manifest(manifestText, baseUrl) {
+  if (!manifestText || typeof manifestText !== 'string') {
+    return { type: 'invalid', variants: [], preferredVariantUrl: null, initSegmentUrl: null, segments: [] };
+  }
+
+  const lines = manifestText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const resolveUrl = (rawUri) => {
+    try {
+      return new URL(rawUri, baseUrl).href;
+    } catch {
+      return rawUri;
+    }
+  };
+
+  // 1. Check if this is a Master Playlist (#EXT-X-STREAM-INF)
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+      const infoLine = lines[i];
+      const bwMatch = infoLine.match(/BANDWIDTH=(\d+)/i);
+      const bandwidth = bwMatch ? Number(bwMatch[1]) : 0;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (!lines[j].startsWith('#')) {
+          variants.push({
+            url: resolveUrl(lines[j]),
+            bandwidth
+          });
+          i = j;
+          break;
+        }
+      }
+    }
+  }
+
+  if (variants.length > 0) {
+    const sorted = [...variants].sort((a, b) => b.bandwidth - a.bandwidth);
+    const preferred = sorted.find((v) => v.bandwidth > 0 && v.bandwidth <= 6_000_000) || sorted[0];
+    return {
+      type: 'master',
+      variants: sorted,
+      preferredVariantUrl: preferred.url,
+      initSegmentUrl: null,
+      segments: []
+    };
+  }
+
+  // 2. Media Playlist: extract optional #EXT-X-MAP init header (fMP4) + all segment URLs (.ts / .m4s / .mp4)
+  let initSegmentUrl = null;
+  const segments = [];
+
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-MAP:')) {
+      const uriMatch = line.match(/URI=["']([^"']+)["']/i);
+      if (uriMatch?.[1]) {
+        initSegmentUrl = resolveUrl(uriMatch[1]);
+      }
+      continue;
+    }
+    if (!line.startsWith('#')) {
+      segments.push(resolveUrl(line));
+    }
+  }
+
+  return {
+    type: 'media',
+    variants: [],
+    preferredVariantUrl: null,
+    initSegmentUrl,
+    segments
+  };
+}
+
+// Crawl an HLS .m3u8 playlist, download its .ts / .m4s snippets in batches, and stitch them into a single binary Blob
+async function downloadAndAssembleM3u8Stream(m3u8Url, onProgress) {
+  onProgress?.('Reading .M3U8 stream manifest...', 5, '5%');
+  const masterText = await fetchWithCorsFallback(m3u8Url, true);
+  let parsed = parseM3u8Manifest(masterText, m3u8Url);
+
+  if (parsed.type === 'master' && parsed.preferredVariantUrl) {
+    onProgress?.('Selecting best .M3U8 quality stream...', 10, '10%');
+    const variantText = await fetchWithCorsFallback(parsed.preferredVariantUrl, true);
+    parsed = parseM3u8Manifest(variantText, parsed.preferredVariantUrl);
+  }
+
+  const segmentUrls = [
+    ...(parsed.initSegmentUrl ? [parsed.initSegmentUrl] : []),
+    ...parsed.segments.slice(0, 80)
+  ];
+
+  if (segmentUrls.length === 0) {
+    throw new Error('No downloadable segments found in .m3u8 manifest');
+  }
+
+  const total = segmentUrls.length;
+  const orderedBuffers = new Array(total);
+  let completed = 0;
+  const BATCH_SIZE = 4;
+
+  for (let start = 0; start < total; start += BATCH_SIZE) {
+    const slice = segmentUrls.slice(start, start + BATCH_SIZE);
+    await Promise.all(
+      slice.map(async (segUrl, offset) => {
+        const idx = start + offset;
+        const segBlob = await fetchVideoBlobWithProgress(segUrl, 'video/mp2t', null);
+        orderedBuffers[idx] = new Uint8Array(await segBlob.arrayBuffer());
+        completed++;
+        const pct = Math.min(85, Math.max(12, Math.round(12 + (completed / total) * 73)));
+        onProgress?.(`Stitching .M3U8 snippet ${completed} of ${total}...`, pct, `${pct}%`);
+      })
+    );
+  }
+
+  const totalBytes = orderedBuffers.reduce((sum, arr) => sum + (arr ? arr.byteLength : 0), 0);
+  const stitched = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const buf of orderedBuffers) {
+    if (buf) {
+      stitched.set(buf, offset);
+      offset += buf.byteLength;
+    }
+  }
+
+  const firstSeg = (parsed.segments[0] || '').toLowerCase();
+  const isFmp4 = Boolean(parsed.initSegmentUrl || firstSeg.includes('.m4s') || firstSeg.includes('.mp4'));
+  return {
+    blob: new Blob([stitched], { type: isFmp4 ? 'video/mp4' : 'video/mp2t' }),
+    ext: isFmp4 ? 'mp4' : 'ts',
+    mime: isFmp4 ? 'video/mp4' : 'video/mp2t'
+  };
+}
+
 // Unified pipeline: takes any videoItem and returns { blob, ext, mime, wasConverted } ready for iPhone
 async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false, onProgress = null) {
   if (!videoItem || typeof videoItem !== 'object') {
@@ -612,15 +748,24 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
     }
   }
 
-  // 3. Download the primary file
-  const rawBlob = await fetchVideoBlobWithProgress(
-    videoItem.videoUrl,
-    fmtInfo.mime,
-    onProgress,
-    `Downloading .${fmtInfo.label} video...`
-  );
+  // 3. Download the primary file (or crawl & stitch snippets if it is an HLS .m3u8 playlist)
+  let rawBlob = null;
+  let effectiveInputExt = fmtInfo.ext;
 
-  if (!shouldConvert) {
+  if (fmtInfo.ext === 'm3u8') {
+    const assembled = await downloadAndAssembleM3u8Stream(videoItem.videoUrl, onProgress);
+    rawBlob = assembled.blob;
+    effectiveInputExt = assembled.ext;
+  } else {
+    rawBlob = await fetchVideoBlobWithProgress(
+      videoItem.videoUrl,
+      fmtInfo.mime,
+      onProgress,
+      `Downloading .${fmtInfo.label} video...`
+    );
+  }
+
+  if (!shouldConvert && fmtInfo.ext !== 'm3u8') {
     return {
       blob: rawBlob,
       ext: fmtInfo.ext === 'gifv' ? 'mp4' : fmtInfo.ext,
@@ -632,7 +777,7 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
   // 4. On-device conversion to .mp4 (FFmpeg.wasm -> Native iOS MediaRecorder fallback)
   let mp4Blob = null;
   try {
-    mp4Blob = await transcodeBlobWithFfmpegWasm(rawBlob, fmtInfo.ext, (msg, pct) => {
+    mp4Blob = await transcodeBlobWithFfmpegWasm(rawBlob, effectiveInputExt, (msg, pct) => {
       onProgress?.(msg, pct, `${pct}%`);
     });
   } catch {
@@ -2767,6 +2912,8 @@ if (typeof module !== 'undefined' && module.exports) {
     needsMp4Conversion,
     encodeArchiveFilePath,
     extractRedditVideosFromListing,
+    parseM3u8Manifest,
+    downloadAndAssembleM3u8Stream,
     escapeHtml,
     obtainIphoneReadyVideoBlob,
     setPlayerLoading,
