@@ -31,6 +31,15 @@
         </div>
       </div>
       <div class="header-actions">
+        <button
+          id="ageGateToggleBtn"
+          type="button"
+          class="age-toggle-btn"
+          aria-pressed="false"
+          title="Toggle 18+ Adult Content"
+        >
+          🔞 18+ Off
+        </button>
         <button id="installGuideBtn" class="icon-btn" title="Install on iPhone" aria-label="Install on iPhone">
           📲
         </button>
@@ -372,8 +381,8 @@
           </div>
           <div class="setting-row">
             <div>
-              <strong>Include 18+ Results in Custom Searches</strong>
-              <p class="setting-sub">Allow unfiltered search results when querying custom keywords or subreddits on your device.</p>
+              <strong>18+ Adult Content Filter</strong>
+              <p class="setting-sub">Ask for 18+ age verification and allow unfiltered adult videos in searches, random pulls, and custom sources.</p>
             </div>
             <label class="switch">
               <input type="checkbox" id="allowNsfwToggle" />
@@ -441,6 +450,30 @@
 
   <!-- Toast Notification -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- 18+ Age Verification Modal -->
+  <div id="ageGateModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="ageGateModalTitle">
+    <div class="modal-sheet age-gate-sheet">
+      <div class="modal-header">
+        <h3 id="ageGateModalTitle">🔞 18+ Adult Content Verification</h3>
+        <button id="closeAgeGateModalBtn" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="age-gate-text">
+        Are you <strong>18 years of age or older</strong>, and do you want to enable 18+ adult video content in your searches, random video pulls, and custom sources?
+      </p>
+      <div class="install-tip age-gate-note">
+        🔒 Your choice is saved privately on your iPhone. You can turn 18+ content off anytime with 1 tap using the <strong>🔞 18+</strong> toggle button in the top bar.
+      </div>
+      <div class="age-gate-actions">
+        <button id="confirmAgeGateBtn" type="button" class="btn-age-confirm">
+          ✅ Yes, I'm 18+ — Enable Adult Content
+        </button>
+        <button id="cancelAgeGateBtn" type="button" class="btn-secondary">
+          No, Keep 18+ Content Off
+        </button>
+      </div>
+    </div>
+  </div>
 
   <!-- iPhone Install Guide Modal -->
   <div id="installModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="installModalTitle">

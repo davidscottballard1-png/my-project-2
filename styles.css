@@ -76,6 +76,35 @@ html, body {
   color: var(--text-muted);
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.age-toggle-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  height: 36px;
+  padding: 0 11px;
+  border-radius: 10px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.age-toggle-btn.active {
+  background: rgba(236, 72, 153, 0.22);
+  border-color: rgba(236, 72, 153, 0.55);
+  color: #f9a8d4;
+  box-shadow: 0 0 14px rgba(236, 72, 153, 0.28);
+}
+
 .icon-btn {
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
@@ -1012,4 +1041,30 @@ input:checked + .slider:before {
   font-size: 0.82rem;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+.age-gate-text {
+  font-size: 0.92rem;
+  line-height: 1.45;
+  color: var(--text-main);
+}
+
+.age-gate-note {
+  border-left-color: var(--accent-pink);
+}
+
+.age-gate-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.btn-age-confirm {
+  background: linear-gradient(135deg, #ec4899, #ef4444);
+  color: #fff;
+  font-weight: 700;
+  padding: 13px 16px;
+  border-radius: 12px;
+  font-size: 0.95rem;
+  box-shadow: 0 4px 16px rgba(236, 72, 153, 0.35);
 }

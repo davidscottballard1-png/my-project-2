@@ -864,6 +864,43 @@ function updateHeaderSummary() {
   }
 }
 
+function syncAgeGateUI() {
+  const isAllowed = Boolean(settings.allowNsfw);
+  const headerBtn = document.getElementById('ageGateToggleBtn');
+  if (headerBtn) {
+    headerBtn.textContent = isAllowed ? '🔞 18+ On' : '🔞 18+ Off';
+    headerBtn.classList.toggle('active', isAllowed);
+    headerBtn.setAttribute?.('aria-pressed', isAllowed ? 'true' : 'false');
+  }
+  const nsfwToggle = document.getElementById('allowNsfwToggle');
+  if (nsfwToggle) {
+    nsfwToggle.checked = isAllowed;
+  }
+}
+
+function openAgeGateModal() {
+  const modal = document.getElementById('ageGateModal');
+  modal?.classList.remove('hidden');
+}
+
+function closeAgeGateModal() {
+  const modal = document.getElementById('ageGateModal');
+  modal?.classList.add('hidden');
+  syncAgeGateUI();
+}
+
+function setAdultContentEnabled(enabled) {
+  settings.allowNsfw = Boolean(enabled);
+  sourcePoolCache.clear();
+  saveSettings();
+  syncAgeGateUI();
+  showToast(
+    settings.allowNsfw
+      ? '🔞 18+ Adult Content Enabled'
+      : '🔒 18+ Adult Content Disabled (Safe Mode)'
+  );
+}
+
 // Fast fetch helper with timeout
 async function fetchWithTimeout(url, timeoutMs = 4500) {
   const controller = new AbortController();
@@ -1099,9 +1136,10 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       mediaPost?.media?.reddit_video?.hls_url ||
       null;
 
-    if (!rawVideoUrl && typeof mediaPost.url === 'string') {
-      if (DIRECT_VIDEO_URL_REGEX.test(mediaPost.url)) {
-        rawVideoUrl = mediaPost.url;
+    const candidateDirectUrl = mediaPost.url_overridden_by_dest || mediaPost.url;
+    if (!rawVideoUrl && typeof candidateDirectUrl === 'string') {
+      if (DIRECT_VIDEO_URL_REGEX.test(candidateDirectUrl)) {
+        rawVideoUrl = candidateDirectUrl;
       }
     }
 
@@ -1132,9 +1170,10 @@ function extractRedditVideosFromListing(json, sourceLabel) {
 
 async function fetchSubredditVideos(subreddit) {
   const cleanSub = subreddit.replace(/^\/?r\//i, '').trim();
+  const nsfwFlag = settings.allowNsfw ? '1' : '0';
   const sorts = ['hot', 'top', 'new'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
-  const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&raw_json=1`;
+  const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`;
 
   const json = await fetchWithCorsFallback(url, false);
   return extractRedditVideosFromListing(json, `r/${cleanSub}`);
@@ -2202,6 +2241,7 @@ if (typeof document !== 'undefined') {
   const offlineVaultToggle = document.getElementById('offlineVaultToggle');
 
   if (nsfwToggle) nsfwToggle.checked = Boolean(settings.allowNsfw);
+  syncAgeGateUI();
   if (autoPlayToggle) autoPlayToggle.checked = Boolean(settings.autoPlay);
   if (formatModeSelect) formatModeSelect.value = settings.formatMode || 'all';
   if (autoConvertToggle) autoConvertToggle.checked = settings.autoConvert !== false;
@@ -2597,10 +2637,36 @@ if (typeof document !== 'undefined') {
     );
   });
 
+  // 18+ Age Verification Toggle Button (Top Header) & Settings Switch
+  document.getElementById('ageGateToggleBtn')?.addEventListener('click', () => {
+    if (settings.allowNsfw) {
+      setAdultContentEnabled(false);
+    } else {
+      openAgeGateModal();
+    }
+  });
+
   nsfwToggle?.addEventListener('change', () => {
-    settings.allowNsfw = nsfwToggle.checked;
-    saveSettings();
-    showToast(settings.allowNsfw ? '18+ search filter enabled' : '18+ search filter disabled');
+    if (nsfwToggle.checked) {
+      nsfwToggle.checked = false;
+      openAgeGateModal();
+    } else {
+      setAdultContentEnabled(false);
+    }
+  });
+
+  document.getElementById('confirmAgeGateBtn')?.addEventListener('click', () => {
+    setAdultContentEnabled(true);
+    closeAgeGateModal();
+  });
+
+  document.getElementById('cancelAgeGateBtn')?.addEventListener('click', () => {
+    setAdultContentEnabled(false);
+    closeAgeGateModal();
+  });
+
+  document.getElementById('closeAgeGateModalBtn')?.addEventListener('click', () => {
+    closeAgeGateModal();
   });
 
   autoPlayToggle?.addEventListener('change', () => {
@@ -2631,6 +2697,7 @@ if (typeof document !== 'undefined') {
     seenUrls.clear();
     saveSources();
     saveSettings();
+    syncAgeGateUI();
     renderSourcesList();
     updatePlayerUI();
     showToast('Reset to default sources & settings');
@@ -2721,6 +2788,10 @@ if (typeof module !== 'undefined' && module.exports) {
     saveSettings,
     initBookmarkletAndUrlParams,
     updateHeaderSummary,
+    syncAgeGateUI,
+    openAgeGateModal,
+    closeAgeGateModal,
+    setAdultContentEnabled,
     showToast,
     getAppState: () => ({
       sources,

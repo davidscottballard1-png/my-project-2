@@ -10,6 +10,7 @@
 * **🎲 1-Tap Random Video Shuffle & Batch Pull:** Pull a random video (or a batch of 5 at once) from your active sources, or swipe left/right on the player to move through your queue.
 * **🔗 Multi-Format Webpage Video Scanner + Safari Bookmarklet:** Paste any webpage link or install the 1-tap **"Send to ReelVault" Safari Bookmarklet** (`?scan=`) to extract downloadable videos from any page you're browsing on your iPhone.
 * **🎛 Custom Sources Manager:** Add your own custom **Keywords/Topics**, **Subreddits**, or **Direct/JSON Feed URLs**. Toggle any source ON or OFF anytime. All custom sources are stored privately in your iPhone's local storage.
+* **🔞 1-Tap 18+ Content Toggle & Age Verification Prompt:** Tap the **`🔞 18+ Off / On`** button in the top header bar (or in Settings) to open an 18+ age verification prompt and unlock or block 18+ content across Reddit, Internet Archive, PeerTube, Mastodon, and Lemmy.
 * **📲 Save Straight to iPhone Photos or Files:** Uses the iOS Web Share API (`navigator.share`) so tapping **Save to iPhone** opens the native iOS sheet where you can tap **"Save Video"** (saves straight to your Camera Roll) or **"Save to Files"**.
 * **📥 True Offline Vault (`IndexedDB`):** Caches actual converted `.mp4` video files inside your iPhone's local `IndexedDB` storage for 100% offline Airplane-Mode playback.
 

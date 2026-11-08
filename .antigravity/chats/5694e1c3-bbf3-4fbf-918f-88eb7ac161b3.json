@@ -3,6 +3,19 @@
   "name": "So can I use my app",
   "createdAt": "2026-11-08T01:53:42.327Z",
   "filename": "5694e1c3-bbf3-4fbf-918f-88eb7ac161b3.json",
-  "geminiStarted": false,
-  "messages": []
+  "geminiStarted": true,
+  "messages": [
+    {
+      "id": "23ac82f8-ee2c-45df-8ee8-e200edfd4534",
+      "role": "user",
+      "content": "So can I use my app to watch adult videos? If so can we add a button that can be toggled to ask if your 18 and want that content or not?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:53:44.502Z",
+      "sender": "ios",
+      "is_cancelled": false
+    }
+  ]
 }
