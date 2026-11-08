@@ -6,6 +6,9 @@ const {
   STORAGE_KEYS,
   settings,
   extractRedditVideosFromListing,
+  searchRedditVideosByKeyword,
+  searchRedgifsVideos,
+  searchWikimediaVideos,
   extractVideoUrlsFromHtml,
   searchFreeTubeSites,
   searchInternetArchive,
@@ -902,9 +905,133 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         settings.autoConvert = origAutoConvert;
       }
     });
+
+    it('should find creator/subreddit videos on Reddit even when title search returns empty, and fallback on RedGIFs & Wikimedia', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origFormatMode = settings.formatMode;
+      const origDuration = settings.tubeDurationFilter;
+
+      settings.allowNsfw = true;
+      settings.formatMode = 'mp4';
+      settings.tubeDurationFilter = 'long';
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        // 1. Reddit global search returns empty, but u/Jaybbgirl/submitted.json has a video post
+        if (u.includes('reddit.com/search.json')) {
+          return { ok: true, json: async () => ({ data: { children: [] } }) };
+        }
+        if (u.includes('reddit.com/r/Jaybbgirl/')) {
+          return { ok: true, json: async () => ({ data: { children: [] } }) };
+        }
+        if (u.includes('reddit.com/user/Jaybbgirl/submitted.json')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: 'u1',
+                      title: 'Creator Profile Clip',
+                      over_18: true,
+                      permalink: '/r/u_Jaybbgirl/comments/u1',
+                      media_metadata: {
+                        g1: { s: { mp4: 'https://i.redd.it/gallery_clip.mp4?a=1&amp;b=2' } }
+                      }
+                    }
+                  }
+                ]
+              }
+            })
+          };
+        }
+
+        // 2. RedGIFs trending search returns empty, but order=best returns a clip
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=trending')) {
+          return { ok: true, json: async () => ({ gifs: [] }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=best')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'nicheclip1',
+                  duration: 19,
+                  tags: ['Niche', 'Creator'],
+                  urls: { hd: 'https://thumbs4.redgifs.com/NicheClip1.mp4' }
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('api.redgifs.com/v2/users/')) {
+          return { ok: true, json: async () => ({ gifs: [] }) };
+        }
+
+        // 3. Wikimedia returns a .webm original with a server-transcoded .mp4 derivative while formatMode === 'mp4'
+        if (u.includes('commons.wikimedia.org/w/api.php')) {
+          return {
+            ok: true,
+            json: async () => ({
+              query: {
+                pages: {
+                  101: {
+                    pageid: 101,
+                    title: 'File:Ocean_Wave.webm',
+                    videoinfo: [
+                      {
+                        url: 'https://upload.wikimedia.org/wikipedia/commons/a/ab/Ocean_Wave.webm',
+                        derivatives: [
+                          {
+                            src: 'https://upload.wikimedia.org/wikipedia/commons/transcoded/a/ab/Ocean_Wave.webm/Ocean_Wave.webm.720p.mp4',
+                            type: 'video/mp4'
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            })
+          };
+        }
+
+        return { ok: false, status: 404 };
+      };
+
+      try {
+        const redditHits = await searchRedditVideosByKeyword('Jaybbgirl');
+        assert.strictEqual(redditHits.length, 1, 'Should pull from u/<handle>/submitted.json when title search is empty');
+        assert.strictEqual(redditHits[0].videoUrl, 'https://i.redd.it/gallery_clip.mp4?a=1&b=2');
+
+        const rgHits = await searchRedgifsVideos('Jaybbgirl', 4);
+        assert.strictEqual(
+          rgHits.length,
+          1,
+          'Should fall back from order=trending to order=best and not be wiped out by tubeDurationFilter="long"'
+        );
+        assert.strictEqual(rgHits[0].videoUrl, 'https://thumbs4.redgifs.com/NicheClip1.mp4');
+
+        const wikiHits = await searchWikimediaVideos('ocean', 4);
+        assert.strictEqual(
+          wikiHits.length,
+          1,
+          'Should use Wikimedia server-transcoded .mp4 derivative when formatMode is set to mp4'
+        );
+        assert.ok(wikiHits[0].videoUrl.endsWith('.720p.mp4'));
+        assert.strictEqual(wikiHits[0].format, 'mp4');
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.formatMode = origFormatMode;
+        settings.tubeDurationFilter = origDuration;
+      }
+    });
   });
 });
-
-
-
-

@@ -2203,11 +2203,12 @@ async function fetchWithCorsFallback(url, asText = false) {
 
   const proxies = [
     `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
   ];
 
   const controllers = proxies.map(() => new AbortController());
-  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 4500);
+  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 5500);
   timer.unref?.();
 
   try {
@@ -2244,10 +2245,14 @@ function encodeArchiveFilePath(fileName) {
 // 1. Internet Archive Engine (Supports all 19 video extensions + auto-derivative pairing)
 async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') {
   const safeQuery = keyword.replace(/["()]/g, ' ').trim();
+  if (!safeQuery) return [];
   const nsfwFilter = settings.allowNsfw ? '' : ' AND NOT collection:(adult)';
-  const collectionClause = extraQueryFilter ? ` AND ${extraQueryFilter}` : '';
+  const collectionClause = extraQueryFilter ? ` AND (${extraQueryFilter})` : '';
   const q = `(${safeQuery}) AND mediatype:(movies)${collectionClause}${nsfwFilter}`;
-  const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&fl[]=identifier,title&sort[]=downloads+desc&rows=25&page=1&output=json`;
+  const sortClause = extraQueryFilter.includes('prelinger') ? '&sort[]=downloads+desc' : '';
+  const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(
+    q
+  )}&fl[]=identifier,title${sortClause}&rows=25&page=1&output=json`;
 
   const res = await fetchWithTimeout(searchUrl, 4500);
   if (!res.ok) return [];
@@ -2256,11 +2261,15 @@ async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') 
   const docs = data?.response?.docs || [];
   if (!docs.length) return [];
 
-  const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(3, limit));
+  // Keep the top 2 most relevant matches and shuffle the remainder so exact keyword hits aren't missed
+  const candidateCount = Math.min(docs.length, Math.max(5, limit));
+  const topRelevant = docs.slice(0, 2);
+  const restShuffled = docs.slice(2).sort(() => Math.random() - 0.5);
+  const candidates = [...topRelevant, ...restShuffled].slice(0, candidateCount);
   const results = [];
 
   await Promise.all(
-    shuffled.map(async (doc) => {
+    candidates.map(async (doc) => {
       try {
         const metaRes = await fetchWithTimeout(
           `https://archive.org/metadata/${encodeURIComponent(doc.identifier)}`,
@@ -2385,7 +2394,7 @@ async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') 
     })
   );
 
-  return results;
+  return results.slice(0, limit);
 }
 
 // 2. Prelinger Retro Archives Engine (Vintage commercials, retro cartoons, ephemeral films)
@@ -2411,9 +2420,6 @@ async function searchWikimediaVideos(keyword, limit = 8) {
     const info = page?.videoinfo?.[0] || page?.imageinfo?.[0];
     if (!info || !info.url) continue;
 
-    const fmt = detectVideoFormat(info.url, 'webm');
-    if (!isFormatAllowedBySettings(fmt.ext)) continue;
-
     const derivatives = Array.isArray(info.derivatives) ? info.derivatives : [];
     const mp4Deriv = derivatives.find(
       (d) => d?.src && (d.type?.includes('mp4') || d.src.toLowerCase().endsWith('.mp4'))
@@ -2426,6 +2432,19 @@ async function searchWikimediaVideos(keyword, limit = 8) {
         Number(d.height || 0) <= 720
     );
 
+    const fmt = detectVideoFormat(info.url, 'webm');
+    let primaryUrl = info.url;
+    let primaryExt = fmt.ext;
+
+    if (!isFormatAllowedBySettings(primaryExt)) {
+      if (mp4Deriv?.src && isFormatAllowedBySettings('mp4')) {
+        primaryUrl = mp4Deriv.src;
+        primaryExt = 'mp4';
+      } else {
+        continue;
+      }
+    }
+
     const cleanTitle = (page.title || 'Wikimedia Video')
       .replace(/^File:/i, '')
       .replace(VIDEO_EXT_END_REGEX, '')
@@ -2434,10 +2453,10 @@ async function searchWikimediaVideos(keyword, limit = 8) {
     results.push({
       id: `wiki-${page.pageid}`,
       title: cleanTitle,
-      videoUrl: info.url,
+      videoUrl: primaryUrl,
       originalUrl: info.url,
       convertedUrl: mp4Deriv?.src || (!fmt.iphoneNative && webmDeriv?.src ? webmDeriv.src : null),
-      format: fmt.ext,
+      format: primaryExt,
       sourceName: `Wikimedia (${keyword})`,
       pageUrl: info.descriptionurl || info.url
     });
@@ -2457,7 +2476,7 @@ function extractRedgifsId(rawUrl) {
     return watchMatch[1].toLowerCase();
   }
   const thumbMatch = rawUrl.match(
-    /thumbs\d*\.redgifs\.com\/([a-zA-Z0-9_-]+?)(?:-mobile|-silent|-size_restricted|-poster)?\.(?:mp4|webm|gif|jpg)/i
+    /(?:thumbs\d*|media|i)\.redgifs\.com\/(?:i\/)?([a-zA-Z0-9_-]+?)(?:-mobile|-silent|-size_restricted|-poster|-large)?\.(?:mp4|webm|gif|jpg|png)/i
   );
   if (thumbMatch?.[1]) {
     return thumbMatch[1];
@@ -2480,7 +2499,15 @@ async function getRedgifsTempToken() {
       }
     }
   } catch {
-    // fallback if blocked
+    // fallback to CORS proxy if direct temporary auth is blocked
+    try {
+      const data = await fetchWithCorsFallback('https://api.redgifs.com/v2/auth/temporary', false);
+      if (data?.token) {
+        cachedRedgifsToken = data.token;
+        cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+        return cachedRedgifsToken;
+      }
+    } catch {}
   }
   return null;
 }
@@ -2550,47 +2577,95 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
 async function searchRedgifsVideos(keyword, limit = 6) {
   if (!settings.allowNsfw) return [];
   const results = [];
+  const seenIds = new Set();
+  const cleanKw = String(keyword || '').replace(/\b(redgifs|nsfw|18\+)\b/gi, '').trim() || 'trending';
+
+  const appendGifsFromList = (gifs) => {
+    if (!Array.isArray(gifs)) return;
+    for (const g of gifs) {
+      if (!g?.id || seenIds.has(g.id)) continue;
+      const mp4Url = g?.urls?.hd || g?.urls?.sd;
+      if (!mp4Url || !isFormatAllowedBySettings('mp4')) continue;
+      seenIds.add(g.id);
+      const tagLabel = Array.isArray(g.tags) && g.tags.length ? g.tags.slice(0, 4).join(', ') : cleanKw;
+      results.push({
+        id: `rg-${g.id}`,
+        title: `RedGIFs HD — ${tagLabel}`,
+        videoUrl: mp4Url,
+        originalUrl: mp4Url,
+        convertedUrl: null,
+        format: 'mp4',
+        duration: Number(g.duration) || 0,
+        tags: Array.isArray(g.tags) ? g.tags.slice(0, 6) : [],
+        isHd: Boolean(g?.urls?.hd),
+        isNsfw: true,
+        sourceName: `RedGIFs (${cleanKw})`,
+        pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(g.id)}`
+      });
+    }
+  };
 
   try {
     const token = await getRedgifsTempToken();
-    const cleanKw = String(keyword || '').replace(/\b(redgifs|nsfw|18\+)\b/gi, '').trim() || 'trending';
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+
+    // 1. Primary search on RedGIFs API v2
     const searchUrl = `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(
       cleanKw
     )}&order=trending&count=${limit}`;
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
     const res = await fetch(searchUrl, { headers });
     if (res.ok) {
       const data = await res.json();
-      const gifs = Array.isArray(data?.gifs) ? data.gifs : [];
-      for (const g of gifs) {
-        const mp4Url = g?.urls?.hd || g?.urls?.sd;
-        if (!mp4Url || !isFormatAllowedBySettings('mp4')) continue;
-        const tagLabel = Array.isArray(g.tags) && g.tags.length ? g.tags.slice(0, 4).join(', ') : cleanKw;
-        results.push({
-          id: `rg-${g.id}`,
-          title: `RedGIFs HD — ${tagLabel}`,
-          videoUrl: mp4Url,
-          originalUrl: mp4Url,
-          convertedUrl: null,
-          format: 'mp4',
-          duration: Number(g.duration) || 0,
-          tags: Array.isArray(g.tags) ? g.tags.slice(0, 6) : [],
-          isHd: Boolean(g?.urls?.hd),
-          isNsfw: true,
-          sourceName: `RedGIFs (${cleanKw})`,
-          pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(g.id)}`
-        });
+      appendGifsFromList(data?.gifs);
+    }
+
+    // 2. Niche/creator keywords often have 0 clips in 'trending' but many in 'best' or user creator feeds
+    if (results.length === 0 && cleanKw.toLowerCase() !== 'trending') {
+      const fallbackUrls = [
+        `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(cleanKw)}&order=best&count=${limit}`
+      ];
+      if (/^[a-zA-Z0-9_.-]{3,30}$/.test(cleanKw)) {
+        fallbackUrls.push(
+          `https://api.redgifs.com/v2/users/${encodeURIComponent(cleanKw.toLowerCase())}/search?order=new&count=${limit}`
+        );
+      }
+      const settled = await Promise.allSettled(
+        fallbackUrls.map(async (u) => {
+          const r = await fetch(u, { headers });
+          if (r.ok) return await r.json();
+          return null;
+        })
+      );
+      for (const s of settled) {
+        if (s.status === 'fulfilled' && s.value) {
+          appendGifsFromList(s.value.gifs);
+        }
       }
     }
   } catch {
-    // ignore API error
+    // ignore direct API error and try Reddit RedGIFs index below
   }
 
-  return filterAndSortTubeResults(results);
+  // 3. Fallback: if RedGIFs API returned 0 results or was blocked, search Reddit's index of redgifs.com links
+  if (results.length === 0 && cleanKw.toLowerCase() !== 'trending') {
+    try {
+      const rgRedditUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+        `site:redgifs.com ${cleanKw}`
+      )}&type=link&sort=relevance&include_over_18=1&limit=20&raw_json=1`;
+      const json = await fetchWithCorsFallback(rgRedditUrl, false);
+      const fallbackItems = extractRedditVideosFromListing(json, `RedGIFs (${cleanKw})`, true);
+      results.push(...fallbackItems.slice(0, limit));
+    } catch {
+      // ignore fallback error
+    }
+  }
+
+  const filtered = filterAndSortTubeResults(results);
+  return filtered.length > 0 ? filtered : filterAndSortTubeResults(results, 'all', settings.tubeQualityFilter);
 }
 
 // 4. Reddit Subreddit or Global Keyword Video Search
-function extractRedditVideosFromListing(json, sourceLabel) {
+function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = false) {
   const children = json?.data?.children || [];
   const results = [];
 
@@ -2598,7 +2673,7 @@ function extractRedditVideosFromListing(json, sourceLabel) {
     const post = child?.data;
     if (!post) continue;
     if (post.over_18 && !settings.allowNsfw) continue;
-    if (settings.allowNsfw && settings.nsfwMode === 'strict' && post.over_18 === false) continue;
+    if (!allowSfwFallback && settings.allowNsfw && settings.nsfwMode === 'strict' && post.over_18 === false) continue;
 
     const mediaPost = post.crosspost_parent_list?.[0] || post;
 
@@ -2606,8 +2681,20 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       mediaPost?.secure_media?.reddit_video?.fallback_url ||
       mediaPost?.media?.reddit_video?.fallback_url ||
       mediaPost?.preview?.reddit_video_preview?.fallback_url ||
+      mediaPost?.preview?.video_preview?.fallback_url ||
       mediaPost?.preview?.images?.[0]?.variants?.mp4?.source?.url ||
       null;
+
+    // Support Reddit Gallery / media_metadata animated MP4 items
+    if (!rawVideoUrl && mediaPost?.media_metadata && typeof mediaPost.media_metadata === 'object') {
+      for (const metaItem of Object.values(mediaPost.media_metadata)) {
+        const mp4Candidate = metaItem?.s?.mp4 || metaItem?.p?.[metaItem.p.length - 1]?.mp4;
+        if (mp4Candidate && typeof mp4Candidate === 'string') {
+          rawVideoUrl = mp4Candidate.replace(/&amp;/g, '&');
+          break;
+        }
+      }
+    }
 
     const hlsUrl =
       mediaPost?.secure_media?.reddit_video?.hls_url ||
@@ -2619,16 +2706,19 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       if (DIRECT_VIDEO_URL_REGEX.test(candidateDirectUrl)) {
         rawVideoUrl = candidateDirectUrl;
       } else if (/redgifs\.com/i.test(candidateDirectUrl)) {
-        // Extract RedGIFs direct .mp4 from oembed thumbnail pattern or slug
+        // Extract RedGIFs direct .mp4 from oembed thumbnail pattern (preserving exact CamelCase slug)
         const oembedThumb =
           mediaPost?.secure_media?.oembed?.thumbnail_url ||
           mediaPost?.media?.oembed?.thumbnail_url ||
+          mediaPost?.preview?.images?.[0]?.source?.url ||
           '';
         const thumbSlugMatch = String(oembedThumb).match(
-          /(https?:\/\/thumbs\d*\.redgifs\.com\/[a-zA-Z0-9_-]+?)(?:-poster|-mobile|-size_restricted)?\.(?:jpg|png|gif|mp4)/i
+          /https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/(?:i\/)?([a-zA-Z0-9_-]+?)(?:-poster|-mobile|-size_restricted|-large)?\.(?:jpg|png|gif|mp4|webm)/i
         );
         if (thumbSlugMatch?.[1]) {
-          rawVideoUrl = `${thumbSlugMatch[1]}.mp4`;
+          const hostPrefixMatch = String(oembedThumb).match(/^(https?:\/\/thumbs\d*\.redgifs\.com)\//i);
+          const cdnHost = hostPrefixMatch?.[1] || 'https://thumbs4.redgifs.com';
+          rawVideoUrl = `${cdnHost}/${thumbSlugMatch[1]}.mp4`;
         } else {
           const rgId = extractRedgifsId(candidateDirectUrl);
           if (rgId) {
@@ -2691,23 +2781,86 @@ async function fetchSubredditVideos(subreddit) {
   const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`;
 
   const json = await fetchWithCorsFallback(url, false);
-  return extractRedditVideosFromListing(json, `r/${cleanSub}`);
+  const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
+  if (extracted.length > 0) return extracted;
+  return extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
 }
 
 async function searchRedditVideosByKeyword(keyword) {
+  const rawKw = String(keyword || '').trim();
+  if (!rawKw) return [];
+
   const nsfwFlag = settings.allowNsfw ? '1' : '0';
+  const isStrict = Boolean(settings.allowNsfw && settings.nsfwMode === 'strict');
   const effectiveQuery =
-    settings.allowNsfw && settings.nsfwMode === 'strict' && !/\bnsfw:yes\b/i.test(keyword)
-      ? `${keyword} nsfw:yes`
-      : keyword;
+    isStrict && !/\bnsfw:yes\b/i.test(rawKw) ? `${rawKw} nsfw:yes` : rawKw;
   const sorts = ['relevance', 'hot', 'top'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
-  const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-    effectiveQuery
-  )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
 
-  const json = await fetchWithCorsFallback(url, false);
-  return extractRedditVideosFromListing(json, `Reddit (${keyword})`);
+  const tasks = [];
+  const results = [];
+  const seenIds = new Set();
+
+  const addUnique = (items) => {
+    for (const item of items) {
+      if (item?.id && !seenIds.has(item.id)) {
+        seenIds.add(item.id);
+        results.push(item);
+      }
+    }
+  };
+
+  // 1. Global Reddit keyword search
+  tasks.push(
+    (async () => {
+      const searchUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+        effectiveQuery
+      )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+      const json = await fetchWithCorsFallback(searchUrl, false);
+      let items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`);
+      if (items.length === 0 && isStrict) {
+        // Fallback if 'nsfw:yes' or strict post.over_18 filter excluded matching keyword posts
+        items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`, true);
+        if (items.length === 0 && effectiveQuery !== rawKw) {
+          const plainUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+            rawKw
+          )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+          const plainJson = await fetchWithCorsFallback(plainUrl, false);
+          items = extractRedditVideosFromListing(plainJson, `Reddit (${rawKw})`, true);
+        }
+      }
+      addUnique(items);
+    })()
+  );
+
+  // 2. If keyword is a single word / handle / r/sub / u/user, also check matching subreddit & user profile
+  const handleMatch = rawKw.match(/^(?:\/?(?:r|u|user)\/)?([a-zA-Z0-9_-]{3,28})$/i);
+  if (handleMatch?.[1]) {
+    const cleanHandle = handleMatch[1];
+    tasks.push(
+      (async () => {
+        try {
+          const subUrl = `https://www.reddit.com/r/${encodeURIComponent(
+            cleanHandle
+          )}/hot.json?limit=25&include_over_18=${nsfwFlag}&raw_json=1`;
+          const subJson = await fetchWithCorsFallback(subUrl, false);
+          addUnique(extractRedditVideosFromListing(subJson, `r/${cleanHandle}`, true));
+        } catch {}
+      })(),
+      (async () => {
+        try {
+          const userUrl = `https://www.reddit.com/user/${encodeURIComponent(
+            cleanHandle
+          )}/submitted.json?limit=25&include_over_18=${nsfwFlag}&raw_json=1`;
+          const userJson = await fetchWithCorsFallback(userUrl, false);
+          addUnique(extractRedditVideosFromListing(userJson, `u/${cleanHandle}`, true));
+        } catch {}
+      })()
+    );
+  }
+
+  await Promise.allSettled(tasks);
+  return results;
 }
 
 // 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
@@ -2725,10 +2878,25 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
   if (!res.ok) return [];
 
   const json = await res.json();
-  const data = Array.isArray(json?.data) ? json.data : [];
+  let data = Array.isArray(json?.data) ? json.data : [];
+
+  // If strict nsfw=true returned 0 matches on SepiaSearch, retry with nsfw=both
+  if (data.length === 0 && nsfwParam === 'true') {
+    try {
+      const bothUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
+        keyword
+      )}&count=12&nsfw=both&sort=-match`;
+      const bothRes = await fetchWithTimeout(bothUrl, 3500);
+      if (bothRes.ok) {
+        const bothJson = await bothRes.json();
+        data = Array.isArray(bothJson?.data) ? bothJson.data : [];
+      }
+    } catch {}
+  }
+
   if (!data.length) return [];
 
-  const picked = [...data].sort(() => Math.random() - 0.5).slice(0, Math.min(3, limit));
+  const picked = [...data].sort(() => Math.random() - 0.5).slice(0, Math.min(5, Math.max(3, limit)));
   const results = [];
 
   await Promise.all(
@@ -2780,7 +2948,7 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
     })
   );
 
-  return results;
+  return results.slice(0, limit);
 }
 
 // 6. Lemmy & Mastodon Open Fediverse Video Feeds
@@ -2800,7 +2968,6 @@ async function searchFediverseVideos(keyword) {
 
       for (const st of statuses) {
         if (st?.sensitive && !settings.allowNsfw) continue;
-        if (settings.allowNsfw && settings.nsfwMode === 'strict' && !st?.sensitive) continue;
         const attachments = Array.isArray(st?.media_attachments) ? st.media_attachments : [];
         for (const att of attachments) {
           if ((att.type === 'video' || att.type === 'gifv') && att.url) {
@@ -2840,11 +3007,21 @@ async function searchFediverseVideos(keyword) {
         if (!post) continue;
         const isPostNsfw = Boolean(post.nsfw || entry?.community?.nsfw);
         if (isPostNsfw && !settings.allowNsfw) continue;
-        if (settings.allowNsfw && settings.nsfwMode === 'strict' && !isPostNsfw) continue;
         let candidateUrl = post.url || post.embed_video_url;
         if (!candidateUrl || typeof candidateUrl !== 'string') continue;
 
         if (/redgifs\.com/i.test(candidateUrl)) {
+          const resolvedRg = await resolveRedgifsUrlToMp4(candidateUrl, post.name || 'Lemmy Video Post');
+          if (resolvedRg) {
+            results.push({
+              ...resolvedRg,
+              id: `lemmy-${post.id}`,
+              title: post.name || resolvedRg.title,
+              sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
+              pageUrl: post.ap_id || candidateUrl
+            });
+            continue;
+          }
           const rgId = extractRedgifsId(candidateUrl);
           if (rgId) {
             candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
@@ -2890,6 +3067,17 @@ async function searchFediverseVideos(keyword) {
           if (!candidateUrl || typeof candidateUrl !== 'string') continue;
 
           if (/redgifs\.com/i.test(candidateUrl)) {
+            const resolvedRg = await resolveRedgifsUrlToMp4(candidateUrl, post.name || 'Fediverse 18+ Video Post');
+            if (resolvedRg) {
+              results.push({
+                ...resolvedRg,
+                id: `lemmynsfw-${post.id}`,
+                title: post.name || resolvedRg.title,
+                sourceName: `Lemmy 18+ (${entry?.community?.name || 'nsfw'})`,
+                pageUrl: post.ap_id || candidateUrl
+              });
+              continue;
+            }
             const rgId = extractRedgifsId(candidateUrl);
             if (rgId) {
               candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
@@ -3359,7 +3547,8 @@ async function searchFreeTubeSites(keyword, limit = 6) {
   }
 
   await Promise.allSettled(tasks);
-  return filterAndSortTubeResults(results);
+  const filtered = filterAndSortTubeResults(results);
+  return filtered.length > 0 ? filtered : filterAndSortTubeResults(results, 'all', settings.tubeQualityFilter);
 }
 
 // In-memory source pool cache (3-minute TTL) for instant 0ms subsequent pulls
@@ -3388,7 +3577,7 @@ async function pullFromSource(source) {
     }
     return items;
   }
-  if (source.type === 'url') {
+  if (source.type === 'url' || /^https?:\/\//i.test(String(source.value || '').trim())) {
     const items = await scanUrlForVideos(source.value, source.label || 'Custom URL');
     if (source.isNsfw) {
       items.forEach((item) => {
@@ -3412,19 +3601,21 @@ async function pullFromSource(source) {
         searchRedgifsVideos(source.value, 5),
         searchFreeTubeSites(source.value, 5),
         searchRedditVideosByKeyword(source.value),
+        searchInternetArchive(source.value, 5),
         searchPeerTubeVideos(source.value, 4),
         searchFediverseVideos(source.value),
-        searchInternetArchive(source.value, 3, 'collection:(adult) OR mediatype:(movies)')
+        searchWikimediaVideos(source.value, 4)
       ]
     : [
         searchWikimediaVideos(source.value, 5),
         searchNasaVideos(source.value, 3),
         searchRedditVideosByKeyword(source.value),
-        searchInternetArchive(source.value, 3),
+        searchInternetArchive(source.value, 5),
         searchPrelingerArchives(source.value, 2),
-        searchPeerTubeVideos(source.value, 3),
+        searchPeerTubeVideos(source.value, 4),
         searchFediverseVideos(source.value),
-        searchFreeTubeSites(source.value, 4)
+        searchFreeTubeSites(source.value, 4),
+        ...(settings.allowNsfw ? [searchRedgifsVideos(source.value, 5)] : [])
       ];
 
   return new Promise((resolve) => {
@@ -3445,11 +3636,17 @@ async function pullFromSource(source) {
           if (Array.isArray(items) && items.length > 0) {
             combined.push(...items);
             cacheRecord.timestamp = Date.now();
-            // As soon as the fastest engine yields videos, give a short 350ms grace window
-            // for other fast engines, then resolve immediately without waiting for slow APIs
-            if (!resolved && !graceTimer) {
-              graceTimer = setTimeout(finish, 350);
-              graceTimer.unref?.();
+            // Give fast/medium engines a 750ms window after first result (or 350ms once >=3 videos arrive)
+            // so a single marginal result never cuts off Reddit, Archive.org, or RedGIFs keyword hits
+            if (!resolved) {
+              if (combined.length >= 3) {
+                if (graceTimer) clearTimeout(graceTimer);
+                graceTimer = setTimeout(finish, 350);
+                graceTimer.unref?.();
+              } else if (!graceTimer) {
+                graceTimer = setTimeout(finish, 750);
+                graceTimer.unref?.();
+              }
             }
           }
         })
@@ -5084,25 +5281,36 @@ if (typeof document !== 'undefined') {
     }
 
     const tasks = [];
-    if (useArchive) tasks.push(searchInternetArchive(query, 6));
-    if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));
-    if (useWiki) tasks.push(searchWikimediaVideos(query, 8));
-    if (useReddit) tasks.push(searchRedditVideosByKeyword(query));
-    if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
-    if (useFediverse) tasks.push(searchFediverseVideos(query));
-    if (useNasa) tasks.push(searchNasaVideos(query, 6));
-    if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
-    if (useRedgifs && settings.allowNsfw) tasks.push(searchRedgifsVideos(query, 6));
+    if (/^https?:\/\//i.test(query)) {
+      tasks.push(scanUrlForVideos(query, 'Scanned Link'));
+    } else {
+      if (useArchive) tasks.push(searchInternetArchive(query, 6));
+      if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));
+      if (useWiki) tasks.push(searchWikimediaVideos(query, 8));
+      if (useReddit) tasks.push(searchRedditVideosByKeyword(query));
+      if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
+      if (useFediverse) tasks.push(searchFediverseVideos(query));
+      if (useNasa) tasks.push(searchNasaVideos(query, 6));
+      if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
+      if (useRedgifs && settings.allowNsfw) tasks.push(searchRedgifsVideos(query, 6));
+    }
 
     const settled = await Promise.allSettled(tasks);
     const combined = [];
+    const seenUrlsInSearch = new Set();
     for (const r of settled) {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-        combined.push(...r.value);
+        for (const item of r.value) {
+          if (item?.videoUrl && !seenUrlsInSearch.has(item.videoUrl)) {
+            seenUrlsInSearch.add(item.videoUrl);
+            combined.push(item);
+          }
+        }
       }
     }
 
-    renderSearchResults(filterAndSortTubeResults(combined));
+    const filtered = filterAndSortTubeResults(combined);
+    renderSearchResults(filtered.length > 0 ? filtered : combined);
   });
 
   // TAB 2: Multi-Format Webpage Video Scanner Form
@@ -5692,13 +5900,18 @@ if (typeof module !== 'undefined' && module.exports) {
     needsMp4Conversion,
     encodeArchiveFilePath,
     searchInternetArchive,
+    searchWikimediaVideos,
     extractRedgifsId,
     resolveRedgifsUrlToMp4,
     searchRedgifsVideos,
     filterAndSortTubeResults,
     extractRedditVideosFromListing,
+    searchRedditVideosByKeyword,
+    searchPeerTubeVideos,
+    searchFediverseVideos,
     extractVideoUrlsFromHtml,
     searchFreeTubeSites,
+    pullFromSource,
     parseM3u8Manifest,
     downloadAndAssembleM3u8Stream,
     escapeHtml,
