@@ -557,6 +557,9 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
 
 // Unified pipeline: takes any videoItem and returns { blob, ext, mime, wasConverted } ready for iPhone
 async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false, onProgress = null) {
+  if (!videoItem || typeof videoItem !== 'object') {
+    throw new Error('Invalid video item');
+  }
   // 0. If the item has a cached offline Blob in IndexedDB Vault, use it immediately (0 network requests!)
   if (videoItem.offlineBlob instanceof Blob) {
     onProgress?.('Loaded from Offline Vault cache!', 100, '100%');
@@ -2038,11 +2041,12 @@ function switchTab(targetId) {
 }
 
 function escapeHtml(str) {
-  return String(str || '')
+  return String(str ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // ==========================================
@@ -2617,6 +2621,8 @@ if (typeof module !== 'undefined' && module.exports) {
     getEffectivePlaybackUrl,
     needsMp4Conversion,
     encodeArchiveFilePath,
-    extractRedditVideosFromListing
+    extractRedditVideosFromListing,
+    escapeHtml,
+    obtainIphoneReadyVideoBlob
   };
 }

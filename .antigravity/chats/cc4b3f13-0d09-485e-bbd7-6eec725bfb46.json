@@ -256,6 +256,54 @@
       "created_at": "2026-11-08T01:24:05.280Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "0a4f65f1-8832-4aed-b0ed-4cf2648d5dc6",
+      "role": "agent",
+      "content": "All 4 new test suites have been added and verified.\n\nWhile writing and running these tests, another real edge-case bug was caught and fixed in [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1347):\n* **The Bug:** Direct video URLs containing timestamp anchors (like `https://example.com/video.webm#t=5`) were previously rejected by the direct URL regex and fell through to the full webpage HTML parser.\n* **The Fix:** The direct video regexes in [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1060-L1350) were updated to accept both query strings (`?`) and hash fragments (`#`).\n\n---\n\n### Complete Test Results\n\n```text\n$ node --test tests/app.test.js\n▶ ReelVault Unit Tests\n  ▶ detectVideoFormat\n    ✔ should detect uppercase video extensions correctly (.MP4, .WEBM) (1.07ms)\n    ✔ should detect video format from URLs with query strings (?token=123) (0.19ms)\n    ✔ should detect video format from URLs with hash anchors (#t=10) (0.18ms)\n    ✔ should gracefully handle null, undefined, empty, and invalid URLs with fallback (0.23ms)\n  ✔ detectVideoFormat (2.87ms)\n  ▶ normalizeAndAutoRewriteVideoUrl\n    ✔ should automatically rewrite .gifv URLs to .mp4 (0.50ms)\n    ✔ should unescape escaped HTML entities (&amp;) (0.25ms)\n    ✔ should return null for null/invalid rawUrl input (1.03ms)\n  ✔ normalizeAndAutoRewriteVideoUrl (2.19ms)\n  ▶ VIDEO_FORMAT_CATALOG\n    ✔ should contain all 19 video extensions (0.28ms)\n    ✔ should have valid mime types for all 19 extensions (0.57ms)\n  ✔ VIDEO_FORMAT_CATALOG (1.21ms)\n  ▶ needsMp4Conversion\n    ✔ should return false for iPhone Photos native formats (0.25ms)\n    ✔ should return true for formats requiring conversion for Camera Roll saving (0.10ms)\n    ✔ should return false if already converted or cached in vault (0.10ms)\n    ✔ should gracefully handle null/empty video items (0.07ms)\n    ✔ should detect format from videoUrl if format property is missing (0.13ms)\n  ✔ needsMp4Conversion (0.93ms)\n  ▶ isFormatAllowedBySettings\n    ✔ should allow all formats when formatMode is \"all\" (0.20ms)\n    ✔ should allow only native formats when formatMode is \"native\" (0.10ms)\n    ✔ should allow only mp4 and gifv when formatMode is \"mp4\" (0.08ms)\n    ✔ should handle leading dots and uppercase extensions cleanly (0.08ms)\n    ✔ should return false for unsupported or invalid extensions (0.09ms)\n  ✔ isFormatAllowedBySettings (0.78ms)\n  ▶ encodeArchiveFilePath\n    ✔ should leave simple file names unchanged (0.14ms)\n    ✔ should encode spaces and brackets in file names (0.07ms)\n    ✔ should preserve forward slashes for nested directory paths (0.07ms)\n    ✔ should safely handle null, undefined, and empty string inputs (0.07ms)\n  ✔ encodeArchiveFilePath (0.56ms)\n  ▶ extractRedditVideosFromListing\n    ✔ should extract direct reddit_video fallback URL (0.26ms)\n    ✔ should extract videos from crosspost_parent_list (0.14ms)\n    ✔ should filter out NSFW posts when settings.allowNsfw is false (0.09ms)\n    ✔ should safely handle empty or malformed API responses without throwing (0.64ms)\n  ✔ extractRedditVideosFromListing (1.33ms)\n  ▶ getEffectivePlaybackUrl\n    ✔ should return empty string for null/undefined video items (0.20ms)\n    ✔ should prioritize existing offlineObjectUrl (0.09ms)\n    ✔ should create and store object URL from offlineBlob if present (1.07ms)\n    ✔ should prioritize convertedBlobUrl over remote videoUrl (0.22ms)\n    ✔ should use convertedUrl for non-native video when autoConvert is enabled (0.14ms)\n    ✔ should fallback to videoUrl for native formats even if convertedUrl exists (0.13ms)\n  ✔ getEffectivePlaybackUrl (2.16ms)\n  ▶ getFormatBadgeInfo\n    ✔ should return hidden badge for null/undefined video items (0.31ms)\n    ✔ should return converted badge for gifv and converted items (0.12ms)\n    ✔ should return native badge for iPhone Photos native formats (0.17ms)\n    ✔ should return auto-convert badge for non-native formats (0.17ms)\n  ✔ getFormatBadgeInfo (0.99ms)\n  ▶ FALLBACK_VIDEOS & DEFAULT_SOURCES Data Integrity\n    ✔ should have valid DEFAULT_SOURCES with proper IDs and enabled flags (0.23ms)\n    ✔ should have valid FALLBACK_VIDEOS with working HTTPS mp4 links (0.22ms)\n  ✔ FALLBACK_VIDEOS & DEFAULT_SOURCES Data Integrity (0.68ms)\n  ▶ Web Scanner Regex & URL Parsing\n    ✔ should match direct video links across all supported formats (0.32ms)\n    ✔ should extract absolute video URLs from raw HTML with unescaped entities (0.29ms)\n    ✔ should resolve relative video paths against a base page URL (0.14ms)\n  ✔ Web Scanner Regex & URL Parsing (0.97ms)\n✔ ReelVault Unit Tests (16.07ms)\nℹ tests 42\nℹ suites 12\nℹ pass 42\nℹ fail 0\nℹ duration_ms 106.33\n```\n\n---\n\n### Summary of Coverage\n* **42 tests across 12 suites** covering format resolution, offline blob priority, URL parsing, media badge logic, and fallback integrity.\n* **106 ms total runtime** (100% deterministic, zero network calls, zero server strain).\n* [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) is locked back down to `chmod 444` (read-only).\n* All changes to [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js) and [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) are saved.",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "f5369fd0-1cc6-4731-8700-11c92fd50d4c",
+      "created_at": "2026-11-08T01:26:17.411Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "4bf20a70-afaa-4ee8-b337-06117ecb725d",
+      "role": "user",
+      "content": "Any more tests you can think of?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:27:23.316Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "d137ff80-befa-422d-bef6-460081da68b5",
+      "role": "agent",
+      "content": "Here are **4 final verification suites** that cover the remaining layers of ReelVault (security, offline conversion pipeline, HTML-to-JS wiring, and iPhone PWA installation):\n\n---\n\n### 1. `escapeHtml(str)` (XSS Security & Untrusted Title Sanitization)\nBecause ReelVault pulls video titles and descriptions from public posts on Reddit, Mastodon, Lemmy, and Archive.org and renders them into the UI ([`app.js#L2040-L2046`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L2040-L2046)):\n* **What to test:**\n  * Malicious HTML tags like `<script>alert(\"xss\")</script>` or `<img src=x onerror=alert(1)>` are neutralized into safe text entities (`&lt;`, `&gt;`, `&quot;`, `&amp;`).\n  * `null`, `undefined`, and numbers are safely converted without throwing errors.\n\n---\n\n### 2. `obtainIphoneReadyVideoBlob(videoItem)` (Zero-Network Cache & Conversion Priority)\nThis is the core pipeline ([`app.js#L559-L659`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L559-L659)) that prepares videos before opening the iPhone Share sheet:\n* **What to test (using in-memory `Blob`s, 0 network calls):**\n  * **Offline Vault cache hit:** If `videoItem.offlineBlob` exists, it returns the cached `Blob` immediately at 100% progress.\n  * **In-session conversion cache hit:** If `videoItem.convertedBlob` already exists, it reuses the converted `.mp4` `Blob` instead of re-downloading or re-transcoding.\n\n---\n\n### 3. DOM Wiring Verification (`app.js` ↔ `index.html`)\n[`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js) references **72 unique element IDs** via `document.getElementById(...)` (buttons, toggles, modals, video stage, progress bars).\n* **What to test:**\n  * Automatically extracts every `getElementById('...')` call from [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js) and verifies that a matching `id=\"...\"` exists in [`index.html`](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html).\n  * Guarantees no button or toggle can ever silently break if HTML is edited later.\n\n---\n\n### 4. iPhone PWA & Service Worker Asset Verification ([`sw.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/sw.js) & [`manifest.json`](https://github.com/davidscottballard1-png/my-project-2/blob/main/manifest.json))\nOn iOS Safari, if even a single file listed in [`sw.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/sw.js) `APP_SHELL` is missing or misspelled, `cache.addAll()` fails and offline mode breaks completely.\n* **What to test:**\n  * Verifies [`manifest.json`](https://github.com/davidscottballard1-png/my-project-2/blob/main/manifest.json) is valid JSON with `display: \"standalone\"`, valid `start_url`, and existing icon files.\n  * Verifies every file listed in [`sw.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/sw.js) `APP_SHELL` exists on disk and is non-empty.\n\n---\n\nWould you like me to add these 4 suites to [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js), run them, and re-lock the file?",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "4bf20a70-afaa-4ee8-b337-06117ecb725d",
+      "created_at": "2026-11-08T01:28:51.120Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "1fcbbf2a-b815-4cfe-9245-3a7d5d9be995",
+      "role": "user",
+      "content": "yes",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:29:47.804Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }

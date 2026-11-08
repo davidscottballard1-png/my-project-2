@@ -1,5 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   detectVideoFormat,
   normalizeAndAutoRewriteVideoUrl,
@@ -13,7 +15,9 @@ const {
   encodeArchiveFilePath,
   extractRedditVideosFromListing,
   getFormatBadgeInfo,
-  getEffectivePlaybackUrl
+  getEffectivePlaybackUrl,
+  escapeHtml,
+  obtainIphoneReadyVideoBlob
 } = require('../app.js');
 
 describe('ReelVault Unit Tests', () => {
@@ -575,6 +579,154 @@ describe('ReelVault Unit Tests', () => {
 
       const resolved = new URL(relativePath, baseUrl).href;
       assert.strictEqual(resolved, 'https://archive.org/download/historic-reel/reel.webm');
+    });
+  });
+
+  describe('escapeHtml (XSS Security & Sanitization)', () => {
+    it('should neutralize script tags and event handler payloads', () => {
+      const xssPayload = '<script>alert("xss")</script><img src=x onerror=\'alert(1)\'>';
+      const escaped = escapeHtml(xssPayload);
+      assert.strictEqual(
+        escaped,
+        '&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;&lt;img src=x onerror=&#39;alert(1)&#39;&gt;'
+      );
+      assert.ok(!escaped.includes('<script>'));
+      assert.ok(!escaped.includes('"'));
+      assert.ok(!escaped.includes("'"));
+    });
+
+    it('should escape ampersands without double-escaping clean strings', () => {
+      assert.strictEqual(escapeHtml('Tom & Jerry'), 'Tom &amp; Jerry');
+      assert.strictEqual(escapeHtml('Normal Video Title 1080p'), 'Normal Video Title 1080p');
+    });
+
+    it('should safely handle null, undefined, numbers, and empty strings', () => {
+      assert.strictEqual(escapeHtml(null), '');
+      assert.strictEqual(escapeHtml(undefined), '');
+      assert.strictEqual(escapeHtml(''), '');
+      assert.strictEqual(escapeHtml(0), '0');
+      assert.strictEqual(escapeHtml(42), '42');
+    });
+  });
+
+  describe('obtainIphoneReadyVideoBlob (Zero-Network Cache & Conversion Pipeline)', () => {
+    it('should immediately return cached offlineBlob from Vault with 0 network calls', async () => {
+      const cachedBlob = new Blob(['offline-mp4-data'], { type: 'video/mp4' });
+      const progressCalls = [];
+      const item = {
+        id: 'vault-1',
+        offlineBlob: cachedBlob,
+        offlineExt: 'mp4',
+        offlineMime: 'video/mp4',
+        isAutoConverted: true
+      };
+
+      const result = await obtainIphoneReadyVideoBlob(item, false, (label, pct) => {
+        progressCalls.push({ label, pct });
+      });
+
+      assert.strictEqual(result.blob, cachedBlob);
+      assert.strictEqual(result.ext, 'mp4');
+      assert.strictEqual(result.mime, 'video/mp4');
+      assert.strictEqual(result.wasConverted, true);
+      assert.strictEqual(progressCalls.length, 1);
+      assert.strictEqual(progressCalls[0].pct, 100);
+    });
+
+    it('should reuse in-session convertedBlob without re-downloading', async () => {
+      const sessionBlob = new Blob(['converted-mp4-data'], { type: 'video/mp4' });
+      const item = {
+        id: 'session-1',
+        format: 'mkv',
+        videoUrl: 'https://remote.example.com/movie.mkv',
+        convertedBlob: sessionBlob
+      };
+
+      const result = await obtainIphoneReadyVideoBlob(item, false);
+      assert.strictEqual(result.blob, sessionBlob);
+      assert.strictEqual(result.ext, 'mp4');
+      assert.strictEqual(result.mime, 'video/mp4');
+      assert.strictEqual(result.wasConverted, true);
+    });
+
+    it('should reject cleanly when given a null or invalid videoItem', async () => {
+      await assert.rejects(
+        async () => {
+          await obtainIphoneReadyVideoBlob(null);
+        },
+        /Invalid video item/
+      );
+    });
+  });
+
+  describe('DOM Wiring Verification (app.js <-> index.html)', () => {
+    const rootDir = path.resolve(__dirname, '..');
+    const appJsCode = fs.readFileSync(path.join(rootDir, 'app.js'), 'utf8');
+    const indexHtml = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+
+    it('should have a matching id="..." in index.html for every getElementById() in app.js', () => {
+      const idMatches = [...appJsCode.matchAll(/getElementById\(['"]([^'"]+)['"]\)/g)].map((m) => m[1]);
+      const uniqueIds = [...new Set(idMatches)];
+
+      assert.ok(uniqueIds.length >= 70, `Expected at least 70 DOM IDs, found ${uniqueIds.length}`);
+
+      const missingIds = uniqueIds.filter((id) => !indexHtml.includes(`id="${id}"`));
+      assert.deepStrictEqual(
+        missingIds,
+        [],
+        `These element IDs referenced in app.js are missing from index.html: ${missingIds.join(', ')}`
+      );
+    });
+
+    it('should have matching tab view sections for all bottom navigation buttons', () => {
+      const navTargets = [...indexHtml.matchAll(/data-target="([^"]+)"/g)].map((m) => m[1]);
+      assert.strictEqual(navTargets.length, 4, 'Should have 4 bottom navigation tabs');
+
+      for (const targetId of navTargets) {
+        assert.ok(
+          indexHtml.includes(`id="${targetId}"`),
+          `Bottom nav target #${targetId} must exist as a section in index.html`
+        );
+      }
+    });
+  });
+
+  describe('iPhone PWA & Service Worker Asset Verification (sw.js & manifest.json)', () => {
+    const rootDir = path.resolve(__dirname, '..');
+
+    it('should have a valid manifest.json with standalone display and existing icon files', () => {
+      const manifestRaw = fs.readFileSync(path.join(rootDir, 'manifest.json'), 'utf8');
+      const manifest = JSON.parse(manifestRaw);
+
+      assert.strictEqual(manifest.short_name, 'ReelVault');
+      assert.strictEqual(manifest.display, 'standalone');
+      assert.ok(manifest.start_url, 'manifest.json must specify start_url');
+
+      const startFile = path.join(rootDir, manifest.start_url.replace(/^\.\//, ''));
+      assert.ok(fs.existsSync(startFile), `start_url file must exist: ${startFile}`);
+
+      assert.ok(Array.isArray(manifest.icons) && manifest.icons.length > 0, 'manifest must define icons');
+      for (const icon of manifest.icons) {
+        const iconPath = path.join(rootDir, icon.src.replace(/^\.\//, ''));
+        assert.ok(fs.existsSync(iconPath), `PWA icon file must exist: ${iconPath}`);
+      }
+    });
+
+    it('should verify all APP_SHELL files in sw.js exist on disk for offline caching', () => {
+      const swCode = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
+      const shellMatch = swCode.match(/const\s+APP_SHELL\s*=\s*\[([\s\S]*?)\]/);
+      assert.ok(shellMatch, 'sw.js must define APP_SHELL array');
+
+      const assetPaths = [...shellMatch[1].matchAll(/['"]([^'"]+)['"]/g)].map((m) => m[1]);
+      assert.ok(assetPaths.length >= 6, 'APP_SHELL should list core app files');
+
+      for (const relPath of assetPaths) {
+        if (relPath === './') continue;
+        const fullPath = path.join(rootDir, relPath.replace(/^\.\//, ''));
+        assert.ok(fs.existsSync(fullPath), `Service Worker APP_SHELL asset missing: ${relPath}`);
+        const stat = fs.statSync(fullPath);
+        assert.ok(stat.size > 0, `Service Worker APP_SHELL asset is empty: ${relPath}`);
+      }
     });
   });
 });
