@@ -64,6 +64,54 @@
       "created_at": "2026-11-08T02:05:14.981Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "ec1c36b1-3ab7-4193-a433-1f6c853d17b7",
+      "role": "agent",
+      "content": "**Yes!** I have also just added automatic **Free Tube Sites** searching ([`searchFreeTubeSites`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1682-L1767)) and a **Two-Hop Tube Page Crawler** ([`extractVideoUrlsFromHtml`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1553-L1594) and [`scanUrlForVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1597-L1680)) and saved your changes.\n\nHere is how automatic tube site searching works now:\n\n### 1. Automatic Keyword Searching Across Free Tube Sites ([`searchFreeTubeSites`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1682-L1767))\n* Whenever you search a keyword in the **Player** tab, run **Shuffle Random**, or use **Multi-Engine Video Search** (where a new **Free Tube Sites** chip [`#engTubeSites`](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L224-L227) is now checked by default):\n  * **When `🔞 18+ Off` (Safe Mode) is active:** It automatically queries open tube networks like **Dailymotion's Tube API** (`explicit=false`) and **PeerTube** instances alongside your other engines.\n  * **When `🔞 18+ On` is active:** It automatically unlocks and queries **free 18+ tube APIs and feeds** in parallel—including **Eporner's Public Video API v2** (extracting direct `.mp4` streams from matched video embeds), **18+ Reddit/RedGIFs video tube feeds**, **PeerTube 18+ federated tube instances**, and unfiltered **Dailymotion** streams.\n\n### 2. Automatic Tube Player Unescaping & Two-Hop Listing Crawler ([`scanUrlForVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1597-L1680))\nIf you add a favorite free tube site's **category page, search results URL, or video page** in the **Sources** tab (`Direct / JSON URL`) or scan it with the **Safari Bookmarklet**:\n* **Unescaping Hidden `<script>` Streams:** Most tube sites hide their `.mp4` and `.m3u8` URLs inside inline JavaScript player configs with escaped slashes (like `\"https:\\/\\/cdn.site.com\\/video_720p.mp4\"`). [`extractVideoUrlsFromHtml`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1553-L1594) automatically decodes JSON/Unicode escapes (`\\/`, `\\u002F`, `\\u0026`) and prioritizes full-length video streams over tiny hover-preview clips.\n* **Two-Hop Watch-Page Crawling:** If you give it a tube site's search or category page (where the full videos live one click deeper on `/video...`, `/watch/...`, or `viewkey=...` pages), [`scanUrlForVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1655-L1677) automatically follows the watch-page links on that page and pulls the full-length `.mp4` / `.m3u8` streams for you.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "494ce98f-32cc-4e92-b5e8-09301916859d",
+      "created_at": "2026-11-08T02:08:58.328Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "3ba8cb57-9472-4995-95ee-f2f6f5b61c01",
+      "role": "user",
+      "content": "Wow that is amazing!",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T02:11:09.018Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "595d5780-8217-436a-831a-eef7f606bc15",
+      "role": "agent",
+      "content": "Glad you like it! Everything is saved and live in your repository ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html), [app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js), and [styles.css](https://github.com/davidscottballard1-png/my-project-2/blob/main/styles.css)).\n\nWhenever you refresh **ReelVault** on your iPhone, you'll see the **`🔞 18+ Off / On`** button right in the top bar—ready to toggle anytime you want. Let me know if you ever want to add more features or tweak anything else!",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "3ba8cb57-9472-4995-95ee-f2f6f5b61c01",
+      "created_at": "2026-11-08T02:11:24.192Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "8428e04a-7bf3-4c8e-8e4b-e0f88ef86132",
+      "role": "user",
+      "content": "Anything we should add to tests to test all these new features?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T02:12:03.864Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }
