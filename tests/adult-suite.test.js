@@ -17,7 +17,10 @@ const {
   verifyNsfwPin,
   scrubNsfwFromActiveSession,
   triggerPanicSafeMode,
-  handleVisibilityAutoLock,
+  getSavedPlaybackTime,
+  savePlaybackState,
+  restorePlaybackState,
+  handleVisibilityPlaybackChange,
   buildExportFilename,
   setAdultContentEnabled,
   renderSourcesList,
@@ -450,18 +453,53 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(elements.get('mainVideo').muted, true);
     });
 
-    it('should auto-lock 18+ mode and pause video when app is backgrounded (handleVisibilityAutoLock)', () => {
+    it('should save exact playback timestamp when backgrounded and pick up right where you left off when returning', () => {
       const { elements } = setupTestEnv();
+      settings.prebuffer = false;
       settings.allowNsfw = true;
-      settings.autoLockOnHide = true;
+      settings.resumePlayback = true;
 
+      const sampleClip = {
+        id: 'resume-clip-1',
+        title: 'Resume Test Video',
+        videoUrl: 'https://ex.com/resume-test.mp4',
+        format: 'mp4',
+        isNsfw: true
+      };
+
+      setAppState({
+        videoQueue: [sampleClip],
+        currentIndex: 0
+      });
+      updatePlayerUI();
+
+      // Simulate user watching up to 47.5 seconds and backgrounding the app
+      const mainVideo = elements.get('mainVideo');
+      mainVideo.currentTime = 47.5;
       globalThis.document.hidden = true;
       globalThis.document.visibilityState = 'hidden';
 
-      handleVisibilityAutoLock();
+      handleVisibilityPlaybackChange();
 
-      assert.strictEqual(settings.allowNsfw, false);
-      assert.strictEqual(elements.get('mainVideo').paused, true);
+      // 18+ mode remains active (no auto-lock on background) and timestamp is persisted
+      assert.strictEqual(settings.allowNsfw, true);
+      assert.strictEqual(getSavedPlaybackTime(sampleClip), 47.5);
+
+      // Simulate fresh app reload / return and restoring where the user left off
+      setAppState({ videoQueue: [], currentIndex: -1, playbackPositions: {} });
+      mainVideo.src = '';
+      mainVideo.currentTime = 0;
+
+      globalThis.document.hidden = false;
+      globalThis.document.visibilityState = 'visible';
+      const restored = restorePlaybackState();
+
+      assert.strictEqual(restored, true);
+      const state = getAppState();
+      assert.strictEqual(state.videoQueue.length, 1);
+      assert.strictEqual(state.videoQueue[0].id, 'resume-clip-1');
+      assert.strictEqual(mainVideo.src, 'https://ex.com/resume-test.mp4');
+      assert.strictEqual(mainVideo.currentTime, 47.5);
     });
 
     it('should immediately drop into Safe Mode, exit Reels fullscreen, and load a harmless NASA clip on triggerPanicSafeMode', () => {

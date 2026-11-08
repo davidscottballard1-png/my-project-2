@@ -2,7 +2,8 @@
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
-  SETTINGS: 'reelvault_settings_v1'
+  SETTINGS: 'reelvault_settings_v1',
+  PLAYBACK_STATE: 'reelvault_playback_state_v1'
 };
 
 // Comprehensive catalog of 19 video extensions across the internet:
@@ -186,7 +187,7 @@ let settings = {
   allowNsfw: false,
   nsfwMode: 'mixed', // 'safe' | 'mixed' | 'strict'
   autoMuteNsfw: true,
-  autoLockOnHide: true,
+  resumePlayback: true,
   discreetFilenames: true,
   nsfwPin: '',
   nsfwBiometricId: '',
@@ -204,6 +205,7 @@ let videoQueue = [];
 let currentIndex = -1;
 let seenUrls = new Set();
 let lastSearchResults = [];
+let playbackPositions = {};
 let isReelsFullscreen = false;
 let isBackgroundRefilling = false;
 let prebufferVideoEl = null;
@@ -1229,6 +1231,23 @@ function scrubNsfwFromActiveSession() {
     }
   }
 
+  // Scrub 18+ video from persisted playback resume state if Safe Mode is enabled
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (isItemNsfw(parsed?.currentVideo)) {
+          if (videoQueue.length > 0 && currentIndex >= 0) {
+            savePlaybackState();
+          } else {
+            localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+          }
+        }
+      }
+    }
+  } catch {}
+
   if (typeof document !== 'undefined') {
     if (document.getElementById('sourcesList')) renderSourcesList();
     if (document.getElementById('mainVideo')) updatePlayerUI();
@@ -1263,18 +1282,182 @@ function triggerPanicSafeMode() {
   showToast('🛡️ Safe Mode Active');
 }
 
-// Auto-lock 18+ mode when app is backgrounded or phone is locked
-function handleVisibilityAutoLock() {
-  if (!settings.allowNsfw || !settings.autoLockOnHide) return;
+// ==========================================
+// RESUME PLAYBACK WHERE YOU LEFT OFF HELPERS
+// ==========================================
+
+function getPlaybackItemKey(videoItem) {
+  if (!videoItem) return '';
+  return String(videoItem.videoUrl || videoItem.originalUrl || videoItem.id || '');
+}
+
+function sanitizeVideoItemForStorage(videoItem) {
+  if (!videoItem || typeof videoItem !== 'object') return null;
+  const copy = { ...videoItem };
+  delete copy.offlineBlob;
+  delete copy.convertedBlob;
+  delete copy.convertedBlobUrl;
+  delete copy.offlineObjectUrl;
+  return copy;
+}
+
+function getSavedPlaybackTime(videoItem) {
+  if (!settings.resumePlayback || !videoItem) return 0;
+  if (typeof videoItem.resumeTime === 'number' && isFinite(videoItem.resumeTime) && videoItem.resumeTime > 0) {
+    return videoItem.resumeTime;
+  }
+  const key = getPlaybackItemKey(videoItem);
+  if (key && typeof playbackPositions[key] === 'number' && isFinite(playbackPositions[key]) && playbackPositions[key] > 0) {
+    return playbackPositions[key];
+  }
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (key && typeof parsed?.positions?.[key] === 'number' && parsed.positions[key] > 0) {
+          return parsed.positions[key];
+        }
+        if (getPlaybackItemKey(parsed?.currentVideo) === key && typeof parsed?.currentTime === 'number' && parsed.currentTime > 0) {
+          return parsed.currentTime;
+        }
+      }
+    }
+  } catch {}
+  return 0;
+}
+
+function savePlaybackState(overrideTime = null) {
+  if (!settings.resumePlayback) return null;
+  const current = videoQueue[currentIndex];
+  if (!current) return null;
+
+  const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+  let time = 0;
+  if (typeof overrideTime === 'number' && isFinite(overrideTime) && overrideTime >= 0) {
+    time = overrideTime;
+  } else if (videoEl && typeof videoEl.currentTime === 'number' && isFinite(videoEl.currentTime) && videoEl.currentTime > 0) {
+    time = videoEl.currentTime;
+  } else if (typeof current.resumeTime === 'number' && isFinite(current.resumeTime) && current.resumeTime > 0) {
+    time = current.resumeTime;
+  } else {
+    const key = getPlaybackItemKey(current);
+    if (key && typeof playbackPositions[key] === 'number' && playbackPositions[key] > 0) {
+      time = playbackPositions[key];
+    }
+  }
+
+  current.resumeTime = time;
+  const key = getPlaybackItemKey(current);
+  if (key) {
+    playbackPositions[key] = time;
+  }
+
+  const snapshot = {
+    currentVideo: sanitizeVideoItemForStorage(current),
+    videoQueue: videoQueue.slice(0, 25).map(sanitizeVideoItemForStorage).filter(Boolean),
+    currentIndex,
+    currentTime: time,
+    wasPlaying: Boolean(videoEl && !videoEl.paused),
+    positions: { ...playbackPositions },
+    updatedAt: Date.now()
+  };
+
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(STORAGE_KEYS.PLAYBACK_STATE, JSON.stringify(snapshot));
+    }
+  } catch {}
+
+  return snapshot;
+}
+
+function restorePlaybackState() {
+  if (!settings.resumePlayback) return false;
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const raw = localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return false;
+
+    if (parsed.positions && typeof parsed.positions === 'object') {
+      playbackPositions = { ...playbackPositions, ...parsed.positions };
+    }
+
+    const isItemNsfw = (item) => Boolean(item?.isNsfw || item?.over_18);
+    let restoredQueue = Array.isArray(parsed.videoQueue) && parsed.videoQueue.length > 0
+      ? parsed.videoQueue
+      : parsed.currentVideo
+      ? [parsed.currentVideo]
+      : [];
+
+    if (!settings.allowNsfw) {
+      restoredQueue = restoredQueue.filter((item) => !isItemNsfw(item));
+    }
+    if (restoredQueue.length === 0) return false;
+
+    const targetKey = getPlaybackItemKey(parsed.currentVideo);
+    let restoredIndex = restoredQueue.findIndex((item) => getPlaybackItemKey(item) === targetKey);
+    if (restoredIndex < 0) {
+      restoredIndex =
+        typeof parsed.currentIndex === 'number' &&
+        parsed.currentIndex >= 0 &&
+        parsed.currentIndex < restoredQueue.length
+          ? parsed.currentIndex
+          : 0;
+    }
+
+    const activeItem = restoredQueue[restoredIndex];
+    const activeKey = getPlaybackItemKey(activeItem);
+    const savedTime =
+      activeKey === targetKey && typeof parsed.currentTime === 'number' && parsed.currentTime > 0
+        ? parsed.currentTime
+        : Number(playbackPositions[activeKey] || activeItem?.resumeTime || 0);
+
+    if (activeItem && savedTime > 0) {
+      activeItem.resumeTime = savedTime;
+      if (activeKey) {
+        playbackPositions[activeKey] = savedTime;
+      }
+    }
+
+    videoQueue = restoredQueue;
+    currentIndex = restoredIndex;
+    for (const item of videoQueue) {
+      if (item?.videoUrl) seenUrls.add(item.videoUrl);
+    }
+
+    if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
+      updatePlayerUI();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Save exact video position when backgrounded and pick up right where you left off when returning
+function handleVisibilityPlaybackChange() {
+  if (!settings.resumePlayback) return;
   const isHidden = typeof document !== 'undefined' && Boolean(document.hidden || document.visibilityState === 'hidden');
   if (isHidden) {
-    if (typeof document !== 'undefined') {
-      const videoEl = document.getElementById('mainVideo');
-      try {
-        videoEl?.pause?.();
-      } catch {}
+    savePlaybackState();
+  } else {
+    if (videoQueue.length === 0 || currentIndex < 0) {
+      restorePlaybackState();
+      return;
     }
-    setAdultContentEnabled(false);
+    const current = videoQueue[currentIndex];
+    const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+    if (current && videoEl) {
+      const savedTime = getSavedPlaybackTime(current);
+      if (savedTime > 0 && (!videoEl.currentTime || Math.abs(videoEl.currentTime - savedTime) > 1.5)) {
+        try {
+          videoEl.currentTime = savedTime;
+        } catch {}
+      }
+    }
   }
 }
 
@@ -2618,6 +2801,7 @@ function updatePlayerUI() {
   }
 
   const targetPlayUrl = getEffectivePlaybackUrl(current);
+  const savedTime = getSavedPlaybackTime(current);
   if (videoEl.src !== targetPlayUrl) {
     videoEl.dataset.autoConvertAttempted = 'false';
     if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
@@ -2625,18 +2809,41 @@ function updatePlayerUI() {
     }
     videoEl.src = targetPlayUrl;
     videoEl.load();
+    if (savedTime > 0) {
+      try {
+        videoEl.currentTime = savedTime;
+      } catch {}
+      videoEl.addEventListener?.(
+        'loadedmetadata',
+        () => {
+          try {
+            if (!videoEl.duration || savedTime < videoEl.duration - 0.5) {
+              videoEl.currentTime = savedTime;
+            }
+          } catch {}
+        },
+        { once: true }
+      );
+    }
     if (settings.autoPlay) {
       videoEl.play().catch(() => {
         // iOS may require user tap if unmuted; user can tap play on controls
       });
     }
+  } else if (savedTime > 0 && (!videoEl.currentTime || Math.abs(videoEl.currentTime - savedTime) > 1.5)) {
+    try {
+      videoEl.currentTime = savedTime;
+    } catch {}
   }
+
+  savePlaybackState(savedTime > 0 ? savedTime : null);
 
   // Trigger background pre-buffering for the upcoming video
   scheduleBackgroundQueuePrebuffer();
 }
 
 function advanceToNextVideo() {
+  savePlaybackState();
   if (currentIndex < videoQueue.length - 1) {
     currentIndex++;
     updatePlayerUI();
@@ -2646,6 +2853,7 @@ function advanceToNextVideo() {
 }
 
 function goToPrevVideo() {
+  savePlaybackState();
   if (currentIndex > 0) {
     currentIndex--;
     updatePlayerUI();
@@ -3166,7 +3374,7 @@ if (typeof document !== 'undefined') {
   const nsfwToggle = document.getElementById('allowNsfwToggle');
   const nsfwModeSelect = document.getElementById('nsfwModeSelect');
   const autoMuteNsfwToggle = document.getElementById('autoMuteNsfwToggle');
-  const autoLockOnHideToggle = document.getElementById('autoLockOnHideToggle');
+  const resumePlaybackToggle = document.getElementById('resumePlaybackToggle');
   const discreetFilenamesToggle = document.getElementById('discreetFilenamesToggle');
   const tubeDurationSelect = document.getElementById('tubeDurationSelect');
   const tubeQualitySelect = document.getElementById('tubeQualitySelect');
@@ -3180,7 +3388,7 @@ if (typeof document !== 'undefined') {
 
   if (nsfwToggle) nsfwToggle.checked = Boolean(settings.allowNsfw);
   if (autoMuteNsfwToggle) autoMuteNsfwToggle.checked = settings.autoMuteNsfw !== false;
-  if (autoLockOnHideToggle) autoLockOnHideToggle.checked = settings.autoLockOnHide !== false;
+  if (resumePlaybackToggle) resumePlaybackToggle.checked = settings.resumePlayback !== false;
   if (discreetFilenamesToggle) discreetFilenamesToggle.checked = settings.discreetFilenames !== false;
   if (tubeDurationSelect) tubeDurationSelect.value = settings.tubeDurationFilter || 'all';
   if (tubeQualitySelect) tubeQualitySelect.value = settings.tubeQualityFilter || 'all';
@@ -3193,19 +3401,22 @@ if (typeof document !== 'undefined') {
   if (prebufferToggle) prebufferToggle.checked = settings.prebuffer !== false;
   if (offlineVaultToggle) offlineVaultToggle.checked = settings.offlineVaultCache !== false;
 
+  // Restore last watched video and timestamp if no deep-link query/scan was launched
+  if (videoQueue.length === 0 && settings.resumePlayback) {
+    restorePlaybackState();
+  }
+
   // Register Service Worker for PWA
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
-  // Auto-Lock 18+ Mode when backgrounded / iPhone locked
+  // Save & resume playback position when backgrounded or returning to the app
   document.addEventListener('visibilitychange', () => {
-    handleVisibilityAutoLock();
+    handleVisibilityPlaybackChange();
   });
   window.addEventListener?.('pagehide', () => {
-    if (settings.allowNsfw && settings.autoLockOnHide) {
-      setAdultContentEnabled(false);
-    }
+    savePlaybackState();
   });
 
   // Panic / Boss Key Button & Header Triple-Tap Gesture
@@ -3277,8 +3488,23 @@ if (typeof document !== 'undefined') {
 
   const mainVideoEl = document.getElementById('mainVideo');
 
+  // Track playback position so user can pick up right where they left off
+  mainVideoEl?.addEventListener('timeupdate', () => {
+    savePlaybackState();
+  });
+  mainVideoEl?.addEventListener('pause', () => {
+    savePlaybackState();
+  });
+
   // Auto-Advance on Video End
   mainVideoEl?.addEventListener('ended', () => {
+    const current = videoQueue[currentIndex];
+    if (current) {
+      current.resumeTime = 0;
+      const key = getPlaybackItemKey(current);
+      if (key) delete playbackPositions[key];
+      savePlaybackState(0);
+    }
     if (settings.autoAdvance) {
       advanceToNextVideo();
     }
@@ -3690,10 +3916,18 @@ if (typeof document !== 'undefined') {
     showToast(settings.autoMuteNsfw ? 'Auto-mute enabled for 18+ videos' : 'Auto-mute disabled');
   });
 
-  autoLockOnHideToggle?.addEventListener('change', () => {
-    settings.autoLockOnHide = autoLockOnHideToggle.checked;
+  resumePlaybackToggle?.addEventListener('change', () => {
+    settings.resumePlayback = resumePlaybackToggle.checked;
     saveSettings();
-    showToast(settings.autoLockOnHide ? 'Auto-lock when backgrounded enabled' : 'Auto-lock disabled');
+    if (settings.resumePlayback) {
+      savePlaybackState();
+      showToast('Resume video where you left off enabled');
+    } else {
+      try {
+        localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+      } catch {}
+      showToast('Resume playback disabled');
+    }
   });
 
   discreetFilenamesToggle?.addEventListener('change', () => {
@@ -3802,7 +4036,7 @@ if (typeof document !== 'undefined') {
       allowNsfw: false,
       nsfwMode: 'mixed',
       autoMuteNsfw: true,
-      autoLockOnHide: true,
+      resumePlayback: true,
       discreetFilenames: true,
       nsfwPin: '',
       nsfwBiometricId: '',
@@ -3817,6 +4051,7 @@ if (typeof document !== 'undefined') {
       offlineVaultCache: true
     };
     if (nsfwToggle) nsfwToggle.checked = false;
+    if (resumePlaybackToggle) resumePlaybackToggle.checked = true;
     if (autoPlayToggle) autoPlayToggle.checked = true;
     if (formatModeSelect) formatModeSelect.value = 'all';
     if (autoConvertToggle) autoConvertToggle.checked = true;
@@ -3825,7 +4060,11 @@ if (typeof document !== 'undefined') {
     if (offlineVaultToggle) offlineVaultToggle.checked = true;
     videoQueue = [];
     currentIndex = -1;
+    playbackPositions = {};
     seenUrls.clear();
+    try {
+      localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+    } catch {}
     saveSources();
     saveSettings();
     syncAgeGateUI();
@@ -3948,7 +4187,10 @@ if (typeof module !== 'undefined' && module.exports) {
     authenticateNsfwBiometric,
     scrubNsfwFromActiveSession,
     triggerPanicSafeMode,
-    handleVisibilityAutoLock,
+    getSavedPlaybackTime,
+    savePlaybackState,
+    restorePlaybackState,
+    handleVisibilityPlaybackChange,
     syncAgeGateUI,
     openAgeGateModal,
     closeAgeGateModal,
@@ -3960,14 +4202,23 @@ if (typeof module !== 'undefined' && module.exports) {
       videoQueue,
       currentIndex,
       isReelsFullscreen,
-      lastSearchResults
+      lastSearchResults,
+      playbackPositions
     }),
     setAppState: (patch = {}) => {
       if (Array.isArray(patch.sources)) sources = patch.sources;
-      if (Array.isArray(patch.videoQueue)) videoQueue = patch.videoQueue;
+      if (Array.isArray(patch.videoQueue)) {
+        videoQueue = patch.videoQueue;
+        if (patch.videoQueue.length === 0 && !patch.playbackPositions) {
+          playbackPositions = {};
+        }
+      }
       if (typeof patch.currentIndex === 'number') currentIndex = patch.currentIndex;
       if (typeof patch.isReelsFullscreen === 'boolean') isReelsFullscreen = patch.isReelsFullscreen;
       if (Array.isArray(patch.lastSearchResults)) lastSearchResults = patch.lastSearchResults;
+      if (patch.playbackPositions && typeof patch.playbackPositions === 'object') {
+        playbackPositions = patch.playbackPositions;
+      }
     }
   };
 }
