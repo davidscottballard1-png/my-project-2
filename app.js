@@ -1,11 +1,11 @@
-// ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter & Downloader PWA
+// ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
   SETTINGS: 'reelvault_settings_v1'
 };
 
-// Comprehensive catalog of video extensions across the internet:
+// Comprehensive catalog of 19 video extensions across the internet:
 // - iphoneNative: Plays directly in iPhone Safari <video>
 // - photosNative: Accepted directly by iOS Share Sheet -> "Save Video" (Camera Roll) without conversion
 const VIDEO_FORMAT_CATALOG = {
@@ -46,7 +46,7 @@ const DEFAULT_SOURCES = [
     id: 'src-kw-vintage',
     type: 'keyword',
     value: 'vintage cartoon animation',
-    label: 'Vintage Cartoons & Retro',
+    label: 'Prelinger & Vintage Cartoons',
     enabled: true,
     builtIn: true
   },
@@ -54,7 +54,7 @@ const DEFAULT_SOURCES = [
     id: 'src-kw-space',
     type: 'keyword',
     value: 'nasa space launch',
-    label: 'NASA & Space Footage',
+    label: 'NASA Space & Science Library',
     enabled: true,
     builtIn: true
   },
@@ -62,7 +62,7 @@ const DEFAULT_SOURCES = [
     id: 'src-kw-nature',
     type: 'keyword',
     value: 'ocean wildlife nature',
-    label: 'Ocean & Nature',
+    label: 'Ocean & Wildlife Footage',
     enabled: true,
     builtIn: true
   },
@@ -84,7 +84,7 @@ const DEFAULT_SOURCES = [
   }
 ];
 
-// Reliable public-domain / CC0 fallback clips across multiple formats so the player never fails offline/rate-limited
+// Reliable public-domain / CC0 fallback clips so the player never fails offline/rate-limited
 const FALLBACK_VIDEOS = [
   {
     id: 'fb-apollo11',
@@ -134,12 +134,18 @@ let settings = {
   allowNsfw: false,
   autoPlay: true,
   formatMode: 'all', // 'all' | 'native' | 'mp4'
-  autoConvert: true
+  autoConvert: true,
+  autoAdvance: true,
+  prebuffer: true,
+  offlineVaultCache: true
 };
 let videoQueue = [];
 let currentIndex = -1;
 let seenUrls = new Set();
 let lastSearchResults = [];
+let isReelsFullscreen = false;
+let isBackgroundRefilling = false;
+let prebufferVideoEl = null;
 
 // ==========================================
 // FORMAT DETECTION & AUTO-CONVERSION HELPERS
@@ -171,7 +177,7 @@ function isFormatAllowedBySettings(ext) {
   if (settings.formatMode === 'native') {
     return Boolean(info.iphoneNative);
   }
-  return true; // 'all' allows all supported extensions
+  return true; // 'all' allows all 19 supported extensions
 }
 
 function normalizeAndAutoRewriteVideoUrl(rawUrl) {
@@ -244,7 +250,7 @@ function getFormatBadgeInfo(videoItem) {
 
 function needsMp4Conversion(videoItem) {
   if (!videoItem) return false;
-  if (videoItem.convertedBlobUrl) return false;
+  if (videoItem.convertedBlobUrl || videoItem.offlineBlob) return false;
   const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
   const info = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
   return !info.photosNative;
@@ -264,7 +270,6 @@ async function loadFfmpegConverter(onStatus) {
 
   ffmpegLoadingPromise = (async () => {
     if (onStatus) onStatus('Loading auto-converter engine...');
-    // Load @ffmpeg/ffmpeg & @ffmpeg/util UMD scripts from jsDelivr CDN
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js');
     await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js');
 
@@ -549,6 +554,17 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
 
 // Unified pipeline: takes any videoItem and returns { blob, ext, mime, wasConverted } ready for iPhone
 async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false, onProgress = null) {
+  // 0. If the item has a cached offline Blob in IndexedDB Vault, use it immediately (0 network requests!)
+  if (videoItem.offlineBlob instanceof Blob) {
+    onProgress?.('Loaded from Offline Vault cache!', 100, '100%');
+    return {
+      blob: videoItem.offlineBlob,
+      ext: videoItem.offlineExt || 'mp4',
+      mime: videoItem.offlineMime || 'video/mp4',
+      wasConverted: Boolean(videoItem.isAutoConverted)
+    };
+  }
+
   const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
   const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
   const shouldConvert = forceMp4Conversion || (settings.autoConvert && !fmtInfo.photosNative);
@@ -564,7 +580,7 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
     };
   }
 
-  // 2. If a server-transcoded .mp4 derivative URL is available (Archive.org / Wikimedia / Reddit / Imgur .gifv)
+  // 2. If a server-transcoded .mp4 derivative URL is available (Archive.org / Wikimedia / NASA / PeerTube / Reddit / .gifv)
   if (shouldConvert && videoItem.convertedUrl) {
     try {
       const mp4Blob = await fetchVideoBlobWithProgress(
@@ -640,7 +656,7 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
 }
 
 // ==========================================
-// INDEXEDDB VAULT
+// INDEXEDDB VAULT (WITH TRUE OFFLINE VIDEO BLOB CACHING)
 // ==========================================
 
 const DB_NAME = 'ReelVaultDB';
@@ -676,24 +692,73 @@ async function getAllVaultVideos() {
   }
 }
 
-async function saveVideoToVaultDB(videoItem) {
+async function saveVideoToVaultDB(videoItem, offlineBlobData = null) {
   const db = await openVaultDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(VAULT_STORE, 'readwrite');
     const store = tx.objectStore(VAULT_STORE);
-    // Avoid storing ephemeral blob URLs in IndexedDB
     const copy = { ...videoItem };
     delete copy.convertedBlob;
     delete copy.convertedBlobUrl;
+    delete copy.offlineObjectUrl;
+
+    if (offlineBlobData?.blob instanceof Blob) {
+      copy.offlineBlob = offlineBlobData.blob;
+      copy.offlineMime = offlineBlobData.mime || 'video/mp4';
+      copy.offlineExt = offlineBlobData.ext || 'mp4';
+      copy.offlineSize = offlineBlobData.blob.size;
+      copy.hasOfflineBlob = true;
+    } else if (copy.offlineBlob instanceof Blob) {
+      copy.offlineSize = copy.offlineBlob.size;
+      copy.hasOfflineBlob = true;
+    }
+
     const record = {
       ...copy,
       id: copy.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-      savedAt: Date.now()
+      savedAt: copy.savedAt || Date.now()
     };
     const req = store.put(record);
     req.onsuccess = () => resolve(record);
     req.onerror = () => reject(req.error);
   });
+}
+
+// Save video to Vault and optionally cache its full .MP4 bytes in IndexedDB for Airplane-Mode playback
+async function saveAndCacheVideoToVault(videoItem, forceOfflineDownload = false) {
+  const savedRecord = await saveVideoToVaultDB(videoItem);
+  await renderVaultList();
+
+  if (!forceOfflineDownload && !settings.offlineVaultCache) {
+    showToast('Saved link to Vault!');
+    return savedRecord;
+  }
+
+  // If we already have the blob in memory, store it immediately
+  if (videoItem.convertedBlob instanceof Blob) {
+    await saveVideoToVaultDB(savedRecord, {
+      blob: videoItem.convertedBlob,
+      ext: 'mp4',
+      mime: 'video/mp4'
+    });
+    await renderVaultList();
+    showToast('Saved & cached offline in Vault!');
+    return savedRecord;
+  }
+
+  showToast('Saved to Vault! Caching video for offline playback...');
+  try {
+    const blobResult = await obtainIphoneReadyVideoBlob(videoItem, false);
+    if (blobResult?.blob instanceof Blob) {
+      await saveVideoToVaultDB(savedRecord, blobResult);
+      await renderVaultList();
+      const mb = (blobResult.blob.size / (1024 * 1024)).toFixed(1);
+      showToast(`Cached offline in Vault (${mb} MB)!`);
+    }
+  } catch {
+    // Metadata/link is still saved even if CORS prevented raw blob caching
+  }
+  return savedRecord;
 }
 
 async function deleteVaultVideoDB(id) {
@@ -803,7 +868,7 @@ async function fetchWithCorsFallback(url, asText = false) {
 }
 
 // ==========================================
-// MULTI-FORMAT VIDEO DISCOVERY ENGINES
+// MULTI-ENGINE & MULTI-FORMAT VIDEO DISCOVERY
 // ==========================================
 
 function encodeArchiveFilePath(fileName) {
@@ -813,11 +878,12 @@ function encodeArchiveFilePath(fileName) {
     .join('/');
 }
 
-// 1. Internet Archive Engine (Supports .mp4, .mov, .m4v, .webm, .ogv, .mkv, .avi, .mpeg, .mpg, .3gp, .flv, .wmv + auto-derivative pairing)
-async function searchInternetArchive(keyword, limit = 12) {
+// 1. Internet Archive Engine (Supports all 19 video extensions + auto-derivative pairing)
+async function searchInternetArchive(keyword, limit = 10, extraQueryFilter = '') {
   const safeQuery = keyword.replace(/["()]/g, ' ').trim();
   const nsfwFilter = settings.allowNsfw ? '' : ' AND NOT collection:(adult)';
-  const q = `(${safeQuery}) AND mediatype:(movies)${nsfwFilter}`;
+  const collectionClause = extraQueryFilter ? ` AND ${extraQueryFilter}` : '';
+  const q = `(${safeQuery}) AND mediatype:(movies)${collectionClause}${nsfwFilter}`;
   const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&fl[]=identifier,title&sort[]=downloads+desc&rows=30&page=1&output=json`;
 
   const controller = new AbortController();
@@ -830,8 +896,7 @@ async function searchInternetArchive(keyword, limit = 12) {
   const docs = data?.response?.docs || [];
   if (!docs.length) return [];
 
-  // Shuffle docs and inspect metadata of up to 6 items in parallel
-  const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(6, limit));
+  const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
   const results = [];
 
   await Promise.all(
@@ -842,7 +907,6 @@ async function searchInternetArchive(keyword, limit = 12) {
         const meta = await metaRes.json();
         const files = meta?.files || [];
 
-        // Collect all recognized video files in the item
         const videoFiles = files
           .filter((f) => {
             if (!f?.name || f.name.toLowerCase().includes('.ia.mp4')) return false;
@@ -862,7 +926,6 @@ async function searchInternetArchive(keyword, limit = 12) {
 
         if (videoFiles.length === 0) return;
 
-        // Also locate a lightweight .mp4 derivative if present (for instant auto-conversion of .ogv/.avi/.mkv/.mpeg/.mov)
         const mp4Candidate =
           files.find(
             (f) =>
@@ -877,11 +940,8 @@ async function searchInternetArchive(keyword, limit = 12) {
           ? `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(mp4Candidate.name)}`
           : null;
 
-        // Filter to reasonable sizes (< 95MB when size metadata exists)
         const sizedPool = videoFiles.filter((vf) => !vf.size || vf.size < 95_000_000);
         const candidatePool = sizedPool.length > 0 ? sizedPool : videoFiles;
-
-        // Pick a file: in 'all' mode, allow variety across formats (.mov, .webm, .ogv, .mkv, .mp4, .avi, .mpeg)
         const chosenEntry = candidatePool[Math.floor(Math.random() * candidatePool.length)];
         if (!chosenEntry) return;
 
@@ -889,6 +949,7 @@ async function searchInternetArchive(keyword, limit = 12) {
           chosenEntry.file.name
         )}`;
 
+        const sourcePrefix = extraQueryFilter.includes('prelinger') ? 'Prelinger Archive' : 'Archive.org';
         results.push({
           id: `ia-${doc.identifier}-${chosenEntry.ext}`,
           title: doc.title || doc.identifier,
@@ -896,7 +957,7 @@ async function searchInternetArchive(keyword, limit = 12) {
           originalUrl: chosenUrl,
           convertedUrl: chosenEntry.ext !== 'mp4' ? mp4DerivativeUrl : null,
           format: chosenEntry.ext,
-          sourceName: `Archive.org (${keyword})`,
+          sourceName: `${sourcePrefix} (${keyword})`,
           pageUrl: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`
         });
       } catch {
@@ -908,7 +969,12 @@ async function searchInternetArchive(keyword, limit = 12) {
   return results;
 }
 
-// 2. Wikimedia Commons Video Search Engine (Pulls .webm, .ogv, .ogg, .mpeg, .mpg, .mov, .mp4 + auto-transcoded derivatives via videoinfo API)
+// 2. Prelinger Retro Archives Engine (Vintage commercials, retro cartoons, ephemeral films)
+async function searchPrelingerArchives(keyword, limit = 6) {
+  return await searchInternetArchive(keyword, limit, 'collection:(prelinger)');
+}
+
+// 3. Wikimedia Commons Video Search Engine (Pulls .webm, .ogv, .ogg, .mpeg, .mpg, .mov, .mp4 + server derivatives)
 async function searchWikimediaVideos(keyword, limit = 10) {
   const query = `${keyword} filetype:video`;
   const apiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
@@ -932,7 +998,6 @@ async function searchWikimediaVideos(keyword, limit = 10) {
     const fmt = detectVideoFormat(info.url, 'webm');
     if (!isFormatAllowedBySettings(fmt.ext)) continue;
 
-    // Inspect Wikimedia's pre-transcoded derivatives for an iPhone-ready MP4 or WebM stream
     const derivatives = Array.isArray(info.derivatives) ? info.derivatives : [];
     const mp4Deriv = derivatives.find(
       (d) => d?.src && (d.type?.includes('mp4') || d.src.toLowerCase().endsWith('.mp4'))
@@ -965,7 +1030,7 @@ async function searchWikimediaVideos(keyword, limit = 10) {
   return results;
 }
 
-// 3. Reddit Subreddit or Global Keyword Video Search (Supports Reddit MP4, HLS .m3u8, GIF->MP4 variants, .gifv, .mov, .webm, .m4v, .mkv, etc.)
+// 4. Reddit Subreddit or Global Keyword Video Search
 function extractRedditVideosFromListing(json, sourceLabel) {
   const children = json?.data?.children || [];
   const results = [];
@@ -975,7 +1040,6 @@ function extractRedditVideosFromListing(json, sourceLabel) {
     if (!post) continue;
     if (post.over_18 && !settings.allowNsfw) continue;
 
-    // Check crosspost parent too
     const mediaPost = post.crosspost_parent_list?.[0] || post;
 
     let rawVideoUrl =
@@ -990,7 +1054,6 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       mediaPost?.media?.reddit_video?.hls_url ||
       null;
 
-    // Check direct link to any video extension (.mp4, .mov, .m4v, .webm, .gifv, .ogv, .mkv, .avi, .3gp, .m3u8, etc.)
     if (!rawVideoUrl && typeof mediaPost.url === 'string') {
       const directMatch = mediaPost.url.match(
         new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i')
@@ -1047,11 +1110,237 @@ async function searchRedditVideosByKeyword(keyword) {
   return extractRedditVideosFromListing(json, `Reddit (${keyword})`);
 }
 
-// 4. Custom URL / Webpage Multi-Format Video Scanner
+// 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
+async function searchPeerTubeVideos(keyword, limit = 6) {
+  const nsfwParam = settings.allowNsfw ? 'both' : 'false';
+  const searchUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
+    keyword
+  )}&count=16&nsfw=${nsfwParam}&sort=-match`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 7500);
+  const res = await fetch(searchUrl, { signal: controller.signal });
+  clearTimeout(timer);
+  if (!res.ok) return [];
+
+  const json = await res.json();
+  const data = Array.isArray(json?.data) ? json.data : [];
+  if (!data.length) return [];
+
+  const picked = [...data].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
+  const results = [];
+
+  await Promise.all(
+    picked.map(async (item) => {
+      try {
+        const host = item?.account?.host || item?.channel?.host || (item?.url ? new URL(item.url).host : null);
+        const uuid = item?.uuid || item?.shortUUID;
+        if (!host || !uuid) return;
+
+        const detailCtrl = new AbortController();
+        const detailTimer = setTimeout(() => detailCtrl.abort(), 6000);
+        const detailRes = await fetch(`https://${host}/api/v1/videos/${encodeURIComponent(uuid)}`, {
+          signal: detailCtrl.signal
+        });
+        clearTimeout(detailTimer);
+        if (!detailRes.ok) return;
+
+        const detail = await detailRes.json();
+        const directFiles = [
+          ...(Array.isArray(detail?.files) ? detail.files : []),
+          ...(Array.isArray(detail?.streamingPlaylists?.[0]?.files) ? detail.streamingPlaylists[0].files : [])
+        ];
+
+        const mp4File =
+          directFiles.find((f) => (f?.fileDownloadUrl || f?.fileUrl) && Number(f.size || 0) < 90_000_000) ||
+          directFiles[0];
+
+        const hlsPlaylistUrl = detail?.streamingPlaylists?.[0]?.playlistUrl || null;
+        const primaryUrl = mp4File?.fileDownloadUrl || mp4File?.fileUrl || hlsPlaylistUrl;
+        if (!primaryUrl) return;
+
+        const fmt = detectVideoFormat(primaryUrl, hlsPlaylistUrl === primaryUrl ? 'm3u8' : 'mp4');
+        if (!isFormatAllowedBySettings(fmt.ext)) return;
+
+        results.push({
+          id: `pt-${uuid}`,
+          title: item.name || detail.name || 'PeerTube Video',
+          videoUrl: primaryUrl,
+          originalUrl: primaryUrl,
+          convertedUrl: fmt.ext !== 'mp4' && mp4File ? mp4File.fileDownloadUrl || mp4File.fileUrl : null,
+          format: fmt.ext,
+          sourceName: `PeerTube (${host})`,
+          pageUrl: item.url || `https://${host}/w/${uuid}`
+        });
+      } catch {
+        // ignore instance error
+      }
+    })
+  );
+
+  return results;
+}
+
+// 6. Lemmy & Mastodon Open Fediverse Video Feeds
+async function searchFediverseVideos(keyword) {
+  const cleanTag = keyword.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  const results = [];
+
+  const tasks = [
+    // Mastodon Public Tag Timeline
+    (async () => {
+      if (!cleanTag) return;
+      const mastoUrl = `https://mastodon.social/api/v1/timelines/tag/${encodeURIComponent(cleanTag)}?limit=25`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 7000);
+      const res = await fetch(mastoUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const statuses = await res.json();
+      if (!Array.isArray(statuses)) return;
+
+      for (const st of statuses) {
+        if (st?.sensitive && !settings.allowNsfw) continue;
+        const attachments = Array.isArray(st?.media_attachments) ? st.media_attachments : [];
+        for (const att of attachments) {
+          if ((att.type === 'video' || att.type === 'gifv') && att.url) {
+            const fmt = detectVideoFormat(att.url, 'mp4');
+            if (!isFormatAllowedBySettings(fmt.ext)) continue;
+            const plainText = String(st.content || '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+            results.push({
+              id: `masto-${att.id || st.id}`,
+              title: plainText.slice(0, 75) || `Mastodon #${cleanTag} Clip`,
+              videoUrl: att.url,
+              originalUrl: att.url,
+              convertedUrl: null,
+              format: fmt.ext,
+              sourceName: `Mastodon (#${cleanTag})`,
+              pageUrl: st.url || att.url
+            });
+          }
+        }
+      }
+    })(),
+    // Lemmy Global Post Search
+    (async () => {
+      const lemmyUrl = `https://lemmy.world/api/v3/search?q=${encodeURIComponent(
+        keyword
+      )}&type_=Posts&sort=TopAll&limit=25`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 7000);
+      const res = await fetch(lemmyUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const data = await res.json();
+      const posts = Array.isArray(data?.posts) ? data.posts : [];
+
+      for (const entry of posts) {
+        const post = entry?.post;
+        if (!post) continue;
+        if (post.nsfw && !settings.allowNsfw) continue;
+        const candidateUrl = post.url || post.embed_video_url;
+        if (!candidateUrl || typeof candidateUrl !== 'string') continue;
+
+        if (new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i').test(candidateUrl)) {
+          const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
+          if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
+          results.push({
+            id: `lemmy-${post.id}`,
+            title: post.name || 'Lemmy Video Post',
+            videoUrl: normalized.videoUrl,
+            originalUrl: normalized.originalUrl,
+            convertedUrl: normalized.convertedUrl,
+            format: normalized.format,
+            isAutoConverted: normalized.isAutoConverted,
+            sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
+            pageUrl: post.ap_id || candidateUrl
+          });
+        }
+      }
+    })()
+  ];
+
+  await Promise.allSettled(tasks);
+  return results;
+}
+
+// 7. NASA Image & Video Library API (Direct .mp4 / .mov / .m4v / .m3u8 space & science footage)
+async function searchNasaVideos(keyword, limit = 6) {
+  const apiUrl = `https://images-api.nasa.gov/search?q=${encodeURIComponent(keyword)}&media_type=video`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 7500);
+  const res = await fetch(apiUrl, { signal: controller.signal });
+  clearTimeout(timer);
+  if (!res.ok) return [];
+
+  const json = await res.json();
+  const items = Array.isArray(json?.collection?.items) ? json.collection.items : [];
+  if (!items.length) return [];
+
+  const shuffled = [...items].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
+  const results = [];
+
+  await Promise.all(
+    shuffled.map(async (item) => {
+      try {
+        const meta = item?.data?.[0];
+        const manifestUrl = item?.href;
+        if (!meta || !manifestUrl) return;
+
+        const mRes = await fetch(manifestUrl);
+        if (!mRes.ok) return;
+        const assetList = await mRes.json();
+        if (!Array.isArray(assetList)) return;
+
+        const videoAssets = assetList.filter(
+          (u) =>
+            typeof u === 'string' &&
+            new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i').test(u) &&
+            isFormatAllowedBySettings(detectVideoFormat(u).ext)
+        );
+        if (!videoAssets.length) return;
+
+        // Prefer mobile/medium mp4 for fast loading, or whatever allowed format is present
+        const mp4Asset =
+          videoAssets.find((u) => u.endsWith('~mobile.mp4')) ||
+          videoAssets.find((u) => u.endsWith('~medium.mp4')) ||
+          videoAssets.find((u) => u.toLowerCase().endsWith('.mp4'));
+
+        const chosenAsset =
+          settings.formatMode === 'all'
+            ? videoAssets[Math.floor(Math.random() * videoAssets.length)]
+            : mp4Asset || videoAssets[0];
+
+        const secureChosen = chosenAsset.replace(/^http:\/\//i, 'https://');
+        const secureMp4 = mp4Asset ? mp4Asset.replace(/^http:\/\//i, 'https://') : null;
+        const fmt = detectVideoFormat(secureChosen, 'mp4');
+
+        results.push({
+          id: `nasa-${meta.nasa_id}`,
+          title: meta.title || 'NASA Archival Video',
+          videoUrl: secureChosen,
+          originalUrl: secureChosen,
+          convertedUrl: fmt.ext !== 'mp4' ? secureMp4 : null,
+          format: fmt.ext,
+          sourceName: 'NASA Video Library',
+          pageUrl: `https://images.nasa.gov/details/${encodeURIComponent(meta.nasa_id)}`
+        });
+      } catch {
+        // ignore individual asset error
+      }
+    })
+  );
+
+  return results;
+}
+
+// 8. Custom URL / Webpage Multi-Format Video Scanner
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   const trimmed = targetUrl.trim();
 
-  // Direct video URL across any supported video extension
   const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i');
   if (directRegex.test(trimmed)) {
     const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
@@ -1071,7 +1360,6 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
     ];
   }
 
-  // If Reddit URL, route to Reddit JSON
   if (trimmed.includes('reddit.com/r/')) {
     const match = trimmed.match(/reddit\.com\/r\/([^/?#]+)/i);
     if (match?.[1]) {
@@ -1079,7 +1367,6 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
     }
   }
 
-  // Otherwise fetch raw text/JSON and extract all video links across all supported extensions
   const rawText = await fetchWithCorsFallback(trimmed, true);
   const foundUrls = new Set();
 
@@ -1130,7 +1417,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   return results;
 }
 
-// Pull videos from a single source object
+// Pull videos from a single source object across open video networks
 async function pullFromSource(source) {
   if (source.type === 'subreddit') {
     return await fetchSubredditVideos(source.value);
@@ -1138,11 +1425,15 @@ async function pullFromSource(source) {
   if (source.type === 'url') {
     return await scanUrlForVideos(source.value, source.label || 'Custom URL');
   }
-  // Default: 'keyword' -> query Archive.org, Reddit, and Wikimedia in parallel
+  // Default: 'keyword' -> query Archive.org, Prelinger, Wikimedia, Reddit, PeerTube, Fediverse & NASA in parallel
   const settled = await Promise.allSettled([
-    searchInternetArchive(source.value, 6),
+    searchInternetArchive(source.value, 5),
+    searchPrelingerArchives(source.value, 4),
     searchRedditVideosByKeyword(source.value),
-    searchWikimediaVideos(source.value, 8)
+    searchWikimediaVideos(source.value, 6),
+    searchPeerTubeVideos(source.value, 4),
+    searchFediverseVideos(source.value),
+    searchNasaVideos(source.value, 4)
   ]);
 
   const combined = [];
@@ -1155,7 +1446,7 @@ async function pullFromSource(source) {
 }
 
 // ==========================================
-// PLAYER & SHUFFLE CONTROLLER
+// PLAYER, BACKGROUND PRE-BUFFER & REELS MODE CONTROLLER
 // ==========================================
 
 function setPlayerLoading(isLoading, message = 'Pulling random video...') {
@@ -1173,17 +1464,99 @@ function setPlayerLoading(isLoading, message = 'Pulling random video...') {
 
 function getEffectivePlaybackUrl(videoItem) {
   if (!videoItem) return '';
+  if (videoItem.offlineObjectUrl) return videoItem.offlineObjectUrl;
+  if (videoItem.offlineBlob instanceof Blob) {
+    videoItem.offlineObjectUrl = URL.createObjectURL(videoItem.offlineBlob);
+    return videoItem.offlineObjectUrl;
+  }
   if (videoItem.convertedBlobUrl) return videoItem.convertedBlobUrl;
 
   const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
   const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
 
-  // If the original format isn't iPhone-native (e.g. .ogv, .mkv, .avi, .mpeg, .flv, .wmv) and a converted stream URL exists, use it automatically
   if (settings.autoConvert && !fmtInfo.iphoneNative && videoItem.convertedUrl) {
     return videoItem.convertedUrl;
   }
 
   return videoItem.videoUrl;
+}
+
+// Silently pre-buffer the next video in the queue and top up the queue in the background
+async function scheduleBackgroundQueuePrebuffer() {
+  if (!settings.prebuffer) {
+    document.getElementById('prebufferBadge')?.classList.add('hidden');
+    return;
+  }
+
+  // 1. If fewer than 2 videos remain ahead of currentIndex, silently pull 2 more in the background
+  const remainingAhead = videoQueue.length - 1 - currentIndex;
+  if (remainingAhead < 2 && !isBackgroundRefilling && sources.some((s) => s.enabled)) {
+    isBackgroundRefilling = true;
+    try {
+      const activeSources = sources.filter((s) => s.enabled);
+      const randomSource = activeSources[Math.floor(Math.random() * activeSources.length)];
+      if (randomSource) {
+        const fetched = await pullFromSource(randomSource);
+        const fresh = fetched.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+        const picks = fresh.sort(() => Math.random() - 0.5).slice(0, 2);
+        for (const p of picks) {
+          seenUrls.add(p.videoUrl);
+          videoQueue.push(p);
+        }
+        const queueEl = document.getElementById('queueCounter');
+        if (queueEl && videoQueue.length > 0) {
+          queueEl.textContent = `Video ${currentIndex + 1} of ${videoQueue.length}`;
+        }
+      }
+    } catch {
+      // silent background refill
+    } finally {
+      isBackgroundRefilling = false;
+    }
+  }
+
+  // 2. Warm up the next video in the queue using an offscreen <video preload="auto"> element
+  const nextItem = videoQueue[currentIndex + 1];
+  const prebufferBadge = document.getElementById('prebufferBadge');
+  if (!nextItem) {
+    prebufferBadge?.classList.add('hidden');
+    return;
+  }
+
+  const nextUrl = getEffectivePlaybackUrl(nextItem);
+  if (!nextUrl) return;
+
+  if (!prebufferVideoEl) {
+    prebufferVideoEl = document.createElement('video');
+    prebufferVideoEl.muted = true;
+    prebufferVideoEl.playsInline = true;
+    prebufferVideoEl.preload = 'auto';
+    prebufferVideoEl.style.display = 'none';
+    document.body.appendChild(prebufferVideoEl);
+  }
+
+  if (prebufferVideoEl.src !== nextUrl) {
+    prebufferVideoEl.src = nextUrl;
+    prebufferVideoEl.load();
+  }
+  nextItem.isPrebuffered = true;
+  prebufferBadge?.classList.remove('hidden');
+}
+
+function toggleReelsFullscreen(forceState) {
+  const stage = document.getElementById('videoStage');
+  const hud = document.getElementById('reelsHudOverlay');
+  if (!stage || !hud) return;
+
+  isReelsFullscreen = typeof forceState === 'boolean' ? forceState : !isReelsFullscreen;
+  stage.classList.toggle('reels-fullscreen', isReelsFullscreen);
+  hud.classList.toggle('hidden', !isReelsFullscreen);
+
+  if (isReelsFullscreen && currentIndex < 0 && videoQueue.length === 0) {
+    pullRandomVideos(1);
+  } else {
+    updatePlayerUI();
+  }
 }
 
 function updatePlayerUI() {
@@ -1198,6 +1571,8 @@ function updatePlayerUI() {
   const savePhoneBtn = document.getElementById('saveToPhoneBtn');
   const saveVaultBtn = document.getElementById('saveToVaultBtn');
   const emptyEl = document.getElementById('playerEmpty');
+  const reelsHudBadge = document.getElementById('reelsHudBadge');
+  const reelsHudTitle = document.getElementById('reelsHudTitle');
 
   queueEl.textContent =
     videoQueue.length > 0
@@ -1219,12 +1594,18 @@ function updatePlayerUI() {
   savePhoneBtn.disabled = false;
   saveVaultBtn.disabled = false;
 
+  const fMeta = getFormatBadgeInfo(current);
   titleEl.textContent = current.title || 'Untitled Video';
   badgeEl.textContent = current.sourceName || 'Random Feed';
 
-  // Update Format Badge & Convert Button
+  if (reelsHudBadge) {
+    reelsHudBadge.textContent = `${current.sourceName || 'Reel'} • ${fMeta.text}`;
+  }
+  if (reelsHudTitle) {
+    reelsHudTitle.textContent = current.title || 'Untitled Video';
+  }
+
   if (formatBadgeEl) {
-    const fMeta = getFormatBadgeInfo(current);
     formatBadgeEl.textContent = fMeta.text;
     formatBadgeEl.className = fMeta.className;
   }
@@ -1256,6 +1637,25 @@ function updatePlayerUI() {
         // iOS may require user tap if unmuted; user can tap play on controls
       });
     }
+  }
+
+  // Trigger background pre-buffering for the upcoming video
+  scheduleBackgroundQueuePrebuffer();
+}
+
+function advanceToNextVideo() {
+  if (currentIndex < videoQueue.length - 1) {
+    currentIndex++;
+    updatePlayerUI();
+  } else {
+    pullRandomVideos(1);
+  }
+}
+
+function goToPrevVideo() {
+  if (currentIndex > 0) {
+    currentIndex--;
+    updatePlayerUI();
   }
 }
 
@@ -1324,7 +1724,6 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         return;
       }
 
-      // Pick up to 2 random active sources for variety & speed
       const pickedSources = [...activeSources]
         .sort(() => Math.random() - 0.5)
         .slice(0, Math.min(2, activeSources.length));
@@ -1340,14 +1739,12 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       }
     }
 
-    // Filter out already seen URLs if possible
     let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
     if (fresh.length === 0 && pool.length > 0) {
       seenUrls.clear();
       fresh = pool;
     }
 
-    // Fallback if offline or no matches returned
     if (fresh.length === 0) {
       if (customKeyword) {
         showToast(`No matching videos found for "${customKeyword}". Try another keyword!`);
@@ -1357,7 +1754,6 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       fresh = [...FALLBACK_VIDEOS];
     }
 
-    // Shuffle and pick requested count
     const selected = fresh.sort(() => Math.random() - 0.5).slice(0, count);
     for (const item of selected) {
       seenUrls.add(item.videoUrl);
@@ -1385,7 +1781,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
 // ==========================================
 
 async function downloadVideoToIphone(videoItem) {
-  if (!videoItem?.videoUrl) return;
+  if (!videoItem?.videoUrl && !videoItem?.offlineBlob) return;
 
   const statusBox = document.getElementById('downloadStatusBox');
   const statusText = document.getElementById('downloadStatusText');
@@ -1427,7 +1823,6 @@ async function downloadVideoToIphone(videoItem) {
     const cleanFileName = `${baseSlug}.${ext || 'mp4'}`;
     const file = new File([blob], cleanFileName, { type: mime || 'video/mp4' });
 
-    // On iPhone Safari, navigator.share({ files }) opens the native sheet with "Save Video" (to Photos) & "Save to Files"
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       if (statusText) statusText.textContent = 'Opening iPhone Save menu...';
       await navigator.share({
@@ -1440,7 +1835,6 @@ async function downloadVideoToIphone(videoItem) {
           : 'Saved! Choose "Save Video" for Photos app.'
       );
     } else {
-      // Standard browser file download
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
@@ -1457,10 +1851,8 @@ async function downloadVideoToIphone(videoItem) {
     }
   } catch (err) {
     if (err?.name === 'AbortError') {
-      // User dismissed iOS share sheet
       showToast('Share menu closed');
     } else {
-      // Fallback: open direct link (prefer convertedUrl if present)
       const fallbackUrl = videoItem.convertedUrl || videoItem.videoUrl;
       const fallbackExt = detectVideoFormat(fallbackUrl).ext;
       const a = document.createElement('a');
@@ -1483,7 +1875,7 @@ async function downloadVideoToIphone(videoItem) {
 }
 
 // ==========================================
-// RENDER SOURCES, SEARCH RESULTS & VAULT
+// RENDER SOURCES, SEARCH RESULTS & OFFLINE VAULT
 // ==========================================
 
 function renderSourcesList() {
@@ -1571,6 +1963,7 @@ async function renderVaultList() {
   const items = await getAllVaultVideos();
   const listEl = document.getElementById('vaultList');
   const badgeEl = document.getElementById('vaultBadge');
+  const summaryEl = document.getElementById('vaultStorageSummary');
 
   if (badgeEl) {
     if (items.length > 0) {
@@ -1581,27 +1974,43 @@ async function renderVaultList() {
     }
   }
 
+  const totalOfflineBytes = items.reduce((acc, item) => acc + (Number(item.offlineSize) || 0), 0);
+  const totalOfflineMb = (totalOfflineBytes / (1024 * 1024)).toFixed(1);
+  if (summaryEl) {
+    summaryEl.textContent =
+      totalOfflineBytes > 0
+        ? `${items.length} saved • ${totalOfflineMb} MB cached offline`
+        : `${items.length} video${items.length === 1 ? '' : 's'} saved`;
+  }
+
   if (!listEl) return;
   if (items.length === 0) {
-    listEl.innerHTML = `<p class="muted-center">No videos saved in your Vault yet. Tap "📥 Vault" on any video to save it here.</p>`;
+    listEl.innerHTML = `<p class="muted-center">No videos saved in your Vault yet. Tap "📥 Vault" (or double-tap any video) to save it here for offline replay.</p>`;
     return;
   }
 
   listEl.innerHTML = items
     .map((item) => {
       const fMeta = getFormatBadgeInfo(item);
+      const isOfflineReady = Boolean(item.hasOfflineBlob || item.offlineBlob);
+      const sizeMb = item.offlineSize ? `${(item.offlineSize / (1024 * 1024)).toFixed(1)} MB` : '';
+      const offlineBadgeHtml = isOfflineReady
+        ? `<span class="offline-badge">✅ Offline ${sizeMb}</span>`
+        : `<button class="btn-inline-convert" data-action="cache-vault-item" data-id="${escapeHtml(item.id)}">☁️ Cache Offline</button>`;
+
       return `
       <div class="video-list-item">
         <div class="vli-header">
           <div class="vli-title">${escapeHtml(item.title)}</div>
           <div class="vli-badges">
+            ${offlineBadgeHtml}
             <span class="${fMeta.className}">${escapeHtml(fMeta.text)}</span>
             <span class="source-badge">${escapeHtml(item.sourceName || 'Saved')}</span>
           </div>
         </div>
         <div class="vli-actions">
           <button class="btn-primary btn-mini" data-action="play-vault-item" data-id="${escapeHtml(item.id)}">
-            ▶ Watch
+            ▶ Watch ${isOfflineReady ? '(Offline)' : ''}
           </button>
           <button class="btn-download btn-mini" data-action="download-vault-item" data-id="${escapeHtml(item.id)}">
             📲 Save to iPhone
@@ -1634,6 +2043,59 @@ function escapeHtml(str) {
 }
 
 // ==========================================
+// SAFARI "SEND TO REELVAULT" BOOKMARKLET & URL PARAMS
+// ==========================================
+
+function initBookmarkletAndUrlParams() {
+  const baseAppUrl = `${window.location.origin}${window.location.pathname}`;
+  const bookmarkletCode = `javascript:(function(){window.location.href='${baseAppUrl}?scan='+encodeURIComponent(window.location.href);})();`;
+
+  const codeInput = document.getElementById('bookmarkletCodeInput');
+  if (codeInput) {
+    codeInput.value = bookmarkletCode;
+  }
+
+  document.getElementById('copyBookmarkletBtn')?.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(bookmarkletCode);
+      showToast('Copied Safari Bookmarklet code!');
+    } catch {
+      if (codeInput) {
+        codeInput.select();
+        document.execCommand('copy');
+        showToast('Copied Safari Bookmarklet code!');
+      }
+    }
+  });
+
+  // Check if launched via Safari Bookmarklet (?scan=URL or ?url=URL) or quick query (?q=keyword)
+  const params = new URLSearchParams(window.location.search);
+  const scanTarget = params.get('scan') || params.get('url');
+  const queryTarget = params.get('q');
+
+  if (scanTarget) {
+    switchTab('view-search');
+    const urlScanInput = document.getElementById('urlScanInput');
+    if (urlScanInput) urlScanInput.value = scanTarget;
+    const listEl = document.getElementById('searchResultsList');
+    if (listEl) {
+      listEl.innerHTML = `<p class="muted-center">Scanning "${escapeHtml(scanTarget)}" for downloadable videos...</p>`;
+    }
+    scanUrlForVideos(scanTarget, 'Safari Bookmarklet')
+      .then((found) => {
+        renderSearchResults(found);
+        showToast(`Found ${found.length} video(s) from Safari page!`);
+      })
+      .catch(() => {
+        renderSearchResults([]);
+        showToast('Could not scan that URL due to site security restrictions.');
+      });
+  } else if (queryTarget) {
+    pullRandomVideos(1, queryTarget);
+  }
+}
+
+// ==========================================
 // INITIALIZATION & EVENT LISTENERS
 // ==========================================
 
@@ -1642,31 +2104,45 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateHeaderSummary();
   renderSourcesList();
   await renderVaultList();
+  initBookmarkletAndUrlParams();
 
   // Sync settings controls
   const nsfwToggle = document.getElementById('allowNsfwToggle');
   const autoPlayToggle = document.getElementById('autoPlayToggle');
   const formatModeSelect = document.getElementById('formatModeSelect');
   const autoConvertToggle = document.getElementById('autoConvertToggle');
+  const autoAdvanceToggle = document.getElementById('autoAdvanceToggle');
+  const prebufferToggle = document.getElementById('prebufferToggle');
+  const offlineVaultToggle = document.getElementById('offlineVaultToggle');
 
   if (nsfwToggle) nsfwToggle.checked = Boolean(settings.allowNsfw);
   if (autoPlayToggle) autoPlayToggle.checked = Boolean(settings.autoPlay);
   if (formatModeSelect) formatModeSelect.value = settings.formatMode || 'all';
   if (autoConvertToggle) autoConvertToggle.checked = settings.autoConvert !== false;
+  if (autoAdvanceToggle) autoAdvanceToggle.checked = settings.autoAdvance !== false;
+  if (prebufferToggle) prebufferToggle.checked = settings.prebuffer !== false;
+  if (offlineVaultToggle) offlineVaultToggle.checked = settings.offlineVaultCache !== false;
 
   // Register Service Worker for PWA
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
-  // Auto-convert on playback error if a non-native format fails to decode directly on iPhone Safari
   const mainVideoEl = document.getElementById('mainVideo');
+
+  // Auto-Advance on Video End
+  mainVideoEl?.addEventListener('ended', () => {
+    if (settings.autoAdvance) {
+      advanceToNextVideo();
+    }
+  });
+
+  // Auto-convert on playback error if a non-native format fails to decode directly on iPhone Safari
   mainVideoEl?.addEventListener('error', async () => {
     const current = videoQueue[currentIndex];
     if (!current || mainVideoEl.dataset.autoConvertAttempted === 'true') return;
     mainVideoEl.dataset.autoConvertAttempted = 'true';
 
-    // If a pre-transcoded derivative URL exists and wasn't tried yet, switch to it immediately
     if (current.convertedUrl && mainVideoEl.src !== current.convertedUrl) {
       mainVideoEl.src = current.convertedUrl;
       mainVideoEl.load();
@@ -1674,7 +2150,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    // Otherwise run on-device auto-conversion if enabled
     if (settings.autoConvert && !current.convertedBlobUrl) {
       showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
       await convertCurrentVideoForPlayer(current);
@@ -1689,9 +2164,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  // Fullscreen Vertical Swipe (Reels) Mode Controls
+  document.getElementById('reelsModeBtn')?.addEventListener('click', () => {
+    toggleReelsFullscreen(true);
+  });
+  document.getElementById('exitReelsModeBtn')?.addEventListener('click', () => {
+    toggleReelsFullscreen(false);
+  });
+  document.getElementById('reelsNextBtn')?.addEventListener('click', () => {
+    advanceToNextVideo();
+  });
+  document.getElementById('reelsSavePhoneBtn')?.addEventListener('click', () => {
+    const current = videoQueue[currentIndex];
+    if (current) downloadVideoToIphone(current);
+  });
+  document.getElementById('reelsVaultBtn')?.addEventListener('click', async () => {
+    const current = videoQueue[currentIndex];
+    if (current) await saveAndCacheVideoToVault(current);
+  });
+
   // Bottom Navigation Tabs
   document.querySelectorAll('.nav-tab').forEach((btn) => {
     btn.addEventListener('click', () => {
+      if (isReelsFullscreen) toggleReelsFullscreen(false);
       switchTab(btn.dataset.target);
     });
   });
@@ -1711,25 +2206,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('nextVideoBtn')?.addEventListener('click', () => {
-    if (currentIndex < videoQueue.length - 1) {
-      currentIndex++;
-      updatePlayerUI();
-    } else {
-      pullRandomVideos(1);
-    }
+    advanceToNextVideo();
   });
 
   document.getElementById('prevVideoBtn')?.addEventListener('click', () => {
-    if (currentIndex > 0) {
-      currentIndex--;
-      updatePlayerUI();
-    }
+    goToPrevVideo();
   });
 
-  // Swipe left/right on Video Stage for quick Next/Prev on iPhone
+  // Swipe Left/Right AND Vertical Swipe Up/Down (in Reels Mode) + Double-Tap to Vault on Video Stage
   const stage = document.getElementById('videoStage');
   let touchStartX = 0;
   let touchStartY = 0;
+  let lastTapTime = 0;
+
   stage?.addEventListener(
     'touchstart',
     (e) => {
@@ -1738,19 +2227,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     },
     { passive: true }
   );
+
   stage?.addEventListener(
     'touchend',
-    (e) => {
+    async (e) => {
       const dx = e.changedTouches[0].screenX - touchStartX;
       const dy = e.changedTouches[0].screenY - touchStartY;
+
+      // Horizontal Swipe (Left = Next, Right = Prev)
       if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy)) {
         if (dx < 0) {
-          // Swipe Left -> Next
-          document.getElementById('nextVideoBtn')?.click();
-        } else if (currentIndex > 0) {
-          // Swipe Right -> Prev
-          document.getElementById('prevVideoBtn')?.click();
+          advanceToNextVideo();
+        } else {
+          goToPrevVideo();
         }
+        return;
+      }
+
+      // Vertical Swipe in Fullscreen Reels Mode (Swipe Up = Next, Swipe Down = Prev)
+      if (isReelsFullscreen && Math.abs(dy) > 65 && Math.abs(dy) > Math.abs(dx)) {
+        if (dy < 0) {
+          advanceToNextVideo();
+        } else {
+          goToPrevVideo();
+        }
+        return;
+      }
+
+      // Double-tap on video stage to save to Offline Vault
+      if (Math.abs(dx) < 15 && Math.abs(dy) < 15 && !e.target.closest('button')) {
+        const now = Date.now();
+        if (now - lastTapTime < 280) {
+          const current = videoQueue[currentIndex];
+          if (current) {
+            const fb = document.getElementById('doubleTapFeedback');
+            fb?.classList.remove('hidden');
+            setTimeout(() => fb?.classList.add('hidden'), 1100);
+            await saveAndCacheVideoToVault(current);
+          }
+        }
+        lastTapTime = now;
       }
     },
     { passive: true }
@@ -1761,7 +2277,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     pullRandomVideos(5);
   });
 
-  // Save to iPhone & Save to Vault
+  // Save to iPhone & Save to Offline Vault
   document.getElementById('saveToPhoneBtn')?.addEventListener('click', () => {
     const current = videoQueue[currentIndex];
     if (current) downloadVideoToIphone(current);
@@ -1770,30 +2286,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('saveToVaultBtn')?.addEventListener('click', async () => {
     const current = videoQueue[currentIndex];
     if (!current) return;
-    await saveVideoToVaultDB(current);
-    await renderVaultList();
-    showToast('Saved to your Offline Vault!');
+    await saveAndCacheVideoToVault(current);
   });
 
-  // TAB 2: Multi-Engine Search Form
+  // TAB 2: Multi-Engine Search Form (All 7 Open Networks)
   document.getElementById('deepSearchForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const query = document.getElementById('deepSearchInput')?.value?.trim();
     if (!query) return;
 
     const useArchive = document.getElementById('engArchive')?.checked;
+    const usePrelinger = document.getElementById('engPrelinger')?.checked;
     const useWiki = document.getElementById('engWikimedia')?.checked;
     const useReddit = document.getElementById('engReddit')?.checked;
+    const usePeerTube = document.getElementById('engPeerTube')?.checked;
+    const useFediverse = document.getElementById('engFediverse')?.checked;
+    const useNasa = document.getElementById('engNasa')?.checked;
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
-      listEl.innerHTML = `<p class="muted-center">Searching open video networks for "${escapeHtml(query)}"...</p>`;
+      listEl.innerHTML = `<p class="muted-center">Searching selected open video networks for "${escapeHtml(query)}"...</p>`;
     }
 
     const tasks = [];
-    if (useArchive) tasks.push(searchInternetArchive(query, 8));
-    if (useWiki) tasks.push(searchWikimediaVideos(query, 10));
+    if (useArchive) tasks.push(searchInternetArchive(query, 6));
+    if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));
+    if (useWiki) tasks.push(searchWikimediaVideos(query, 8));
     if (useReddit) tasks.push(searchRedditVideosByKeyword(query));
+    if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
+    if (useFediverse) tasks.push(searchFediverseVideos(query));
+    if (useNasa) tasks.push(searchNasaVideos(query, 6));
 
     const settled = await Promise.allSettled(tasks);
     const combined = [];
@@ -1845,9 +2367,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else if (btn.dataset.action === 'download-search-item') {
       await downloadVideoToIphone(item);
     } else if (btn.dataset.action === 'vault-search-item') {
-      await saveVideoToVaultDB(item);
-      await renderVaultList();
-      showToast('Saved to Vault!');
+      await saveAndCacheVideoToVault(item);
     }
   });
 
@@ -1963,6 +2483,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     );
   });
 
+  autoAdvanceToggle?.addEventListener('change', () => {
+    settings.autoAdvance = autoAdvanceToggle.checked;
+    saveSettings();
+    showToast(settings.autoAdvance ? 'Auto-advance on video end enabled' : 'Auto-advance disabled');
+  });
+
+  prebufferToggle?.addEventListener('change', () => {
+    settings.prebuffer = prebufferToggle.checked;
+    saveSettings();
+    if (settings.prebuffer) {
+      scheduleBackgroundQueuePrebuffer();
+      showToast('Background queue pre-buffering enabled');
+    } else {
+      document.getElementById('prebufferBadge')?.classList.add('hidden');
+      showToast('Background pre-buffering disabled');
+    }
+  });
+
+  offlineVaultToggle?.addEventListener('change', () => {
+    settings.offlineVaultCache = offlineVaultToggle.checked;
+    saveSettings();
+    showToast(
+      settings.offlineVaultCache
+        ? 'Offline video file caching enabled for Vault'
+        : 'Vault will save lightweight links only'
+    );
+  });
+
   nsfwToggle?.addEventListener('change', () => {
     settings.allowNsfw = nsfwToggle.checked;
     saveSettings();
@@ -1980,12 +2528,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       allowNsfw: false,
       autoPlay: true,
       formatMode: 'all',
-      autoConvert: true
+      autoConvert: true,
+      autoAdvance: true,
+      prebuffer: true,
+      offlineVaultCache: true
     };
     if (nsfwToggle) nsfwToggle.checked = false;
     if (autoPlayToggle) autoPlayToggle.checked = true;
     if (formatModeSelect) formatModeSelect.value = 'all';
     if (autoConvertToggle) autoConvertToggle.checked = true;
+    if (autoAdvanceToggle) autoAdvanceToggle.checked = true;
+    if (prebufferToggle) prebufferToggle.checked = true;
+    if (offlineVaultToggle) offlineVaultToggle.checked = true;
     videoQueue = [];
     currentIndex = -1;
     seenUrls.clear();
@@ -1996,7 +2550,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     showToast('Reset to default sources & settings');
   });
 
-  // TAB 4: Vault Actions
+  // TAB 4: Vault Actions (Play Offline, Export, Cache Offline on demand, Delete)
   document.getElementById('vaultList')?.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
@@ -2012,6 +2566,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       updatePlayerUI();
     } else if (btn.dataset.action === 'download-vault-item') {
       await downloadVideoToIphone(item);
+    } else if (btn.dataset.action === 'cache-vault-item') {
+      btn.disabled = true;
+      btn.textContent = '⏳ Caching...';
+      await saveAndCacheVideoToVault(item, true);
     } else if (btn.dataset.action === 'delete-vault-item') {
       await deleteVaultVideoDB(id);
       await renderVaultList();

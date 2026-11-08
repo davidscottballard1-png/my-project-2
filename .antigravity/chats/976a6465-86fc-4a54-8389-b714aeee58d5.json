@@ -196,6 +196,54 @@
       "created_at": "2026-11-08T00:11:38.205Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "83826cf0-9114-483b-b8a6-5a61c311acb2",
+      "role": "agent",
+      "content": "I have updated ReelVault to pull, play, and auto-convert **19 video file extensions** from across the web so they work on your iPhone.\n\n### What Was Added\n\n1. **Expanded Video File Extensions ([`VIDEO_FORMAT_CATALOG`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L11-L31))**\n   * **iPhone Native Formats (work by default in Safari & Photos):** `.mp4`, `.mov` (Apple QuickTime), `.m4v` (Apple iTunes video), `.3gp`, `.3g2`, and `.m3u8` (HLS).\n   * **Web & Archive Video Formats (with automatic `.mp4` conversion):** `.webm`, `.ogv`, `.ogg`, `.mkv`, `.avi`, `.mpeg`, `.mpg`, `.flv`, `.f4v`, `.wmv`, `.ts`, `.m2ts`, and `.gifv`.\n\n2. **3-Stage Automatic iPhone `.MP4` Conversion Pipeline ([`obtainIphoneReadyVideoBlob`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L455-L534))**\n   * **Instant URL & Server Derivative Matching:**\n     * `.gifv` links and animated Reddit GIF-video variants are automatically rewritten to direct `.mp4` streams via [`normalizeAndAutoRewriteVideoUrl`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L170-L195).\n     * [`searchWikimediaVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L714-L761) queries MediaWiki's `videoinfo` derivatives API to pair `.ogv`, `.webm`, and `.mpeg` files with transcoded `.mp4` streams.\n     * [`searchInternetArchive`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L636-L711) pulls `.mov`, `.m4v`, `.webm`, `.ogv`, `.mkv`, `.avi`, `.mpeg`, `.mpg`, `.3gp`, `.flv`, `.wmv`, and `.mp4` files and pairs non-MP4 files with Archive.org `.mp4` derivatives when available.\n   * **On-Device WebAssembly Remuxing & Transcoding ([`transcodeBlobWithFfmpegWasm`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L291-L361)):**\n     * Uses single-threaded `@ffmpeg/ffmpeg` in the browser to fast-remux (`.mkv`, `.mov`, `.ts`, `.flv`, `.avi`) or transcode (`.webm`, `.ogv`, `.mpeg`, `.wmv`) into `.mp4` (`video/mp4`) with live progress updates.\n   * **iPhone Hardware `MediaRecorder` Fallback ([`transcodeBlobWithMediaRecorder`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L364-L452)):**\n     * Uses iOS Safari's native hardware `video/mp4` `MediaRecorder` to convert browser-decodable videos into Camera Roll-compatible `.mp4` files when needed.\n\n3. **Format Badges, 1-Tap Convert Button & Format Filter Settings ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L75-L90), [styles.css](https://github.com/davidscottballard1-png/my-project-2/blob/main/styles.css#L240-L263))**\n   * Every pulled video displays its format badge (e.g., `MOV • iPhone Native`, `WEBM • Auto-MP4`, `OGV → MP4 ✓`).\n   * Tapping **Save to iPhone (Photos / Files)** automatically converts non-native formats into `.mp4` so iOS shows **\"Save Video\"** for your Camera Roll, or you can tap **🔄 Convert to .MP4** directly in the player.\n   * Added format filter and auto-convert controls in the **Sources → Settings** tab ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L242-L264)) so you can switch between **All Formats + Auto-Convert**, **iPhone Native Only**, or **Strict .MP4 Only**.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "ac402221-43f0-45e2-9bf6-998f2e0a6ef3",
+      "created_at": "2026-11-08T00:19:10.057Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "25266656-9b1b-4043-b564-064206f66d7c",
+      "role": "user",
+      "content": "Any ideas you have for this?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T00:22:03.384Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "1937b70b-c977-4664-bf55-4de4a36b38b8",
+      "role": "agent",
+      "content": "Here are some high-impact ideas we could add to **ReelVault** ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html), [app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js)):\n\n### 1. 🌐 More Open Video Networks (Zero API Keys Required)\n* **PeerTube Global Search (SepiaSearch API):** Search across 1,000+ federated PeerTube video servers for direct `.mp4` and `.m3u8` videos on any keyword.\n* **Lemmy & Mastodon Video Feeds:** Pull random viral video posts from Lemmy communities (`lemmy.world`) and Mastodon hashtag feeds, which expose open JSON APIs with direct `.mp4` / `.webm` files.\n* **NASA Video Library & Prelinger Retro Archives:** Direct integration with `images-api.nasa.gov` and vintage TV/commercial collections.\n\n### 2. ✂️ Built-In iPhone Video Tools (Before Saving to Photos)\n* **Quick Video Trimmer (Start / End Sliders):** If you pull a longer video (e.g., from Archive.org or Wikimedia), trim out a 10–30 second clip and export just that slice as an `.mp4` to your Camera Roll using the existing [`transcodeBlobWithFfmpegWasm`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L291-L361) engine.\n* **Extract Audio only (`.M4A` / `.MP3`):** A button to strip just the audio track or sample from a pulled video and save it to iPhone Files.\n* **Frame Grabber & GIF Loop Maker:** Save the current video frame as a `.png` to Photos, or convert a short segment into a looping `.gif`.\n* **Speed & A–B Loop Controls:** `0.5x`, `1.25x`, `1.5x`, `2x` playback speed pills and a loop toggle on the player card.\n\n### 3. ⚡ Faster Playback & Reels-Style Discovery\n* **Background Queue Pre-Buffer & Pre-Converter:** While you watch Video #1 in [`updatePlayerUI`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L906-L977), silently pull and pre-convert Video #2 in the background so tapping **Next ⏭** is instant.\n* **Fullscreen Vertical Swipe Mode:** A toggle to expand `#videoStage` ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L51-L72)) into an edge-to-edge vertical swipe feed (swipe up for next random video, double-tap to save to Vault).\n* **Auto-Advance on Video End:** Option to automatically pull and play the next video as soon as the current clip finishes.\n\n### 4. 📥 True Offline Vault & Safari Shortcut\n* **True Offline Video Storage in Vault:** Right now [`saveVideoToVaultDB`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L575-L594) saves the video metadata and URL. We can add an **\"Offline Cache\"** toggle so the actual `.mp4` video bytes are stored in `IndexedDB` for airplane-mode playback.\n* **Safari \"Send to ReelVault\" Bookmarklet / iOS Shortcut:** Generate a 1-tap bookmarklet in the Settings tab so when you're on any webpage in iPhone Safari, tapping it opens ReelVault and immediately runs [`scanUrlForVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L823-L886) on that page.\n\nWhich of these would you like me to build first? (Feel free to pick one, a few, or all of them!)",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "25266656-9b1b-4043-b564-064206f66d7c",
+      "created_at": "2026-11-08T00:22:33.840Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "21b1a0fe-7c57-4fc3-9959-0911d8cbb4cf",
+      "role": "user",
+      "content": "Ok add everything from 1, 3, and 4",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T00:25:03.861Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }

@@ -5,12 +5,13 @@
 ## ✨ Features
 
 * **🎬 Multi-Format Video Pulling & Auto-Conversion:** Pulls both **iPhone-native video formats** (`.mp4`, `.mov`, `.m4v`, `.3gp`, `.3g2`, `.m3u8`) and **open-web video formats** (`.webm`, `.ogv`, `.ogg`, `.mkv`, `.avi`, `.mpeg`, `.mpg`, `.flv`, `.f4v`, `.wmv`, `.ts`, `.m2ts`, `.gifv`). Non-native formats are automatically converted/transcoded into iPhone-compatible `.mp4` (via server derivative matching, on-device FFmpeg WebAssembly remuxing/transcoding, and iOS hardware `MediaRecorder`) for smooth playback and Camera Roll saving.
+* **🌐 7 Open Video Networks (Zero API Keys):** Search simultaneously across **Internet Archive**, **Prelinger Retro Archives**, **Wikimedia Commons**, **Global Reddit Videos**, **PeerTube Network (SepiaSearch)**, **Lemmy & Mastodon Fediverse**, and **NASA Image & Video Library**.
+* **📱 Fullscreen Vertical Swipe (Reels) Mode & Pre-Buffering:** Enter edge-to-edge Fullscreen Swipe Mode (swipe up for next, swipe down for previous, double-tap to Vault), with automatic background queue pre-buffering and auto-advance on video end.
 * **🎲 1-Tap Random Video Shuffle & Batch Pull:** Pull a random video (or a batch of 5 at once) from your active sources, or swipe left/right on the player to move through your queue.
-* **🌐 Multi-Engine Web Keyword Search:** Type any keyword or topic to search simultaneously across **Internet Archive**, **Wikimedia Commons**, and **Global Reddit Video Search** across all supported video extensions.
-* **🔗 Multi-Format Webpage Video Scanner:** Paste a webpage link or direct video URL to scan the page code and extract downloadable `.mp4`, `.mov`, `.m4v`, `.webm`, `.ogv`, `.mkv`, `.avi`, `.mpeg`, `.3gp`, `.flv`, `.wmv`, `.ts`, `.m3u8`, and `.gifv` video files.
+* **🔗 Multi-Format Webpage Video Scanner + Safari Bookmarklet:** Paste any webpage link or install the 1-tap **"Send to ReelVault" Safari Bookmarklet** (`?scan=`) to extract downloadable videos from any page you're browsing on your iPhone.
 * **🎛 Custom Sources Manager:** Add your own custom **Keywords/Topics**, **Subreddits**, or **Direct/JSON Feed URLs**. Toggle any source ON or OFF anytime. All custom sources are stored privately in your iPhone's local storage.
 * **📲 Save Straight to iPhone Photos or Files:** Uses the iOS Web Share API (`navigator.share`) so tapping **Save to iPhone** opens the native iOS sheet where you can tap **"Save Video"** (saves straight to your Camera Roll) or **"Save to Files"**.
-* **📥 Built-In Vault:** Save favorite clips to your device's local `IndexedDB` vault for quick replay.
+* **📥 True Offline Vault (`IndexedDB`):** Caches actual converted `.mp4` video files inside your iPhone's local `IndexedDB` storage for 100% offline Airplane-Mode playback.
 
 ---
 

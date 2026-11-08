@@ -54,8 +54,39 @@
               playsinline
               webkit-playsinline
               controls
-              preload="metadata"
+              preload="auto"
             ></video>
+
+            <!-- Double-Tap Vault Feedback -->
+            <div id="doubleTapFeedback" class="double-tap-feedback hidden">📥 Saved to Vault!</div>
+
+            <!-- Fullscreen Vertical Reels HUD Overlay -->
+            <div id="reelsHudOverlay" class="reels-hud hidden">
+              <div class="reels-hud-top">
+                <span id="reelsHudBadge" class="source-badge">Reels Mode</span>
+                <button type="button" id="exitReelsModeBtn" class="reels-exit-btn">✕ Exit Fullscreen</button>
+              </div>
+              <div class="reels-hud-bottom">
+                <div class="reels-hud-caption">
+                  <h4 id="reelsHudTitle">Swipe Up for Next Video</h4>
+                  <p id="reelsHudHint">Swipe ⬆️ Next • Swipe ⬇️ Prev • Double-tap to Vault</p>
+                </div>
+                <div class="reels-hud-rail">
+                  <button type="button" id="reelsNextBtn" class="reels-rail-btn" title="Next Video">
+                    <span>🎲</span>
+                    <small>Next</small>
+                  </button>
+                  <button type="button" id="reelsSavePhoneBtn" class="reels-rail-btn" title="Save to iPhone">
+                    <span>📲</span>
+                    <small>Save</small>
+                  </button>
+                  <button type="button" id="reelsVaultBtn" class="reels-rail-btn" title="Save to Offline Vault">
+                    <span>📥</span>
+                    <small>Vault</small>
+                  </button>
+                </div>
+              </div>
+            </div>
 
             <!-- Loading Overlay -->
             <div id="playerLoading" class="player-overlay hidden">
@@ -77,13 +108,17 @@
               <div class="badge-group">
                 <span class="source-badge" id="videoSourceBadge">Ready</span>
                 <span class="format-badge hidden" id="videoFormatBadge">MP4</span>
+                <span class="prebuffer-badge hidden" id="prebufferBadge">⚡ Next Preloaded</span>
               </div>
               <span class="queue-counter" id="queueCounter">0 in queue</span>
             </div>
             <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
             <div class="meta-links">
               <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
-              <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
+              <div class="meta-inline-btns">
+                <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
+                <button type="button" id="reelsModeBtn" class="btn-inline-reels">📱 Fullscreen Swipe</button>
+              </div>
             </div>
           </div>
 
@@ -148,12 +183,28 @@
                 <span>Internet Archive</span>
               </label>
               <label class="chip-check">
+                <input type="checkbox" id="engPrelinger" checked />
+                <span>Prelinger Retro</span>
+              </label>
+              <label class="chip-check">
                 <input type="checkbox" id="engWikimedia" checked />
                 <span>Wikimedia Commons</span>
               </label>
               <label class="chip-check">
                 <input type="checkbox" id="engReddit" checked />
-                <span>Reddit Global Videos</span>
+                <span>Reddit Global</span>
+              </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engPeerTube" checked />
+                <span>PeerTube Network</span>
+              </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engFediverse" checked />
+                <span>Lemmy &amp; Mastodon</span>
+              </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engNasa" checked />
+                <span>NASA Video Library</span>
               </label>
             </div>
             <button type="submit" class="btn-accent">🔍 Search &amp; Pull Videos</button>
@@ -174,6 +225,27 @@
             />
             <button type="submit" class="btn-primary">📡 Scan Page for All Video Formats</button>
           </form>
+        </div>
+
+        <div class="card-section">
+          <h2>🔖 Safari "Send to ReelVault" Bookmarklet</h2>
+          <p class="section-desc">
+            Add this 1-tap bookmarklet to iPhone Safari. Whenever you're on any webpage in Safari, tap the bookmarklet to launch ReelVault and automatically scan that page for downloadable videos!
+          </p>
+          <div class="bookmarklet-box">
+            <input
+              type="text"
+              id="bookmarkletCodeInput"
+              readonly
+              aria-label="Safari Bookmarklet Code"
+            />
+            <button type="button" id="copyBookmarkletBtn" class="btn-secondary">
+              📋 Copy Safari Bookmarklet Code
+            </button>
+          </div>
+          <p class="setting-sub">
+            <strong>How to add on iPhone:</strong> Bookmark any page in Safari → tap Edit → name it <em>"Send to ReelVault"</em> → paste this code as the URL.
+          </p>
         </div>
 
         <div class="card-section">
@@ -264,6 +336,36 @@
           </div>
           <div class="setting-row">
             <div>
+              <strong>Auto-Advance on Video End</strong>
+              <p class="setting-sub">Automatically advance to (or pull) the next video as soon as the current clip finishes playing.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autoAdvanceToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Background Queue Pre-Buffering</strong>
+              <p class="setting-sub">Silently pull and pre-buffer the next video in the background while you watch so tapping Next is instant.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="prebufferToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>True Offline Video Cache in Vault</strong>
+              <p class="setting-sub">Store the actual converted <code>.mp4</code> video file inside your iPhone's local <code>IndexedDB</code> Vault for Airplane-Mode playback.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="offlineVaultToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
               <strong>Include 18+ Results in Custom Searches</strong>
               <p class="setting-sub">Allow unfiltered search results when querying custom keywords or subreddits on your device.</p>
             </div>
@@ -294,11 +396,14 @@
       <section id="view-vault" class="tab-view">
         <div class="card-section">
           <div class="section-header-row">
-            <h2>📥 Saved Vault</h2>
+            <div>
+              <h2>📥 Saved Offline Vault</h2>
+              <span id="vaultStorageSummary" class="badge-subtle">0 videos saved</span>
+            </div>
             <button id="clearVaultBtn" class="btn-text-danger">Clear All</button>
           </div>
           <p class="section-desc">
-            Videos saved inside your iPhone's local browser storage for quick replay or one-tap export to Photos/Files.
+            Videos saved inside your iPhone's local <code>IndexedDB</code> storage with full offline video caching for Airplane-Mode replay or instant export to Photos/Files.
           </p>
           <div id="vaultList" class="video-grid-list">
             <p class="muted-center">No videos saved in your Vault yet.</p>
