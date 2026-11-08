@@ -112,6 +112,42 @@
       "created_at": "2026-11-08T02:12:03.864Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "15ef9722-e1a1-4117-afbd-ae8a5f51303b",
+      "role": "agent",
+      "content": "Yes! I just added a new test suite in [new-features.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/new-features.test.js) and verified that all **79 unit tests across 28 test suites** pass.\n\nHere is what the new tests cover:\n\n1. **18+ Age Gate Toggle & Verification Modal ([new-features.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/new-features.test.js#L86-L157)):**\n   - Verifies that [`openAgeGateModal`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L881-L884) and [`closeAgeGateModal`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L886-L890) properly show and hide the 18+ confirmation modal.\n   - Verifies that [`setAdultContentEnabled`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L892-L902) toggles `settings.allowNsfw`, updates the top header button (`🔞 18+ On` / `🔞 18+ Off` and `aria-pressed`), keeps the Settings switch in sync via [`syncAgeGateUI`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L867-L879), and persists the choice to `localStorage`.\n   - Verifies that [`extractRedditVideosFromListing`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1116-L1169) allows `over_18` video posts and extracts direct `url_overridden_by_dest` video links when 18+ mode is enabled.\n\n2. **HLS `.M3U8` Manifest Parser & Snippet Stitcher ([new-features.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/new-features.test.js#L159-L253)):**\n   - Tests [`parseM3u8Manifest`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L563-L635) on **Master Playlists** (`#EXT-X-STREAM-INF`) to ensure it selects the best mobile HD variant URL.\n   - Tests [`parseM3u8Manifest`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L563-L635) on **Media Segment Playlists** to ensure `#EXT-X-MAP` initialization headers and `.ts` / `.m4s` snippets are resolved in exact sequence.\n   - Tests [`downloadAndAssembleM3u8Stream`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L638-L694) end-to-end by crawling a Master $\\rightarrow$ Media `.m3u8` stream and verifying that the binary snippet chunks are stitched into a single continuous `Blob` in the exact byte order.\n\n3. **Free Tube Sites Decoder & Automatic Search ([new-features.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/new-features.test.js#L255-L343)):**\n   - Tests [`extractVideoUrlsFromHtml`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1553-L1594) to verify it decodes JSON-escaped slashes (`https:\\/\\/...`) and Unicode escapes (`\\u002F`, `\\u0026`) inside `<script>` player configs and prioritizes full-length streams over thumbnail previews.\n   - Tests [`searchFreeTubeSites`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1682-L1767) to verify it queries Dailymotion and 18+ tube APIs (like Eporner API v2) and extracts playable `.mp4` streams.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "8428e04a-7bf3-4c8e-8e4b-e0f88ef86132",
+      "created_at": "2026-11-08T02:13:47.362Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "77d22500-1010-4283-bce0-dfdb5ea22ea3",
+      "role": "user",
+      "content": "Did you relock the test file?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T02:15:13.709Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "ae391201-bb3d-44d1-ba5f-86eca2417506",
+      "role": "agent",
+      "content": "Yes! Both [app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) (which remained locked the entire time) and the new [new-features.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/new-features.test.js) are now locked (`-r--r--r--` read-only permissions), all **79 tests** pass, and everything is saved.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "77d22500-1010-4283-bce0-dfdb5ea22ea3",
+      "created_at": "2026-11-08T02:15:44.830Z",
+      "sender": "macOS",
+      "is_cancelled": false
     }
   ]
 }
