@@ -208,6 +208,54 @@
       "created_at": "2026-11-08T01:20:29.735Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "7a381853-f744-4596-b017-bc2a6f159c3d",
+      "role": "agent",
+      "content": "All 4 test suites have been added and verified. \n\nIn addition, running the new tests caught an actual edge-case bug in [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L170-L177): `isFormatAllowedBySettings('')` previously fell back to `'mp4'` and allowed empty strings as valid video formats. This has been patched so invalid or non-string inputs correctly return `false`.\n\n---\n\n### Test Results\n\n```text\n$ node --test tests/app.test.js\n▶ ReelVault Unit Tests\n  ▶ detectVideoFormat\n    ✔ should detect uppercase video extensions correctly (.MP4, .WEBM) (1.08ms)\n    ✔ should detect video format from URLs with query strings (?token=123) (0.19ms)\n    ✔ should detect video format from URLs with hash anchors (#t=10) (0.18ms)\n    ✔ should gracefully handle null, undefined, empty, and invalid URLs with fallback (0.25ms)\n  ✔ detectVideoFormat (2.84ms)\n  ▶ normalizeAndAutoRewriteVideoUrl\n    ✔ should automatically rewrite .gifv URLs to .mp4 (0.49ms)\n    ✔ should unescape escaped HTML entities (&amp;) (0.26ms)\n    ✔ should return null for null/invalid rawUrl input (0.15ms)\n  ✔ normalizeAndAutoRewriteVideoUrl (1.29ms)\n  ▶ VIDEO_FORMAT_CATALOG\n    ✔ should contain all 19 video extensions (0.36ms)\n    ✔ should have valid mime types for all 19 extensions (0.56ms)\n  ✔ VIDEO_FORMAT_CATALOG (1.27ms)\n  ▶ needsMp4Conversion\n    ✔ should return false for iPhone Photos native formats (1.27ms)\n    ✔ should return true for formats requiring conversion for Camera Roll saving (0.13ms)\n    ✔ should return false if already converted or cached in vault (0.18ms)\n    ✔ should gracefully handle null/empty video items (0.12ms)\n    ✔ should detect format from videoUrl if format property is missing (0.10ms)\n  ✔ needsMp4Conversion (2.09ms)\n  ▶ isFormatAllowedBySettings\n    ✔ should allow all formats when formatMode is \"all\" (0.21ms)\n    ✔ should allow only native formats when formatMode is \"native\" (0.10ms)\n    ✔ should allow only mp4 and gifv when formatMode is \"mp4\" (0.08ms)\n    ✔ should handle leading dots and uppercase extensions cleanly (0.08ms)\n    ✔ should return false for unsupported or invalid extensions (0.11ms)\n  ✔ isFormatAllowedBySettings (0.86ms)\n  ▶ encodeArchiveFilePath\n    ✔ should leave simple file names unchanged (0.17ms)\n    ✔ should encode spaces and brackets in file names (0.12ms)\n    ✔ should preserve forward slashes for nested directory paths (0.09ms)\n    ✔ should safely handle null, undefined, and empty string inputs (0.07ms)\n  ✔ encodeArchiveFilePath (0.66ms)\n  ▶ extractRedditVideosFromListing\n    ✔ should extract direct reddit_video fallback URL (0.30ms)\n    ✔ should extract videos from crosspost_parent_list (0.13ms)\n    ✔ should filter out NSFW posts when settings.allowNsfw is false (0.09ms)\n    ✔ should safely handle empty or malformed API responses without throwing (0.66ms)\n  ✔ extractRedditVideosFromListing (1.37ms)\n✔ ReelVault Unit Tests (11.45ms)\nℹ tests 27\nℹ suites 8\nℹ pass 27\nℹ fail 0\nℹ duration_ms 87.11\n```\n\n---\n\n### Status\n* **27 of 27 tests passing** across 8 test suites.\n* Total execution time: **87 milliseconds** (no network requests, zero WebAssembly memory bloat).\n* [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) is locked with `chmod 444` (read-only).\n* All changes to [`app.js`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js) and [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) are saved.",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "0bd11445-ab8c-43c2-a19a-e2e307ec76c6",
+      "created_at": "2026-11-08T01:22:22.178Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "4709c004-b9c4-4862-947e-7136d2c91764",
+      "role": "user",
+      "content": "Ok anything else you can think of to test?",
+      "status": "pending",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:23:12.768Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "207de75b-60aa-4920-a9c9-c2f97ffec4ef",
+      "role": "agent",
+      "content": "Here are the next **4 high-value areas** we can test to ensure ReelVault is bulletproof:\n\n---\n\n### 1. `getEffectivePlaybackUrl(videoItem)` (Playback Stream Priority)\nThis function determines what URL is fed into the `<video>` player when a user taps play:\n* **What to test:**\n  * **Offline Vault priority:** If `offlineObjectUrl` or `offlineBlob` exists, does it play from local storage rather than the internet?\n  * **Converted derivative priority:** If a video is non-native (e.g. `.mkv` or `.webm`) and has a server-transcoded `.convertedUrl`, does it play the converted URL?\n  * **Original URL fallback:** Does it fall back to `videoItem.videoUrl` for native `.mp4` files?\n  * **Null safety:** Does it return an empty string `\"\"` without crashing if given `null`?\n\n---\n\n### 2. `getFormatBadgeInfo(videoItem)` (UI Badges & iPhone Compatibility Labels)\nThis controls the pill badge displayed above the video player indicating whether the file can be saved to Camera Roll:\n* **What to test:**\n  * Native `.mp4` shows `\"MP4 • iPhone Native\"` (green badge).\n  * Auto-converted formats or `.gifv` show `\"GIFV → MP4 ✓\"` (blue/purple badge).\n  * Non-native formats (`.mkv`, `.avi`) show `\"MKV • Auto-Convert\"` (orange/yellow badge).\n  * Null or invalid inputs return `{ className: 'format-badge hidden' }`.\n\n---\n\n### 3. `FALLBACK_VIDEOS` & `DEFAULT_SOURCES` Data Integrity\nReelVault relies on fallback videos when the user is in airplane mode or third-party APIs are down:\n* **What to test:**\n  * All 5 fallback clips have valid `.mp4` URLs, unique IDs, and titles.\n  * All built-in default sources have valid types (`keyword` or `subreddit`) and `enabled: true`.\n\n---\n\n### 4. Webpage Video Scanner Regex (`scanUrlForVideos` pattern)\nReelVault has a scanner that extracts videos from pasted links or HTML:\n* **What to test:**\n  * Direct video links (e.g. `https://site.com/movie.mp4`) are immediately recognized.\n  * Matches absolute video URLs across all 19 extensions.\n  * Properly decodes HTML entities (`&amp;`) in query parameters.\n  * Extracts relative video tags (e.g. `<video src=\"/assets/clip.webm\">`) and resolves them against the base URL.\n\n---\n\nWould you like me to unlock [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js), add these 4 suites, and run them?",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "4709c004-b9c4-4862-947e-7136d2c91764",
+      "created_at": "2026-11-08T01:23:42.295Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "f5369fd0-1cc6-4731-8700-11c92fd50d4c",
+      "role": "user",
+      "content": "yes",
+      "status": "pending",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:24:05.280Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }

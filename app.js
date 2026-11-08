@@ -1059,7 +1059,7 @@ function extractRedditVideosFromListing(json, sourceLabel) {
 
     if (!rawVideoUrl && typeof mediaPost.url === 'string') {
       const directMatch = mediaPost.url.match(
-        new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i')
+        new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i')
       );
       if (directMatch) {
         rawVideoUrl = mediaPost.url;
@@ -1247,7 +1247,7 @@ async function searchFediverseVideos(keyword) {
         const candidateUrl = post.url || post.embed_video_url;
         if (!candidateUrl || typeof candidateUrl !== 'string') continue;
 
-        if (new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i').test(candidateUrl)) {
+        if (new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i').test(candidateUrl)) {
           const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
           if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
           results.push({
@@ -1344,10 +1344,10 @@ async function searchNasaVideos(keyword, limit = 6) {
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   const trimmed = targetUrl.trim();
 
-  const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i');
+  const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i');
   if (directRegex.test(trimmed)) {
     const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
-    const fileName = trimmed.split('/').pop().split('?')[0] || 'Direct Video';
+    const fileName = trimmed.split('/').pop().split('?')[0].split('#')[0] || 'Direct Video';
     return [
       {
         id: `url-${Date.now()}`,
@@ -2606,6 +2606,7 @@ if (typeof module !== 'undefined' && module.exports) {
     STORAGE_KEYS,
     VIDEO_FORMAT_CATALOG,
     ALL_VIDEO_EXTENSIONS,
+    VIDEO_EXT_REGEX_PATTERN,
     DEFAULT_SOURCES,
     FALLBACK_VIDEOS,
     settings,
@@ -2613,6 +2614,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isFormatAllowedBySettings,
     normalizeAndAutoRewriteVideoUrl,
     getFormatBadgeInfo,
+    getEffectivePlaybackUrl,
     needsMp4Conversion,
     encodeArchiveFilePath,
     extractRedditVideosFromListing

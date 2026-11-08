@@ -4,11 +4,16 @@ const {
   detectVideoFormat,
   normalizeAndAutoRewriteVideoUrl,
   VIDEO_FORMAT_CATALOG,
+  VIDEO_EXT_REGEX_PATTERN,
+  DEFAULT_SOURCES,
+  FALLBACK_VIDEOS,
   settings,
   isFormatAllowedBySettings,
   needsMp4Conversion,
   encodeArchiveFilePath,
-  extractRedditVideosFromListing
+  extractRedditVideosFromListing,
+  getFormatBadgeInfo,
+  getEffectivePlaybackUrl
 } = require('../app.js');
 
 describe('ReelVault Unit Tests', () => {
@@ -369,5 +374,207 @@ describe('ReelVault Unit Tests', () => {
     // Restore settings
     settings.allowNsfw = originalNsfw;
     settings.formatMode = originalMode;
+  });
+
+  describe('getEffectivePlaybackUrl', () => {
+    const originalAutoConvert = settings.autoConvert;
+
+    it('should return empty string for null/undefined video items', () => {
+      assert.strictEqual(getEffectivePlaybackUrl(null), '');
+      assert.strictEqual(getEffectivePlaybackUrl(undefined), '');
+    });
+
+    it('should prioritize existing offlineObjectUrl', () => {
+      const item = {
+        offlineObjectUrl: 'blob:https://vault.local/offline-video-1',
+        videoUrl: 'https://remote.com/video.mp4'
+      };
+      assert.strictEqual(getEffectivePlaybackUrl(item), 'blob:https://vault.local/offline-video-1');
+    });
+
+    it('should create and store object URL from offlineBlob if present', () => {
+      const fakeBlob = new Blob(['sample-video-bytes'], { type: 'video/mp4' });
+      const item = {
+        offlineBlob: fakeBlob,
+        videoUrl: 'https://remote.com/video.mp4'
+      };
+      const resultUrl = getEffectivePlaybackUrl(item);
+      assert.ok(resultUrl.startsWith('blob:'), 'Playback URL should be a blob URL');
+      assert.strictEqual(item.offlineObjectUrl, resultUrl);
+    });
+
+    it('should prioritize convertedBlobUrl over remote videoUrl', () => {
+      const item = {
+        convertedBlobUrl: 'blob:https://vault.local/converted-mp4-1',
+        videoUrl: 'https://remote.com/video.mkv'
+      };
+      assert.strictEqual(getEffectivePlaybackUrl(item), 'blob:https://vault.local/converted-mp4-1');
+    });
+
+    it('should use convertedUrl for non-native video when autoConvert is enabled', () => {
+      settings.autoConvert = true;
+      const mkvItem = {
+        format: 'mkv',
+        videoUrl: 'https://remote.com/clip.mkv',
+        convertedUrl: 'https://remote.com/clip-transcoded.mp4'
+      };
+      assert.strictEqual(getEffectivePlaybackUrl(mkvItem), 'https://remote.com/clip-transcoded.mp4');
+    });
+
+    it('should fallback to videoUrl for native formats even if convertedUrl exists', () => {
+      settings.autoConvert = true;
+      const mp4Item = {
+        format: 'mp4',
+        videoUrl: 'https://remote.com/direct.mp4',
+        convertedUrl: 'https://remote.com/alt.mp4'
+      };
+      assert.strictEqual(getEffectivePlaybackUrl(mp4Item), 'https://remote.com/direct.mp4');
+    });
+
+    settings.autoConvert = originalAutoConvert;
+  });
+
+  describe('getFormatBadgeInfo', () => {
+    it('should return hidden badge for null/undefined video items', () => {
+      assert.deepStrictEqual(getFormatBadgeInfo(null), {
+        text: 'MP4',
+        className: 'format-badge hidden'
+      });
+      assert.deepStrictEqual(getFormatBadgeInfo(undefined), {
+        text: 'MP4',
+        className: 'format-badge hidden'
+      });
+    });
+
+    it('should return converted badge for gifv and converted items', () => {
+      const gifvItem = { format: 'gifv' };
+      assert.deepStrictEqual(getFormatBadgeInfo(gifvItem), {
+        text: 'GIFV → MP4 ✓',
+        className: 'format-badge converted'
+      });
+
+      const convItem = { format: 'mkv', convertedBlobUrl: 'blob:test' };
+      assert.deepStrictEqual(getFormatBadgeInfo(convItem), {
+        text: 'MKV → MP4 ✓',
+        className: 'format-badge converted'
+      });
+    });
+
+    it('should return native badge for iPhone Photos native formats', () => {
+      const mp4Item = { format: 'mp4' };
+      assert.deepStrictEqual(getFormatBadgeInfo(mp4Item), {
+        text: 'MP4 • iPhone Native',
+        className: 'format-badge'
+      });
+
+      const movItem = { format: 'mov' };
+      assert.deepStrictEqual(getFormatBadgeInfo(movItem), {
+        text: 'MOV • iPhone Native',
+        className: 'format-badge'
+      });
+    });
+
+    it('should return auto-convert badge for non-native formats', () => {
+      const mkvItem = { format: 'mkv' };
+      assert.deepStrictEqual(getFormatBadgeInfo(mkvItem), {
+        text: 'MKV • Auto-Convert',
+        className: 'format-badge convert'
+      });
+
+      const aviItem = { format: 'avi' };
+      assert.deepStrictEqual(getFormatBadgeInfo(aviItem), {
+        text: 'AVI • Auto-Convert',
+        className: 'format-badge convert'
+      });
+    });
+  });
+
+  describe('FALLBACK_VIDEOS & DEFAULT_SOURCES Data Integrity', () => {
+    it('should have valid DEFAULT_SOURCES with proper IDs and enabled flags', () => {
+      assert.ok(Array.isArray(DEFAULT_SOURCES), 'DEFAULT_SOURCES must be an array');
+      assert.ok(DEFAULT_SOURCES.length >= 6, 'Should have at least 6 default sources');
+
+      const seenIds = new Set();
+      for (const src of DEFAULT_SOURCES) {
+        assert.ok(src.id && typeof src.id === 'string', 'Source id must be non-empty string');
+        assert.ok(!seenIds.has(src.id), `Duplicate source id: ${src.id}`);
+        seenIds.add(src.id);
+
+        assert.ok(['keyword', 'subreddit', 'url'].includes(src.type), `Valid type for ${src.id}`);
+        assert.ok(src.value && src.value.trim().length > 0, `Value must be non-empty for ${src.id}`);
+        assert.ok(src.label && src.label.trim().length > 0, `Label must be non-empty for ${src.id}`);
+        assert.strictEqual(src.enabled, true, `Source ${src.id} should be enabled by default`);
+      }
+    });
+
+    it('should have valid FALLBACK_VIDEOS with working HTTPS mp4 links', () => {
+      assert.ok(Array.isArray(FALLBACK_VIDEOS), 'FALLBACK_VIDEOS must be an array');
+      assert.strictEqual(FALLBACK_VIDEOS.length, 5, 'Should have exactly 5 fallback videos');
+
+      const seenIds = new Set();
+      for (const fb of FALLBACK_VIDEOS) {
+        assert.ok(fb.id && fb.id.startsWith('fb-'), `Fallback id must start with fb-: ${fb.id}`);
+        assert.ok(!seenIds.has(fb.id), `Duplicate fallback id: ${fb.id}`);
+        seenIds.add(fb.id);
+
+        assert.ok(fb.title && fb.title.length > 0, `Title must exist for ${fb.id}`);
+        assert.strictEqual(fb.format, 'mp4', `Format must be mp4 for ${fb.id}`);
+        assert.ok(fb.videoUrl.startsWith('https://'), `URL must be https for ${fb.id}`);
+        assert.ok(fb.videoUrl.endsWith('.mp4'), `URL must end with .mp4 for ${fb.id}`);
+        assert.ok(fb.sourceName && fb.sourceName.length > 0, `Source name must exist for ${fb.id}`);
+      }
+    });
+  });
+
+  describe('Web Scanner Regex & URL Parsing', () => {
+    it('should match direct video links across all supported formats', () => {
+      const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i');
+
+      assert.ok(directRegex.test('https://example.com/clip.mp4'));
+      assert.ok(directRegex.test('https://example.com/movie.mkv?token=123'));
+      assert.ok(directRegex.test('https://example.com/stream.m3u8'));
+      assert.ok(directRegex.test('https://example.com/video.WEBM#t=5'));
+      assert.ok(directRegex.test('https://example.com/video.mp4?token=123#t=5'));
+      assert.ok(directRegex.test('https://example.com/animation.gifv'));
+
+      // Non-video files must not match
+      assert.strictEqual(directRegex.test('https://example.com/image.jpg'), false);
+      assert.strictEqual(directRegex.test('https://example.com/index.html'), false);
+      assert.strictEqual(directRegex.test('https://example.com/doc.pdf'), false);
+    });
+
+    it('should extract absolute video URLs from raw HTML with unescaped entities', () => {
+      const rawHtml = `
+        <html>
+          <body>
+            <video src="https://media.org/clip1.mp4?res=1080&amp;auth=xyz"></video>
+            <p>Direct: <a href="https://mirror.org/archive.mkv">Download</a></p>
+          </body>
+        </html>
+      `;
+
+      const absRegex = new RegExp(
+        `https?:\\/\\/[^\\s"'<>\\\\]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^\\s"'<>\\\\]*)?`,
+        'gi'
+      );
+
+      const matches = [];
+      let m;
+      while ((m = absRegex.exec(rawHtml)) !== null) {
+        matches.push(m[0].replace(/&amp;/g, '&'));
+      }
+
+      assert.strictEqual(matches.length, 2);
+      assert.strictEqual(matches[0], 'https://media.org/clip1.mp4?res=1080&auth=xyz');
+      assert.strictEqual(matches[1], 'https://mirror.org/archive.mkv');
+    });
+
+    it('should resolve relative video paths against a base page URL', () => {
+      const baseUrl = 'https://archive.org/details/historic-reel';
+      const relativePath = '/download/historic-reel/reel.webm';
+
+      const resolved = new URL(relativePath, baseUrl).href;
+      assert.strictEqual(resolved, 'https://archive.org/download/historic-reel/reel.webm');
+    });
   });
 });
