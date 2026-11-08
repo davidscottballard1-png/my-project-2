@@ -17,7 +17,19 @@ const {
   getFormatBadgeInfo,
   getEffectivePlaybackUrl,
   escapeHtml,
-  obtainIphoneReadyVideoBlob
+  obtainIphoneReadyVideoBlob,
+  setPlayerLoading,
+  updatePlayerUI,
+  advanceToNextVideo,
+  goToPrevVideo,
+  toggleReelsFullscreen,
+  switchTab,
+  renderSourcesList,
+  renderSearchResults,
+  updateHeaderSummary,
+  showToast,
+  getAppState,
+  setAppState
 } = require('../app.js');
 
 describe('ReelVault Unit Tests', () => {
@@ -727,6 +739,323 @@ describe('ReelVault Unit Tests', () => {
         const stat = fs.statSync(fullPath);
         assert.ok(stat.size > 0, `Service Worker APP_SHELL asset is empty: ${relPath}`);
       }
+    });
+  });
+
+  // Helper to create a fast in-memory DOM environment for UI tests
+  function createMockDom() {
+    const elements = new Map();
+
+    function makeElement(id = '', initialClasses = []) {
+      const classes = new Set(initialClasses);
+      const el = {
+        id,
+        textContent: '',
+        innerHTML: '',
+        disabled: false,
+        href: '',
+        src: '',
+        muted: false,
+        playsInline: false,
+        preload: '',
+        style: {},
+        dataset: {},
+        classList: {
+          add: (...tokens) => tokens.forEach((t) => classes.add(t)),
+          remove: (...tokens) => tokens.forEach((t) => classes.delete(t)),
+          toggle: (token, force) => {
+            const shouldAdd = typeof force === 'boolean' ? force : !classes.has(token);
+            if (shouldAdd) classes.add(token);
+            else classes.delete(token);
+            return shouldAdd;
+          },
+          contains: (token) => classes.has(token)
+        },
+        set className(val) {
+          classes.clear();
+          String(val || '')
+            .split(/\s+/)
+            .filter(Boolean)
+            .forEach((c) => classes.add(c));
+        },
+        get className() {
+          return [...classes].join(' ');
+        },
+        load: () => {},
+        play: () => Promise.resolve(),
+        appendChild: () => {}
+      };
+      if (id) elements.set(id, el);
+      return el;
+    }
+
+    // Pre-create core ReelVault DOM nodes
+    [
+      'mainVideo', 'videoTitle', 'videoSourceBadge', 'videoFormatBadge',
+      'convertNowBtn', 'queueCounter', 'videoOriginalLink', 'prevVideoBtn',
+      'saveToPhoneBtn', 'saveToVaultBtn', 'playerEmpty', 'playerLoading',
+      'playerLoadingText', 'reelsHudOverlay', 'reelsHudBadge', 'reelsHudTitle',
+      'videoStage', 'prebufferBadge', 'sourcesList', 'searchResultsCount',
+      'searchResultsList', 'activeSourceSummary', 'toast'
+    ].forEach((id) => makeElement(id));
+
+    const tabViews = [
+      makeElement('view-discover', ['tab-view', 'active']),
+      makeElement('view-search', ['tab-view']),
+      makeElement('view-sources', ['tab-view']),
+      makeElement('view-vault', ['tab-view'])
+    ];
+
+    const navTabs = ['view-discover', 'view-search', 'view-sources', 'view-vault'].map((target, idx) => {
+      const btn = makeElement('', idx === 0 ? ['nav-tab', 'active'] : ['nav-tab']);
+      btn.dataset.target = target;
+      return btn;
+    });
+
+    globalThis.document = {
+      getElementById: (id) => elements.get(id) || null,
+      createElement: (tag) => makeElement(tag),
+      body: makeElement('body'),
+      querySelectorAll: (selector) => {
+        if (selector === '.tab-view') return tabViews;
+        if (selector === '.nav-tab') return navTabs;
+        return [];
+      }
+    };
+
+    return { elements, tabViews, navTabs };
+  }
+
+  describe('UI: Player Controls & Queue Navigation (updatePlayerUI, advanceToNextVideo, goToPrevVideo)', () => {
+    it('should disable action buttons and show "0 in queue" when queue is empty', () => {
+      const { elements } = createMockDom();
+      settings.prebuffer = false;
+      setAppState({ videoQueue: [], currentIndex: -1 });
+
+      updatePlayerUI();
+
+      assert.strictEqual(elements.get('queueCounter').textContent, '0 in queue');
+      assert.strictEqual(elements.get('prevVideoBtn').disabled, true);
+      assert.strictEqual(elements.get('saveToPhoneBtn').disabled, true);
+      assert.strictEqual(elements.get('saveToVaultBtn').disabled, true);
+      assert.strictEqual(elements.get('videoFormatBadge').classList.contains('hidden'), true);
+      assert.strictEqual(elements.get('convertNowBtn').classList.contains('hidden'), true);
+    });
+
+    it('should enable buttons, hide empty state, and keep Convert button hidden for native .mp4', () => {
+      const { elements } = createMockDom();
+      settings.prebuffer = false;
+      setAppState({
+        videoQueue: [
+          {
+            id: 'v1',
+            title: 'Apollo 11 Launch',
+            videoUrl: 'https://archive.org/download/Apollo11.mp4',
+            format: 'mp4',
+            sourceName: 'NASA Archive',
+            pageUrl: 'https://archive.org/details/Apollo11'
+          }
+        ],
+        currentIndex: 0
+      });
+
+      updatePlayerUI();
+
+      assert.strictEqual(elements.get('queueCounter').textContent, 'Video 1 of 1');
+      assert.strictEqual(elements.get('videoTitle').textContent, 'Apollo 11 Launch');
+      assert.strictEqual(elements.get('videoSourceBadge').textContent, 'NASA Archive');
+      assert.strictEqual(elements.get('videoFormatBadge').textContent, 'MP4 • iPhone Native');
+      assert.strictEqual(elements.get('saveToPhoneBtn').disabled, false);
+      assert.strictEqual(elements.get('saveToVaultBtn').disabled, false);
+      assert.strictEqual(elements.get('prevVideoBtn').disabled, true);
+      assert.strictEqual(elements.get('convertNowBtn').classList.contains('hidden'), true);
+      assert.strictEqual(elements.get('videoOriginalLink').href, 'https://archive.org/details/Apollo11');
+      assert.strictEqual(elements.get('videoOriginalLink').classList.contains('hidden'), false);
+    });
+
+    it('should unhide Convert button with format label when a non-native .mkv video is active', () => {
+      const { elements } = createMockDom();
+      settings.prebuffer = false;
+      setAppState({
+        videoQueue: [
+          {
+            id: 'v2',
+            title: 'Retro MKV Clip',
+            videoUrl: 'https://example.com/retro.mkv',
+            format: 'mkv',
+            sourceName: 'Archive'
+          }
+        ],
+        currentIndex: 0
+      });
+
+      updatePlayerUI();
+
+      const convertBtn = elements.get('convertNowBtn');
+      assert.strictEqual(convertBtn.classList.contains('hidden'), false);
+      assert.strictEqual(convertBtn.textContent, '🔄 Convert .MKV to .MP4');
+    });
+
+    it('should navigate forward and backward through the queue and toggle Prev button state', () => {
+      const { elements } = createMockDom();
+      settings.prebuffer = false;
+      setAppState({
+        videoQueue: [
+          { id: 'v1', title: 'Clip One', videoUrl: 'https://ex.com/1.mp4', format: 'mp4', sourceName: 'Feed' },
+          { id: 'v2', title: 'Clip Two', videoUrl: 'https://ex.com/2.mp4', format: 'mp4', sourceName: 'Feed' }
+        ],
+        currentIndex: 0
+      });
+
+      updatePlayerUI();
+      assert.strictEqual(elements.get('queueCounter').textContent, 'Video 1 of 2');
+      assert.strictEqual(elements.get('prevVideoBtn').disabled, true);
+
+      // Advance to Video 2
+      advanceToNextVideo();
+      assert.strictEqual(getAppState().currentIndex, 1);
+      assert.strictEqual(elements.get('queueCounter').textContent, 'Video 2 of 2');
+      assert.strictEqual(elements.get('videoTitle').textContent, 'Clip Two');
+      assert.strictEqual(elements.get('prevVideoBtn').disabled, false);
+
+      // Go back to Video 1
+      goToPrevVideo();
+      assert.strictEqual(getAppState().currentIndex, 0);
+      assert.strictEqual(elements.get('queueCounter').textContent, 'Video 1 of 2');
+      assert.strictEqual(elements.get('videoTitle').textContent, 'Clip One');
+      assert.strictEqual(elements.get('prevVideoBtn').disabled, true);
+    });
+  });
+
+  describe('UI: Tab Navigation & Fullscreen Reels HUD (switchTab, toggleReelsFullscreen)', () => {
+    it('should activate matching tab section and bottom nav button when switching tabs', () => {
+      const { tabViews, navTabs } = createMockDom();
+
+      switchTab('view-search');
+      assert.strictEqual(tabViews[0].classList.contains('active'), false);
+      assert.strictEqual(tabViews[1].classList.contains('active'), true);
+      assert.strictEqual(navTabs[0].classList.contains('active'), false);
+      assert.strictEqual(navTabs[1].classList.contains('active'), true);
+
+      switchTab('view-vault');
+      assert.strictEqual(tabViews[1].classList.contains('active'), false);
+      assert.strictEqual(tabViews[3].classList.contains('active'), true);
+      assert.strictEqual(navTabs[3].classList.contains('active'), true);
+    });
+
+    it('should enter and exit Fullscreen Reels Mode and update HUD overlay', () => {
+      const { elements } = createMockDom();
+      settings.prebuffer = false;
+      setAppState({
+        videoQueue: [
+          { id: 'v1', title: 'Vertical Reel Clip', videoUrl: 'https://ex.com/reel.mp4', format: 'mp4', sourceName: 'Reels' }
+        ],
+        currentIndex: 0,
+        isReelsFullscreen: false
+      });
+
+      toggleReelsFullscreen(true);
+      assert.strictEqual(getAppState().isReelsFullscreen, true);
+      assert.strictEqual(elements.get('videoStage').classList.contains('reels-fullscreen'), true);
+      assert.strictEqual(elements.get('reelsHudOverlay').classList.contains('hidden'), false);
+      assert.strictEqual(elements.get('reelsHudTitle').textContent, 'Vertical Reel Clip');
+      assert.ok(elements.get('reelsHudBadge').textContent.includes('Reels'));
+
+      toggleReelsFullscreen(false);
+      assert.strictEqual(getAppState().isReelsFullscreen, false);
+      assert.strictEqual(elements.get('videoStage').classList.contains('reels-fullscreen'), false);
+      assert.strictEqual(elements.get('reelsHudOverlay').classList.contains('hidden'), true);
+    });
+  });
+
+  describe('UI: Dynamic List Rendering (renderSourcesList, renderSearchResults)', () => {
+    it('should render empty state and pluralized counts in search results list', () => {
+      const { elements } = createMockDom();
+
+      renderSearchResults([]);
+      assert.strictEqual(elements.get('searchResultsCount').textContent, '0 videos');
+      assert.ok(elements.get('searchResultsList').innerHTML.includes('No matching videos found'));
+
+      renderSearchResults([
+        { id: 's1', title: 'Single <script>Result</script>', videoUrl: 'https://ex.com/1.mp4', format: 'mp4', sourceName: 'NASA' }
+      ]);
+      assert.strictEqual(elements.get('searchResultsCount').textContent, '1 video');
+      const html1 = elements.get('searchResultsList').innerHTML;
+      assert.ok(html1.includes('&lt;script&gt;Result&lt;/script&gt;'), 'Search result title must be XSS-escaped');
+      assert.ok(html1.includes('data-action="play-search-item"'));
+      assert.ok(html1.includes('data-action="download-search-item"'));
+      assert.ok(html1.includes('data-action="vault-search-item"'));
+
+      renderSearchResults([
+        { id: 's1', title: 'Clip A', videoUrl: 'https://ex.com/1.mp4', format: 'mp4', sourceName: 'NASA' },
+        { id: 's2', title: 'Clip B', videoUrl: 'https://ex.com/2.webm', format: 'webm', sourceName: 'Wikimedia' }
+      ]);
+      assert.strictEqual(elements.get('searchResultsCount').textContent, '2 videos');
+    });
+
+    it('should render sources list with type badges, checked states, and XSS escaping', () => {
+      const { elements } = createMockDom();
+
+      setAppState({ sources: [] });
+      renderSourcesList();
+      assert.ok(elements.get('sourcesList').innerHTML.includes('No sources configured'));
+
+      setAppState({
+        sources: [
+          { id: 'src-1', type: 'keyword', value: 'synthwave', label: 'Synthwave <img onerror=alert(1)>', enabled: true },
+          { id: 'src-2', type: 'subreddit', value: 'oddlysatisfying', label: 'r/oddlysatisfying', enabled: false }
+        ]
+      });
+      renderSourcesList();
+      const html = elements.get('sourcesList').innerHTML;
+      assert.ok(html.includes('🔍 Keyword'));
+      assert.ok(html.includes('👽 Subreddit'));
+      assert.ok(html.includes('&lt;img onerror=alert(1)&gt;'), 'Custom source label must be XSS-escaped');
+      assert.ok(html.includes('data-id="src-1" checked'));
+    });
+  });
+
+  describe('UI: Status Overlays, Header Summary & Toast (setPlayerLoading, updateHeaderSummary, showToast)', () => {
+    it('should toggle player loading overlay and update status message', () => {
+      const { elements } = createMockDom();
+
+      setPlayerLoading(true, 'Scanning webpage for videos...');
+      assert.strictEqual(elements.get('playerLoading').classList.contains('hidden'), false);
+      assert.strictEqual(elements.get('playerEmpty').classList.contains('hidden'), true);
+      assert.strictEqual(elements.get('playerLoadingText').textContent, 'Scanning webpage for videos...');
+
+      setPlayerLoading(false);
+      assert.strictEqual(elements.get('playerLoading').classList.contains('hidden'), true);
+    });
+
+    it('should update header summary with active source count and format mode', () => {
+      const { elements } = createMockDom();
+      const origMode = settings.formatMode;
+
+      setAppState({
+        sources: [{ id: '1', enabled: true }, { id: '2', enabled: false }]
+      });
+      settings.formatMode = 'mp4';
+      updateHeaderSummary();
+      assert.strictEqual(elements.get('activeSourceSummary').textContent, '1 source • .mp4 only');
+
+      setAppState({
+        sources: [{ id: '1', enabled: true }, { id: '2', enabled: true }, { id: '3', enabled: true }]
+      });
+      settings.formatMode = 'all';
+      updateHeaderSummary();
+      assert.strictEqual(elements.get('activeSourceSummary').textContent, '3 sources • All formats + Auto-Convert');
+
+      settings.formatMode = origMode;
+    });
+
+    it('should display toast notification with message and remove hidden class', () => {
+      const { elements } = createMockDom();
+      elements.get('toast').classList.add('hidden');
+
+      showToast('Saved to Offline Vault!');
+      assert.strictEqual(elements.get('toast').textContent, 'Saved to Offline Vault!');
+      assert.strictEqual(elements.get('toast').classList.contains('hidden'), false);
     });
   });
 });

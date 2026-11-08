@@ -833,6 +833,7 @@ function showToast(message) {
   toastTimeout = setTimeout(() => {
     toast.classList.add('hidden');
   }, 2800);
+  toastTimeout.unref?.();
 }
 
 function updateHeaderSummary() {
@@ -2623,6 +2624,31 @@ if (typeof module !== 'undefined' && module.exports) {
     encodeArchiveFilePath,
     extractRedditVideosFromListing,
     escapeHtml,
-    obtainIphoneReadyVideoBlob
+    obtainIphoneReadyVideoBlob,
+    setPlayerLoading,
+    updatePlayerUI,
+    advanceToNextVideo,
+    goToPrevVideo,
+    toggleReelsFullscreen,
+    switchTab,
+    renderSourcesList,
+    renderSearchResults,
+    updateHeaderSummary,
+    showToast,
+    getAppState: () => ({
+      sources,
+      settings,
+      videoQueue,
+      currentIndex,
+      isReelsFullscreen,
+      lastSearchResults
+    }),
+    setAppState: (patch = {}) => {
+      if (Array.isArray(patch.sources)) sources = patch.sources;
+      if (Array.isArray(patch.videoQueue)) videoQueue = patch.videoQueue;
+      if (typeof patch.currentIndex === 'number') currentIndex = patch.currentIndex;
+      if (typeof patch.isReelsFullscreen === 'boolean') isReelsFullscreen = patch.isReelsFullscreen;
+      if (Array.isArray(patch.lastSearchResults)) lastSearchResults = patch.lastSearchResults;
+    }
   };
 }
