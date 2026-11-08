@@ -1549,8 +1549,52 @@ async function searchNasaVideos(keyword, limit = 4) {
   return results;
 }
 
-// 8. Custom URL / Webpage Multi-Format Video Scanner
-async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
+// Helper: Decode JSON/JS-escaped URLs in raw HTML/script blocks and extract all playable video stream URLs
+function extractVideoUrlsFromHtml(rawText, baseUrl) {
+  if (!rawText || typeof rawText !== 'string') return [];
+
+  // Unescape JSON-escaped forward slashes (https:\/\/...) and unicode escapes (\u002F, \u0026, &amp;)
+  const decodedText = rawText
+    .replace(/\\\\\//g, '/')
+    .replace(/\\\//g, '/')
+    .replace(/\\u002[fF]/g, '/')
+    .replace(/\\u0026/g, '&')
+    .replace(/&amp;/g, '&');
+
+  const foundUrls = new Set();
+
+  // 1. Absolute video URLs across all 19 extensions (including inside inline <script> player configs)
+  const absRegex = new RegExp(
+    `https?:\\/\\/[^\\s"'<>\\\\()]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^\\s"'<>\\\\()]*)?`,
+    'gi'
+  );
+  let m;
+  while ((m = absRegex.exec(decodedText)) !== null) {
+    foundUrls.add(m[0]);
+  }
+
+  // 2. Relative video src/href/data-src/content/file attributes & JSON player keys
+  const relRegex = new RegExp(
+    `(?:src|href|data-src|data-video|content|video_url|mp4_url|hls_url|contentUrl|file)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
+    'gi'
+  );
+  while ((m = relRegex.exec(decodedText)) !== null) {
+    try {
+      const resolved = new URL(m[1], baseUrl).href;
+      foundUrls.add(resolved);
+    } catch {
+      // ignore invalid relative URL
+    }
+  }
+
+  // Sort full streams ahead of tiny hover-preview clips if both exist on a page
+  const all = [...foundUrls];
+  const nonPreview = all.filter((u) => !/(?:preview|thumb|trailer|sprite)/i.test(u));
+  return nonPreview.length > 0 ? [...nonPreview, ...all.filter((u) => !nonPreview.includes(u))] : all;
+}
+
+// 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
+async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSubpageCrawl = true) {
   const trimmed = targetUrl.trim();
 
   if (DIRECT_VIDEO_URL_REGEX.test(trimmed)) {
@@ -1579,41 +1623,20 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   }
 
   const rawText = await fetchWithCorsFallback(trimmed, true);
-  const foundUrls = new Set();
+  const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
+  const pageTitle = titleMatch?.[1]?.replace(/\s+/g, ' ')?.trim() || null;
 
-  // Absolute video URLs for all 19 extensions
-  const absRegex = new RegExp(
-    `https?:\\/\\/[^\\s"'<>\\\\]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^\\s"'<>\\\\]*)?`,
-    'gi'
-  );
-  let m;
-  while ((m = absRegex.exec(rawText)) !== null) {
-    foundUrls.add(m[0].replace(/&amp;/g, '&'));
-  }
-
-  // Relative video src/href/data-src/content attributes
-  const relRegex = new RegExp(
-    `(?:src|href|data-src|data-video|content)=["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
-    'gi'
-  );
-  while ((m = relRegex.exec(rawText)) !== null) {
-    try {
-      const resolved = new URL(m[1].replace(/&amp;/g, '&'), trimmed).href;
-      foundUrls.add(resolved);
-    } catch {
-      // ignore invalid relative URL
-    }
-  }
-
+  const extractedUrls = extractVideoUrlsFromHtml(rawText, trimmed);
   const results = [];
   let idx = 0;
-  for (const vUrl of foundUrls) {
+
+  for (const vUrl of extractedUrls) {
     const normalized = normalizeAndAutoRewriteVideoUrl(vUrl);
     if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
     const shortName = vUrl.split('/').pop().split('?')[0] || `Video #${idx + 1}`;
     results.push({
       id: `scan-${Date.now()}-${idx}`,
-      title: decodeURIComponent(shortName),
+      title: idx === 0 && pageTitle ? pageTitle : decodeURIComponent(shortName),
       videoUrl: normalized.videoUrl,
       originalUrl: normalized.originalUrl,
       convertedUrl: normalized.convertedUrl,
@@ -1625,6 +1648,125 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
     idx++;
   }
 
+  // Two-Hop Tube Listing Crawler: if this was a tube search/category page with watch-page links, crawl up to 3 watch pages
+  if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string') {
+    const watchLinks = [];
+    const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
+    let lm;
+    while ((lm = linkRegex.exec(rawText)) !== null && watchLinks.length < 3) {
+      try {
+        const fullLink = new URL(lm[1].replace(/&amp;/g, '&'), trimmed).href;
+        if (fullLink !== trimmed && !watchLinks.includes(fullLink)) {
+          watchLinks.push(fullLink);
+        }
+      } catch {
+        // ignore invalid subpage URL
+      }
+    }
+
+    if (watchLinks.length > 0) {
+      const subSettled = await Promise.allSettled(
+        watchLinks.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
+      );
+      for (const s of subSettled) {
+        if (s.status === 'fulfilled' && Array.isArray(s.value)) {
+          results.push(...s.value.slice(0, 2));
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, 18+ Tube Feeds)
+async function searchFreeTubeSites(keyword, limit = 6) {
+  const results = [];
+  const tasks = [];
+
+  // A. Dailymotion Public Tube API (Supports both Safe Mode & 18+ Unfiltered Mode)
+  tasks.push(
+    (async () => {
+      const nsfwFilter = settings.allowNsfw ? 'true' : 'false';
+      const dmUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(
+        keyword
+      )}&fields=id,title,url,stream_h264_url&explicit=${nsfwFilter}&limit=${limit}`;
+      const res = await fetchWithTimeout(dmUrl, 4000);
+      if (!res.ok) return;
+      const data = await res.json();
+      const list = Array.isArray(data?.list) ? data.list : [];
+      for (const item of list) {
+        const directStream = item?.stream_h264_url;
+        if (directStream && typeof directStream === 'string') {
+          const normalized = normalizeAndAutoRewriteVideoUrl(directStream);
+          if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
+          results.push({
+            id: `dm-${item.id}`,
+            title: item.title || 'Dailymotion Tube Clip',
+            videoUrl: normalized.videoUrl,
+            originalUrl: normalized.originalUrl,
+            convertedUrl: normalized.convertedUrl,
+            format: normalized.format,
+            sourceName: 'Dailymotion Tube',
+            pageUrl: item.url || `https://www.dailymotion.com/video/${item.id}`
+          });
+        }
+      }
+    })()
+  );
+
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + 18+ Tube Feeds)
+  if (settings.allowNsfw) {
+    // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
+    tasks.push(
+      (async () => {
+        const epApiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(
+          keyword
+        )}&per_page=6&thumbsize=medium&order=most-popular&format=json`;
+        const data = await fetchWithCorsFallback(epApiUrl, false);
+        const videos = Array.isArray(data?.videos) ? data.videos.slice(0, 3) : [];
+
+        await Promise.allSettled(
+          videos.map(async (v) => {
+            if (!v?.id) return;
+            const embedUrl = v.embed || `https://www.eporner.com/embed/${v.id}/`;
+            const pageHtml = await fetchWithCorsFallback(embedUrl, true);
+            const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
+            const bestStream = streams.find((u) => /\.mp4(\?|$)/i.test(u)) || streams[0];
+            if (!bestStream) return;
+
+            const normalized = normalizeAndAutoRewriteVideoUrl(bestStream);
+            if (!normalized || !isFormatAllowedBySettings(normalized.format)) return;
+
+            results.push({
+              id: `ep-${v.id}`,
+              title: v.title || 'Free Tube 18+ Video',
+              videoUrl: normalized.videoUrl,
+              originalUrl: normalized.originalUrl,
+              convertedUrl: normalized.convertedUrl,
+              format: normalized.format,
+              sourceName: `Free Tube (${ keyword })`,
+              pageUrl: v.url || embedUrl
+            });
+          })
+        );
+      })()
+    );
+
+    // 2. Direct 18+ Tube Stream Search (RedGIFs / v.redd.it NSFW video streams)
+    tasks.push(
+      (async () => {
+        const nsfwTubeUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+          `${keyword} nsfw:yes`
+        )}&type=link&sort=hot&include_over_18=1&limit=25&raw_json=1`;
+        const json = await fetchWithCorsFallback(nsfwTubeUrl, false);
+        const extracted = extractRedditVideosFromListing(json, `18+ Tube (${keyword})`);
+        results.push(...extracted.slice(0, limit));
+      })()
+    );
+  }
+
+  await Promise.allSettled(tasks);
   return results;
 }
 
@@ -1670,7 +1812,8 @@ async function pullFromSource(source) {
     searchInternetArchive(source.value, 3),
     searchPrelingerArchives(source.value, 2),
     searchPeerTubeVideos(source.value, 3),
-    searchFediverseVideos(source.value)
+    searchFediverseVideos(source.value),
+    searchFreeTubeSites(source.value, 4)
   ];
 
   return new Promise((resolve) => {
@@ -2573,6 +2716,7 @@ if (typeof document !== 'undefined') {
     const usePeerTube = document.getElementById('engPeerTube')?.checked;
     const useFediverse = document.getElementById('engFediverse')?.checked;
     const useNasa = document.getElementById('engNasa')?.checked;
+    const useTubeSites = document.getElementById('engTubeSites')?.checked;
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
@@ -2587,6 +2731,7 @@ if (typeof document !== 'undefined') {
     if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
     if (useFediverse) tasks.push(searchFediverseVideos(query));
     if (useNasa) tasks.push(searchNasaVideos(query, 6));
+    if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
 
     const settled = await Promise.allSettled(tasks);
     const combined = [];
@@ -2912,6 +3057,8 @@ if (typeof module !== 'undefined' && module.exports) {
     needsMp4Conversion,
     encodeArchiveFilePath,
     extractRedditVideosFromListing,
+    extractVideoUrlsFromHtml,
+    searchFreeTubeSites,
     parseM3u8Manifest,
     downloadAndAssembleM3u8Stream,
     escapeHtml,

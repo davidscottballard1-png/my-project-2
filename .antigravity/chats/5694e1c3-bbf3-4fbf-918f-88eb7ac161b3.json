@@ -40,6 +40,30 @@
       "created_at": "2026-11-08T02:00:19.981Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "5fee2957-fb95-4f6c-8e6e-de067391af0c",
+      "role": "agent",
+      "content": "You are spot-on. A **`.m3u8` file** (HTTP Live Streaming, or **HLS**) isn’t actually a video file—it is a plain-text **playlist/manifest** that chops a video into dozens of 2-to-6-second snippet files (usually `.ts` MPEG-Transport Stream chunks or `.m4s` fragmented MP4 chunks). If you just download the `.m3u8` URL itself, you only get a tiny text file that iPhone Photos can't save.\n\nHere is the **4-step pipeline** ReelVault uses in [app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js) to get around `.m3u8` snippet splitting:\n\n---\n\n### 1. Direct `.MP4` Sibling Bypass (Fastest Path)\nMany platforms (like Reddit, PeerTube, Internet Archive, and NASA) stream via `.m3u8` to their web player, but still store a single unsplit `.mp4` file in their API metadata alongside it.\n* In [`extractRedditVideosFromListing`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1116-L1169) and [`searchPeerTubeVideos`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1193-L1257), ReelVault checks for the direct `fallback_url` or `.mp4` derivative **first** and pairs it as `convertedUrl` so it can grab the whole `.mp4` in one shot without touching the snippets.\n\n### 2. `.M3U8` Master & Media Playlist Crawler ([`parseM3u8Manifest`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L563-L635))\nWhen a webpage or stream **only** has a `.m3u8` link:\n* ReelVault reads the `.m3u8` text manifest first.\n* **Master Playlist Resolution:** Many sites use a \"Master\" `.m3u8` that points to other `.m3u8` playlists for different resolutions (`360p`, `720p`, `1080p`) via `#EXT-X-STREAM-INF:BANDWIDTH=...`. [`parseM3u8Manifest`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L563-L635) automatically picks the best mobile HD variant playlist and follows it.\n* **Snippet & Header Extraction:** It extracts every relative or absolute snippet URL (`.ts`, `.m4s`, `.mp4`) in order, plus any `#EXT-X-MAP:URI=\"...\"` initialization header used by fragmented MP4 streams.\n\n### 3. Batch Snippet Downloading & Binary Stitching ([`downloadAndAssembleM3u8Stream`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L638-L694))\n* Instead of downloading snippets one by one slowly, [`downloadAndAssembleM3u8Stream`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L638-L694) pulls the snippets in parallel batches of 4 (showing live progress like `Stitching .M3U8 snippet 12 of 35...`).\n* Because MPEG-TS (`.ts`) and fMP4 (`init.mp4` + `.m4s`) segments are designed to be byte-concatenatable, ReelVault joins all their binary `Uint8Array` buffers in exact sequence into a single continuous video `Blob` in memory.\n\n### 4. Lossless Container Remuxing to `.MP4` ([`transcodeBlobWithFfmpegWasm`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L334-L404) & [`transcodeBlobWithMediaRecorder`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L407-L510))\n* Once the `.ts` snippets are stitched together, iPhone's Photos app still won't accept a `.ts` container directly.\n* ReelVault passes the stitched stream into **FFmpeg.wasm** using `-c copy -movflags +faststart` ([app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L355-L374)), which **re-wraps (remuxes)** the already-encoded H.264/AAC video from `.ts` into an iPhone-native `.mp4` container in seconds without losing quality (with a fallback to iOS Safari's hardware `MediaRecorder` if needed).\n\n> **Note on DRM-Encrypted Sites:** This works on standard open `.m3u8` streams (`EXT-X-KEY:NONE`). If a paid/subscription streaming service uses hardware DRM encryption (like Apple FairPlay or Widevine) or single-use signed session cookies locked to their domain, the browser's security sandbox will block third-party web apps from decrypting those segments.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "153590bf-1547-415f-ab31-dafc10e56312",
+      "created_at": "2026-11-08T02:02:37.085Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "494ce98f-32cc-4e92-b5e8-09301916859d",
+      "role": "user",
+      "content": "Also I can even have free tube sites searched automatically right for videos?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T02:05:14.981Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }
