@@ -3,7 +3,12 @@ const assert = require('node:assert');
 const {
   detectVideoFormat,
   normalizeAndAutoRewriteVideoUrl,
-  VIDEO_FORMAT_CATALOG
+  VIDEO_FORMAT_CATALOG,
+  settings,
+  isFormatAllowedBySettings,
+  needsMp4Conversion,
+  encodeArchiveFilePath,
+  extractRedditVideosFromListing
 } = require('../app.js');
 
 describe('ReelVault Unit Tests', () => {
@@ -55,7 +60,6 @@ describe('ReelVault Unit Tests', () => {
     });
 
     it('should gracefully handle null, undefined, empty, and invalid URLs with fallback', () => {
-      // Default fallback is 'mp4'
       assert.strictEqual(detectVideoFormat(null).ext, 'mp4');
       assert.strictEqual(detectVideoFormat(undefined).ext, 'mp4');
       assert.strictEqual(detectVideoFormat('').ext, 'mp4');
@@ -64,7 +68,6 @@ describe('ReelVault Unit Tests', () => {
       assert.strictEqual(detectVideoFormat('https://example.com/not-a-video').ext, 'mp4');
       assert.strictEqual(detectVideoFormat('https://example.com/document.pdf').ext, 'mp4');
 
-      // Custom fallback format
       assert.strictEqual(detectVideoFormat(null, 'webm').ext, 'webm');
       assert.strictEqual(detectVideoFormat('invalid-file', 'webm').ext, 'webm');
       assert.strictEqual(detectVideoFormat('not-a-video', 'm3u8').ext, 'm3u8');
@@ -81,17 +84,14 @@ describe('ReelVault Unit Tests', () => {
       assert.strictEqual(basicGifv.format, 'gifv');
       assert.strictEqual(basicGifv.isAutoConverted, true);
 
-      // Uppercase .GIFV
       const upperGifv = normalizeAndAutoRewriteVideoUrl('https://i.imgur.com/example.GIFV');
       assert.strictEqual(upperGifv.videoUrl, 'https://i.imgur.com/example.mp4');
       assert.strictEqual(upperGifv.isAutoConverted, true);
 
-      // .gifv with query string
       const gifvQuery = normalizeAndAutoRewriteVideoUrl('https://i.imgur.com/example.gifv?token=123');
       assert.strictEqual(gifvQuery.videoUrl, 'https://i.imgur.com/example.mp4?token=123');
       assert.strictEqual(gifvQuery.isAutoConverted, true);
 
-      // .gifv with hash anchor
       const gifvHash = normalizeAndAutoRewriteVideoUrl('https://i.imgur.com/example.gifv#t=5');
       assert.strictEqual(gifvHash.videoUrl, 'https://i.imgur.com/example.mp4#t=5');
       assert.strictEqual(gifvHash.isAutoConverted, true);
@@ -106,7 +106,6 @@ describe('ReelVault Unit Tests', () => {
       assert.strictEqual(result.format, 'mp4');
       assert.strictEqual(result.isAutoConverted, false);
 
-      // Both .gifv rewrite and &amp; unescaping
       const gifvEscaped = normalizeAndAutoRewriteVideoUrl('https://i.imgur.com/clip.gifv?sig=abc&amp;expires=789');
       assert.strictEqual(gifvEscaped.videoUrl, 'https://i.imgur.com/clip.mp4?sig=abc&expires=789');
       assert.strictEqual(gifvEscaped.isAutoConverted, true);
@@ -153,11 +152,222 @@ describe('ReelVault Unit Tests', () => {
         assert.match(item.mime, mimeRegex, `Mime type '${item.mime}' for '${ext}' must be valid format`);
       }
 
-      // Verify specific expected mime types
       assert.strictEqual(VIDEO_FORMAT_CATALOG.mp4.mime, 'video/mp4');
       assert.strictEqual(VIDEO_FORMAT_CATALOG.webm.mime, 'video/webm');
       assert.strictEqual(VIDEO_FORMAT_CATALOG.m3u8.mime, 'application/vnd.apple.mpegurl');
       assert.strictEqual(VIDEO_FORMAT_CATALOG.gifv.mime, 'video/mp4');
     });
+  });
+
+  describe('needsMp4Conversion', () => {
+    it('should return false for iPhone Photos native formats', () => {
+      assert.strictEqual(needsMp4Conversion({ format: 'mp4', videoUrl: 'https://ex.com/a.mp4' }), false);
+      assert.strictEqual(needsMp4Conversion({ format: 'mov', videoUrl: 'https://ex.com/a.mov' }), false);
+      assert.strictEqual(needsMp4Conversion({ format: 'm4v', videoUrl: 'https://ex.com/a.m4v' }), false);
+      assert.strictEqual(needsMp4Conversion({ format: 'gifv', videoUrl: 'https://ex.com/a.gifv' }), false);
+    });
+
+    it('should return true for formats requiring conversion for Camera Roll saving', () => {
+      assert.strictEqual(needsMp4Conversion({ format: 'webm', videoUrl: 'https://ex.com/a.webm' }), true);
+      assert.strictEqual(needsMp4Conversion({ format: 'mkv', videoUrl: 'https://ex.com/a.mkv' }), true);
+      assert.strictEqual(needsMp4Conversion({ format: 'avi', videoUrl: 'https://ex.com/a.avi' }), true);
+      assert.strictEqual(needsMp4Conversion({ format: 'flv', videoUrl: 'https://ex.com/a.flv' }), true);
+      assert.strictEqual(needsMp4Conversion({ format: 'ogv', videoUrl: 'https://ex.com/a.ogv' }), true);
+    });
+
+    it('should return false if already converted or cached in vault', () => {
+      assert.strictEqual(needsMp4Conversion({ format: 'mkv', convertedBlobUrl: 'blob:https://ex.com/123' }), false);
+      assert.strictEqual(needsMp4Conversion({ format: 'webm', offlineBlob: new Uint8Array([0, 1, 2]) }), false);
+    });
+
+    it('should gracefully handle null/empty video items', () => {
+      assert.strictEqual(needsMp4Conversion(null), false);
+      assert.strictEqual(needsMp4Conversion(undefined), false);
+    });
+
+    it('should detect format from videoUrl if format property is missing', () => {
+      assert.strictEqual(needsMp4Conversion({ videoUrl: 'https://ex.com/clip.mkv' }), true);
+      assert.strictEqual(needsMp4Conversion({ videoUrl: 'https://ex.com/clip.mp4' }), false);
+    });
+  });
+
+  describe('isFormatAllowedBySettings', () => {
+    const originalMode = settings.formatMode;
+
+    it('should allow all formats when formatMode is "all"', () => {
+      settings.formatMode = 'all';
+      assert.strictEqual(isFormatAllowedBySettings('mp4'), true);
+      assert.strictEqual(isFormatAllowedBySettings('mkv'), true);
+      assert.strictEqual(isFormatAllowedBySettings('webm'), true);
+      assert.strictEqual(isFormatAllowedBySettings('flv'), true);
+      assert.strictEqual(isFormatAllowedBySettings('gifv'), true);
+    });
+
+    it('should allow only native formats when formatMode is "native"', () => {
+      settings.formatMode = 'native';
+      assert.strictEqual(isFormatAllowedBySettings('mp4'), true);
+      assert.strictEqual(isFormatAllowedBySettings('mov'), true);
+      assert.strictEqual(isFormatAllowedBySettings('webm'), true);
+      assert.strictEqual(isFormatAllowedBySettings('m3u8'), true);
+      // Non-native formats should be blocked
+      assert.strictEqual(isFormatAllowedBySettings('mkv'), false);
+      assert.strictEqual(isFormatAllowedBySettings('avi'), false);
+      assert.strictEqual(isFormatAllowedBySettings('flv'), false);
+    });
+
+    it('should allow only mp4 and gifv when formatMode is "mp4"', () => {
+      settings.formatMode = 'mp4';
+      assert.strictEqual(isFormatAllowedBySettings('mp4'), true);
+      assert.strictEqual(isFormatAllowedBySettings('gifv'), true);
+      assert.strictEqual(isFormatAllowedBySettings('mov'), false);
+      assert.strictEqual(isFormatAllowedBySettings('webm'), false);
+      assert.strictEqual(isFormatAllowedBySettings('mkv'), false);
+    });
+
+    it('should handle leading dots and uppercase extensions cleanly', () => {
+      settings.formatMode = 'all';
+      assert.strictEqual(isFormatAllowedBySettings('.mp4'), true);
+      assert.strictEqual(isFormatAllowedBySettings('.MP4'), true);
+      assert.strictEqual(isFormatAllowedBySettings('.MKV'), true);
+    });
+
+    it('should return false for unsupported or invalid extensions', () => {
+      assert.strictEqual(isFormatAllowedBySettings('exe'), false);
+      assert.strictEqual(isFormatAllowedBySettings('pdf'), false);
+      assert.strictEqual(isFormatAllowedBySettings(''), false);
+    });
+
+    // Restore original setting
+    settings.formatMode = originalMode;
+  });
+
+  describe('encodeArchiveFilePath', () => {
+    it('should leave simple file names unchanged', () => {
+      assert.strictEqual(encodeArchiveFilePath('Apollo11Launch.mp4'), 'Apollo11Launch.mp4');
+    });
+
+    it('should encode spaces and brackets in file names', () => {
+      assert.strictEqual(
+        encodeArchiveFilePath('Apollo 11 Launch.mp4'),
+        'Apollo%2011%20Launch.mp4'
+      );
+      assert.strictEqual(
+        encodeArchiveFilePath('Vintage Clip [HD].webm'),
+        'Vintage%20Clip%20%5BHD%5D.webm'
+      );
+    });
+
+    it('should preserve forward slashes for nested directory paths', () => {
+      assert.strictEqual(
+        encodeArchiveFilePath('sub directory/video file.mp4'),
+        'sub%20directory/video%20file.mp4'
+      );
+    });
+
+    it('should safely handle null, undefined, and empty string inputs', () => {
+      assert.strictEqual(encodeArchiveFilePath(null), '');
+      assert.strictEqual(encodeArchiveFilePath(undefined), '');
+      assert.strictEqual(encodeArchiveFilePath(''), '');
+    });
+  });
+
+  describe('extractRedditVideosFromListing', () => {
+    const originalNsfw = settings.allowNsfw;
+    const originalMode = settings.formatMode;
+
+    it('should extract direct reddit_video fallback URL', () => {
+      settings.formatMode = 'all';
+      const sample = {
+        data: {
+          children: [
+            {
+              data: {
+                id: 'post123',
+                title: 'Cute Otter Swimming',
+                permalink: '/r/otters/comments/post123',
+                secure_media: {
+                  reddit_video: {
+                    fallback_url: 'https://v.redd.it/otter1/DASH_720.mp4'
+                  }
+                }
+              }
+            }
+          ]
+        }
+      };
+
+      const extracted = extractRedditVideosFromListing(sample, 'Otters');
+      assert.strictEqual(extracted.length, 1);
+      assert.strictEqual(extracted[0].id, 'rd-post123');
+      assert.strictEqual(extracted[0].title, 'Cute Otter Swimming');
+      assert.strictEqual(extracted[0].videoUrl, 'https://v.redd.it/otter1/DASH_720.mp4');
+      assert.strictEqual(extracted[0].sourceName, 'Otters');
+    });
+
+    it('should extract videos from crosspost_parent_list', () => {
+      settings.formatMode = 'all';
+      const sample = {
+        data: {
+          children: [
+            {
+              data: {
+                id: 'cross999',
+                title: 'Crossposted Clip',
+                crosspost_parent_list: [
+                  {
+                    secure_media: {
+                      reddit_video: {
+                        fallback_url: 'https://v.redd.it/parent/DASH_1080.mp4'
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      };
+
+      const extracted = extractRedditVideosFromListing(sample, 'Crosspost');
+      assert.strictEqual(extracted.length, 1);
+      assert.strictEqual(extracted[0].id, 'rd-cross999');
+      assert.strictEqual(extracted[0].videoUrl, 'https://v.redd.it/parent/DASH_1080.mp4');
+    });
+
+    it('should filter out NSFW posts when settings.allowNsfw is false', () => {
+      settings.allowNsfw = false;
+      const sample = {
+        data: {
+          children: [
+            {
+              data: {
+                id: 'nsfw1',
+                over_18: true,
+                title: 'NSFW video',
+                secure_media: {
+                  reddit_video: {
+                    fallback_url: 'https://v.redd.it/nsfw/DASH_720.mp4'
+                  }
+                }
+              }
+            }
+          ]
+        }
+      };
+
+      const extracted = extractRedditVideosFromListing(sample, 'Reddit');
+      assert.strictEqual(extracted.length, 0);
+    });
+
+    it('should safely handle empty or malformed API responses without throwing', () => {
+      assert.deepStrictEqual(extractRedditVideosFromListing(null, 'Test'), []);
+      assert.deepStrictEqual(extractRedditVideosFromListing({}, 'Test'), []);
+      assert.deepStrictEqual(extractRedditVideosFromListing({ data: {} }, 'Test'), []);
+      assert.deepStrictEqual(extractRedditVideosFromListing({ data: { children: [null, {}, { data: null }] } }, 'Test'), []);
+    });
+
+    // Restore settings
+    settings.allowNsfw = originalNsfw;
+    settings.formatMode = originalMode;
   });
 });

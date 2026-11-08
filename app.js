@@ -168,7 +168,9 @@ function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
 }
 
 function isFormatAllowedBySettings(ext) {
-  const cleanExt = (ext || 'mp4').toLowerCase().replace(/^\./, '');
+  if (!ext || typeof ext !== 'string') return false;
+  const cleanExt = ext.toLowerCase().trim().replace(/^\./, '');
+  if (!cleanExt) return false;
   const info = VIDEO_FORMAT_CATALOG[cleanExt];
   if (!info) return false;
 
@@ -2606,9 +2608,13 @@ if (typeof module !== 'undefined' && module.exports) {
     ALL_VIDEO_EXTENSIONS,
     DEFAULT_SOURCES,
     FALLBACK_VIDEOS,
+    settings,
     detectVideoFormat,
     isFormatAllowedBySettings,
     normalizeAndAutoRewriteVideoUrl,
-    getFormatBadgeInfo
+    getFormatBadgeInfo,
+    needsMp4Conversion,
+    encodeArchiveFilePath,
+    extractRedditVideosFromListing
   };
 }

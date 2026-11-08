@@ -16,6 +16,18 @@
       "created_at": "2026-11-08T01:14:02.444Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "84406a53-6bdc-4cbe-86c5-cb9799874621",
+      "role": "agent",
+      "content": "Created the unit test suite at [tests/app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js) using Node's built-in test runner (`node:test`) and locked the file with `chmod 444`.\n\n### Functions & Edge Cases Tested\n1. **[`detectVideoFormat`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L154-L168)**:\n   - Uppercase extensions (`.MP4`, `.WEBM`, `.MKV`, `.MOV`)\n   - URLs with query strings (`?token=123`, `?token=123&quality=hd`)\n   - URLs with hash anchors (`#t=10`, `#t=10,20`, query + hash combinations)\n   - Edge cases: `null`, `undefined`, empty strings, non-string values, invalid URLs, and custom fallback formats\n2. **[`normalizeAndAutoRewriteVideoUrl`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L184-L208)**:\n   - Auto-rewriting `.gifv` URLs to `.mp4` (including uppercase `.GIFV`, query strings, and hash anchors)\n   - Unescaping HTML entities (`&amp;` -> `&`)\n   - Returning `null` on invalid inputs\n3. **[`VIDEO_FORMAT_CATALOG`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L11-L31)**:\n   - Verified that all 19 video extensions are present (`mp4`, `mov`, `m4v`, `3gp`, `3g2`, `m3u8`, `webm`, `ogv`, `ogg`, `mkv`, `avi`, `mpeg`, `mpg`, `flv`, `f4v`, `wmv`, `ts`, `m2ts`, `gifv`)\n   - Verified each extension has a valid MIME type conforming to standard MIME formats\n\n---\n\n### Test Execution Output\n\n```console\n$ node --test tests/app.test.js\n▶ ReelVault Unit Tests\n  ▶ detectVideoFormat\n    ✔ should detect uppercase video extensions correctly (.MP4, .WEBM) (1.118817ms)\n    ✔ should detect video format from URLs with query strings (?token=123) (0.216411ms)\n    ✔ should detect video format from URLs with hash anchors (#t=10) (0.239435ms)\n    ✔ should gracefully handle null, undefined, empty, and invalid URLs with fallback (0.193429ms)\n  ✔ detectVideoFormat (3.725318ms)\n  ▶ normalizeAndAutoRewriteVideoUrl\n    ✔ should automatically rewrite .gifv URLs to .mp4 (0.5329ms)\n    ✔ should unescape escaped HTML entities (&amp;) (0.313292ms)\n    ✔ should return null for null/invalid rawUrl input (0.179524ms)\n  ✔ normalizeAndAutoRewriteVideoUrl (1.339357ms)\n  ▶ VIDEO_FORMAT_CATALOG\n    ✔ should contain all 19 video extensions (0.237511ms)\n    ✔ should have valid mime types for all 19 extensions (0.654566ms)\n  ✔ VIDEO_FORMAT_CATALOG (1.207762ms)\n✔ ReelVault Unit Tests (7.011479ms)\nℹ tests 9\nℹ suites 4\nℹ pass 9\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 73.79049\n```",
+      "status": "completed",
+      "model": "gemini-3.8-flash-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "90bd1a16-2d54-47ba-a6a1-dc8367840f1a",
+      "created_at": "2026-11-08T01:17:47.309Z",
+      "sender": "macOS",
+      "is_cancelled": false
     }
   ]
 }
