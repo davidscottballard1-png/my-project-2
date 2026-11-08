@@ -2268,11 +2268,37 @@ async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') 
         );
         if (!metaRes.ok) return;
         const meta = await metaRes.json();
-        const files = meta?.files || [];
+        if (
+          meta?.is_dark ||
+          String(meta?.metadata?.['access-restricted-item'] || '').toLowerCase() === 'true'
+        ) {
+          return;
+        }
+        const files = (meta?.files || []).filter((f) => {
+          if (!f?.name) return false;
+          if (f.private === 'true' || f.private === true) return false;
+          const sz = Number(f.size) || 0;
+          if (sz > 0 && sz < 10_000) return false;
+          return true;
+        });
 
-        const videoFiles = files
+        const isIaWebMp4 = (f) => {
+          const lowerName = String(f?.name || '').toLowerCase();
+          const lowerFmt = String(f?.format || '').toLowerCase();
+          const lowerSrc = String(f?.source || '').toLowerCase();
+          return (
+            lowerName.endsWith('.ia.mp4') ||
+            (lowerName.endsWith('.mp4') &&
+              lowerSrc !== 'original' &&
+              (lowerFmt.includes('h.264') ||
+                lowerFmt.includes('512kb mpeg4') ||
+                lowerFmt.includes('mpeg4')))
+          );
+        };
+
+        const nonIaVideoFiles = files
           .filter((f) => {
-            if (!f?.name || f.name.toLowerCase().includes('.ia.mp4')) return false;
+            if (f.name.toLowerCase().includes('.ia.mp4')) return false;
             const m = f.name.toLowerCase().match(VIDEO_EXT_END_REGEX);
             if (!m) return false;
             return isFormatAllowedBySettings(m[1]);
@@ -2286,38 +2312,69 @@ async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') 
             };
           });
 
-        if (videoFiles.length === 0) return;
+        const allVideoFiles =
+          nonIaVideoFiles.length > 0
+            ? nonIaVideoFiles
+            : files
+                .filter((f) => {
+                  const m = f.name.toLowerCase().match(VIDEO_EXT_END_REGEX);
+                  if (!m) return false;
+                  return isFormatAllowedBySettings(m[1]);
+                })
+                .map((f) => {
+                  const fmt = detectVideoFormat(f.name);
+                  return {
+                    file: f,
+                    ext: fmt.ext,
+                    size: Number(f.size) || 0
+                  };
+                });
 
-        const mp4Candidate =
-          files.find(
-            (f) =>
-              f?.name &&
-              f.name.toLowerCase().endsWith('.mp4') &&
-              !f.name.toLowerCase().includes('.ia.mp4') &&
-              (!f.size || Number(f.size) < 90_000_000)
-          ) ||
-          files.find((f) => f?.name && f.name.toLowerCase().endsWith('.mp4'));
+        if (allVideoFiles.length === 0) return;
 
-        const mp4DerivativeUrl = mp4Candidate
-          ? `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(mp4Candidate.name)}`
-          : null;
+        // Prefer Archive.org's fast-start H.264 web derivative (.ia.mp4 / h.264) for iOS Safari compatibility
+        const webStreamMp4Candidate =
+          files.find((f) => isIaWebMp4(f) && (!f.size || Number(f.size) < 95_000_000)) ||
+          files.find((f) => f.name.toLowerCase().endsWith('.mp4') && (!f.size || Number(f.size) < 90_000_000)) ||
+          files.find((f) => f.name.toLowerCase().endsWith('.mp4'));
 
-        const sizedPool = videoFiles.filter((vf) => !vf.size || vf.size < 95_000_000);
-        const candidatePool = sizedPool.length > 0 ? sizedPool : videoFiles;
+        const sizedPool = allVideoFiles.filter((vf) => !vf.size || vf.size < 95_000_000);
+        const candidatePool = sizedPool.length > 0 ? sizedPool : allVideoFiles;
         const chosenEntry = candidatePool[Math.floor(Math.random() * candidatePool.length)];
         if (!chosenEntry) return;
 
-        const chosenUrl = `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(
+        // If an MP4 was chosen and Archive.org has a fast-start H.264 web derivative (.ia.mp4),
+        // use the web-streamable H.264 MP4 as primary and keep the alternate MP4 as fallback
+        const chosenRawUrl = `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(
           chosenEntry.file.name
         )}`;
+        const webMp4Url = webStreamMp4Candidate
+          ? `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(
+              webStreamMp4Candidate.name
+            )}`
+          : null;
+
+        const useWebDerivativeAsPrimary =
+          chosenEntry.ext === 'mp4' &&
+          webMp4Url &&
+          webMp4Url !== chosenRawUrl &&
+          String(chosenEntry.file.name || '').toLowerCase().endsWith('.mp4') &&
+          !isIaWebMp4(chosenEntry.file);
+
+        const primaryUrl = useWebDerivativeAsPrimary ? webMp4Url : chosenRawUrl;
+        const fallbackMp4Url = useWebDerivativeAsPrimary
+          ? chosenRawUrl
+          : webMp4Url && webMp4Url !== primaryUrl
+          ? webMp4Url
+          : null;
 
         const sourcePrefix = extraQueryFilter.includes('prelinger') ? 'Prelinger Archive' : 'Archive.org';
         results.push({
           id: `ia-${doc.identifier}-${chosenEntry.ext}`,
           title: doc.title || doc.identifier,
-          videoUrl: chosenUrl,
-          originalUrl: chosenUrl,
-          convertedUrl: chosenEntry.ext !== 'mp4' ? mp4DerivativeUrl : null,
+          videoUrl: primaryUrl,
+          originalUrl: chosenRawUrl,
+          convertedUrl: fallbackMp4Url,
           format: chosenEntry.ext,
           sourceName: `${sourcePrefix} (${keyword})`,
           pageUrl: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`
@@ -3805,6 +3862,7 @@ function updatePlayerUI() {
   const savedTime = getSavedPlaybackTime(current);
   if (videoEl.src !== targetPlayUrl) {
     videoEl.dataset.autoConvertAttempted = 'false';
+    videoEl.dataset.triedConvertedUrl = 'false';
     if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
       videoEl.muted = true;
     }
@@ -3868,7 +3926,7 @@ function goToPrevVideo() {
 
 // Convert the currently active video in-place to .MP4 and reload the player
 async function convertCurrentVideoForPlayer(videoItem) {
-  if (!videoItem || videoItem.convertedBlobUrl) return;
+  if (!videoItem || videoItem.convertedBlobUrl) return false;
 
   const statusBox = document.getElementById('downloadStatusBox');
   const statusText = document.getElementById('downloadStatusText');
@@ -3886,6 +3944,10 @@ async function convertCurrentVideoForPlayer(videoItem) {
       if (progressBar) progressBar.style.width = `${pct}%`;
     });
 
+    if (!result || (!result.wasConverted && !videoItem.convertedBlobUrl)) {
+      throw new Error('On-device transcode unavailable for this stream');
+    }
+
     if (!videoItem.convertedBlobUrl && result.blob) {
       videoItem.convertedBlob = result.blob;
       videoItem.convertedBlobUrl = URL.createObjectURL(result.blob);
@@ -3893,8 +3955,10 @@ async function convertCurrentVideoForPlayer(videoItem) {
     videoItem.isAutoConverted = true;
     updatePlayerUI();
     showToast('Converted to iPhone-native .MP4!');
+    return true;
   } catch {
     showToast('Could not auto-convert this stream in browser.');
+    return false;
   } finally {
     if (convertNowBtn) convertNowBtn.disabled = false;
     const hideTimer = setTimeout(() => {
@@ -3905,7 +3969,74 @@ async function convertCurrentVideoForPlayer(videoItem) {
   }
 }
 
+let consecutiveErrorSkips = 0;
+
+// Recover automatically when a pulled video fails to decode or 403/404s on iOS Safari
+async function handleVideoPlaybackError() {
+  const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+  const current = videoQueue[currentIndex];
+  if (!current || !videoEl) return false;
+
+  // 1. If a server-transcoded or alternate .mp4 stream URL is available, try it immediately
+  if (
+    current.convertedUrl &&
+    videoEl.dataset.triedConvertedUrl !== 'true' &&
+    videoEl.src !== current.convertedUrl
+  ) {
+    videoEl.dataset.triedConvertedUrl = 'true';
+    videoEl.src = current.convertedUrl;
+    videoEl.load?.();
+    if (settings.autoPlay) {
+      videoEl.play?.().catch?.(() => {});
+    }
+    return true;
+  }
+
+  // 2. Try on-device auto-conversion to iPhone-native .MP4
+  if (
+    settings.autoConvert &&
+    !current.convertedBlobUrl &&
+    videoEl.dataset.autoConvertAttempted !== 'true'
+  ) {
+    videoEl.dataset.autoConvertAttempted = 'true';
+    showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
+    const convertedOk = await convertCurrentVideoForPlayer(current);
+    if (convertedOk) {
+      return true;
+    }
+  }
+
+  // 3. Stream is dead/restricted/unplayable: remove it from queue and auto-advance to a working video
+  if (consecutiveErrorSkips >= 3) {
+    consecutiveErrorSkips = 0;
+    showToast('Stream unavailable on source server — tap Shuffle for another video.');
+    return false;
+  }
+
+  consecutiveErrorSkips++;
+  showToast('Stream unavailable — pulling a working video...');
+  videoQueue.splice(currentIndex, 1);
+
+  if (videoQueue.length > 0) {
+    if (currentIndex >= videoQueue.length) {
+      currentIndex = videoQueue.length - 1;
+    }
+    updatePlayerUI();
+    return true;
+  }
+
+  currentIndex = -1;
+  await pullRandomVideos(1);
+  return true;
+}
+
 async function pullRandomVideos(count = 1, customKeyword = null) {
+  if (typeof document !== 'undefined') {
+    const mainEl = document.querySelector?.('.app-main');
+    if (mainEl && typeof mainEl.scrollTop === 'number') {
+      mainEl.scrollTop = 0;
+    }
+  }
   setPlayerLoading(
     true,
     customKeyword
@@ -4311,6 +4442,10 @@ function switchTab(targetId) {
   document.querySelectorAll('.nav-tab').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.target === targetId);
   });
+  const mainEl = document.querySelector?.('.app-main');
+  if (mainEl && typeof mainEl.scrollTop === 'number') {
+    mainEl.scrollTop = 0;
+  }
 }
 
 function escapeHtml(str) {
@@ -4517,12 +4652,14 @@ if (typeof document !== 'undefined') {
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('loadedmetadata', () => {
+    consecutiveErrorSkips = 0;
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('durationchange', () => {
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('play', () => {
+    consecutiveErrorSkips = 0;
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('pause', () => {
@@ -4547,23 +4684,9 @@ if (typeof document !== 'undefined') {
     }
   });
 
-  // Auto-convert on playback error if a non-native format fails to decode directly on iPhone Safari
+  // Auto-recover on playback error: try derivative URL -> on-device MP4 convert -> skip dead stream
   mainVideoEl?.addEventListener('error', async () => {
-    const current = videoQueue[currentIndex];
-    if (!current || mainVideoEl.dataset.autoConvertAttempted === 'true') return;
-    mainVideoEl.dataset.autoConvertAttempted = 'true';
-
-    if (current.convertedUrl && mainVideoEl.src !== current.convertedUrl) {
-      mainVideoEl.src = current.convertedUrl;
-      mainVideoEl.load();
-      if (settings.autoPlay) mainVideoEl.play().catch(() => {});
-      return;
-    }
-
-    if (settings.autoConvert && !current.convertedBlobUrl) {
-      showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
-      await convertCurrentVideoForPlayer(current);
-    }
+    await handleVideoPlaybackError();
   });
 
   // Manual / 1-Tap Convert to .MP4 button in Player
@@ -5568,6 +5691,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getEffectivePlaybackUrl,
     needsMp4Conversion,
     encodeArchiveFilePath,
+    searchInternetArchive,
     extractRedgifsId,
     resolveRedgifsUrlToMp4,
     searchRedgifsVideos,
@@ -5579,6 +5703,8 @@ if (typeof module !== 'undefined' && module.exports) {
     downloadAndAssembleM3u8Stream,
     escapeHtml,
     obtainIphoneReadyVideoBlob,
+    convertCurrentVideoForPlayer,
+    handleVideoPlaybackError,
     setPlayerLoading,
     updatePlayerUI,
     advanceToNextVideo,
@@ -5650,6 +5776,7 @@ if (typeof module !== 'undefined' && module.exports) {
       if (Array.isArray(patch.sources)) sources = patch.sources;
       if (Array.isArray(patch.videoQueue)) {
         videoQueue = patch.videoQueue;
+        consecutiveErrorSkips = 0;
         if (patch.videoQueue.length === 0 && !patch.playbackPositions) {
           playbackPositions = {};
         }

@@ -1899,22 +1899,28 @@ input:checked + .slider:before {
     flex: 1;
     min-height: 0;
     align-items: stretch;
+    overflow: hidden;
+  }
+
+  body.reels-mode-active .video-card {
+    overflow: visible !important;
   }
 
   .video-stage {
     height: 100%;
-    min-height: 360px;
-    max-height: none;
+    min-height: 220px;
+    max-height: 100%;
     aspect-ratio: auto;
   }
 
   .video-controls-panel {
     height: 100%;
     min-height: 0;
+    max-height: 100%;
     overflow-y: auto;
     padding-right: 4px;
     justify-content: space-between;
-    gap: 12px;
+    gap: 10px;
   }
 
   #view-sources.active {
@@ -1936,21 +1942,17 @@ input:checked + .slider:before {
    ============================================================================ */
 @media (min-width: 1024px) and (min-height: 581px) {
   .app-header {
-    padding: calc(var(--safe-top) + 16px) calc(var(--safe-right) + 36px) 16px calc(var(--safe-left) + 36px);
+    padding: calc(var(--safe-top) + 14px) calc(var(--safe-right) + 36px) 14px calc(var(--safe-left) + 36px);
   }
 
   .app-main {
-    padding: 24px calc(var(--safe-right) + 36px) 28px calc(var(--safe-left) + 36px);
+    padding: 18px calc(var(--safe-right) + 36px) 20px calc(var(--safe-left) + 36px);
   }
 
   .video-card {
     grid-template-columns: minmax(0, 1.9fr) minmax(380px, 460px);
-    gap: 24px;
-    padding: 22px;
-  }
-
-  .video-stage {
-    min-height: 480px;
+    gap: 22px;
+    padding: 20px;
   }
 
   .video-grid-list {
@@ -1962,6 +1964,59 @@ input:checked + .slider:before {
   .directory-grid {
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 12px;
+  }
+}
+
+/* ============================================================================
+   RESPONSIVE BREAKPOINT 3C: TABLET / iPAD LANDSCAPE WITH BROWSER CHROME
+   When Safari / in-app browser bars reduce viewport height to 581px–820px,
+   tighten vertical spacing so the search bar, 18+ chips, player card, and
+   batch button all fit cleanly in the viewport with zero scroll or clipping.
+   ============================================================================ */
+@media (min-width: 768px) and (min-height: 581px) and (max-height: 820px) {
+  .app-header {
+    padding: calc(var(--safe-top) + 10px) calc(var(--safe-right) + 24px) 10px calc(var(--safe-left) + 24px);
+  }
+
+  .app-main {
+    padding: 10px calc(var(--safe-right) + 24px) 12px calc(var(--safe-left) + 24px);
+  }
+
+  #view-discover.active {
+    gap: 9px;
+  }
+
+  .quick-search-bar input[type="search"] {
+    padding: 9px 14px;
+  }
+
+  .video-card {
+    padding: 14px;
+    gap: 16px;
+  }
+
+  .video-controls-panel {
+    gap: 7px;
+  }
+
+  .video-meta {
+    gap: 4px;
+  }
+
+  .btn-primary,
+  .btn-accent,
+  .btn-secondary,
+  .btn-download,
+  .btn-vault {
+    padding: 9px 12px;
+  }
+
+  .btn-outline-full {
+    padding: 8px 10px;
+  }
+
+  .bottom-nav {
+    padding: 6px calc(var(--safe-right) + 24px) calc(6px + var(--safe-bottom)) calc(var(--safe-left) + 24px);
   }
 }
 

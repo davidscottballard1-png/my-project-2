@@ -8,6 +8,8 @@ const {
   extractRedditVideosFromListing,
   extractVideoUrlsFromHtml,
   searchFreeTubeSites,
+  searchInternetArchive,
+  handleVideoPlaybackError,
   parseM3u8Manifest,
   downloadAndAssembleM3u8Stream,
   formatVideoTime,
@@ -722,6 +724,183 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         css.includes('touch-action: none;'),
         '.video-stage.reels-fullscreen must set touch-action: none for 1:1 vertical swipe tracking'
       );
+      assert.ok(
+        !css.includes('min-height: 480px;'),
+        'iPad Pro media query must not force .video-stage to min-height: 480px which overflows .video-card on shorter viewports'
+      );
+      assert.ok(
+        css.includes('@media (min-width: 768px) and (min-height: 581px) and (max-height: 820px)'),
+        'styles.css should include compact vertical spacing for tablet landscape with browser toolbars (581px–820px) so the top search bar is never clipped'
+      );
+    });
+
+    it('should prefer Archive.org H.264 .ia.mp4 web derivative for iOS playback and skip private/restricted items', async () => {
+      const origFetch = globalThis.fetch;
+      const origFormatMode = settings.formatMode;
+      settings.formatMode = 'all';
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('advancedsearch.php')) {
+          return {
+            ok: true,
+            json: async () => ({
+              response: {
+                docs: [
+                  { identifier: 'restricted-item', title: 'Restricted Video' },
+                  { identifier: 'jaybbgirl-red-top', title: 'Red top' }
+                ]
+              }
+            })
+          };
+        }
+        if (u.includes('/metadata/restricted-item')) {
+          return {
+            ok: true,
+            json: async () => ({
+              is_dark: true,
+              files: [{ name: 'secret.mp4', size: '5000000' }]
+            })
+          };
+        }
+        if (u.includes('/metadata/jaybbgirl-red-top')) {
+          return {
+            ok: true,
+            json: async () => ({
+              files: [
+                { name: 'private-clip.mp4', size: '4000000', private: 'true' },
+                { name: 'Red top.mp4', size: '12000000', source: 'original', format: 'MPEG4' },
+                { name: 'Red top.ia.mp4', size: '8500000', source: 'derivative', format: 'h.264 IA' }
+              ]
+            })
+          };
+        }
+        return { ok: false };
+      };
+
+      try {
+        const items = await searchInternetArchive('Jaybbgirl', 3);
+        assert.strictEqual(items.length, 1, 'Should skip dark/restricted item and return the playable item');
+        assert.strictEqual(items[0].title, 'Red top');
+        assert.strictEqual(
+          items[0].videoUrl,
+          'https://archive.org/download/jaybbgirl-red-top/Red%20top.ia.mp4',
+          'Should select the fast-start H.264 .ia.mp4 derivative as primary videoUrl for iOS Safari'
+        );
+        assert.strictEqual(
+          items[0].convertedUrl,
+          'https://archive.org/download/jaybbgirl-red-top/Red%20top.mp4',
+          'Should retain the alternate MP4 URL in convertedUrl as fallback'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.formatMode = origFormatMode;
+      }
+    });
+
+    it('should automatically recover on playback error by trying convertedUrl first and skipping dead streams to a working video', async () => {
+      const origDoc = globalThis.document;
+      const origAutoConvert = settings.autoConvert;
+      settings.autoConvert = false;
+
+      const makeClassList = (initial = []) => {
+        const set = new Set(initial);
+        return {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          toggle: (c, force) => {
+            const add = typeof force === 'boolean' ? force : !set.has(c);
+            if (add) set.add(c);
+            else set.delete(c);
+            return add;
+          },
+          contains: (c) => set.has(c)
+        };
+      };
+
+      const makeStubEl = () => ({
+        textContent: '',
+        innerHTML: '',
+        value: '',
+        href: '',
+        src: '',
+        disabled: false,
+        controls: true,
+        muted: true,
+        paused: false,
+        currentTime: 0,
+        duration: 60,
+        dataset: {},
+        style: { width: '0%', setProperty() {} },
+        classList: makeClassList(),
+        load() {},
+        play: () => Promise.resolve(),
+        pause() {},
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {}
+      });
+
+      const elements = {
+        mainVideo: makeStubEl(),
+        toast: makeStubEl()
+      };
+
+      globalThis.document = {
+        body: { classList: makeClassList(), appendChild() {} },
+        createElement: () => makeStubEl(),
+        getElementById: (id) => {
+          if (!elements[id]) elements[id] = makeStubEl();
+          return elements[id];
+        },
+        querySelector: () => makeStubEl(),
+        querySelectorAll: () => []
+      };
+
+      try {
+        setAppState({
+          videoQueue: [
+            {
+              id: 'broken-1',
+              title: 'Red top',
+              videoUrl: 'https://archive.org/download/item/raw.mp4',
+              convertedUrl: 'https://archive.org/download/item/stream.ia.mp4',
+              format: 'mp4',
+              sourceName: 'Archive.org (Jaybbgirl)'
+            },
+            {
+              id: 'working-2',
+              title: 'Working Clip',
+              videoUrl: 'https://example.com/working.mp4',
+              format: 'mp4',
+              sourceName: 'RedGIFs HD'
+            }
+          ],
+          currentIndex: 0
+        });
+
+        elements.mainVideo.src = 'https://archive.org/download/item/raw.mp4';
+        elements.mainVideo.dataset.triedConvertedUrl = 'false';
+
+        // 1st error on broken-1 should switch to convertedUrl (.ia.mp4)
+        const recoveredViaDeriv = await handleVideoPlaybackError();
+        assert.strictEqual(recoveredViaDeriv, true);
+        assert.strictEqual(
+          elements.mainVideo.src,
+          'https://archive.org/download/item/stream.ia.mp4',
+          'First error should immediately fall back to convertedUrl'
+        );
+
+        // If convertedUrl also fails (2nd error), it should remove broken-1 from queue and load working-2
+        const recoveredViaSkip = await handleVideoPlaybackError();
+        assert.strictEqual(recoveredViaSkip, true);
+        assert.strictEqual(getAppState().videoQueue.length, 1, 'Dead video should be removed from videoQueue');
+        assert.strictEqual(getAppState().videoQueue[0].id, 'working-2', 'Next working video should become active');
+        assert.strictEqual(elements.mainVideo.src, 'https://example.com/working.mp4');
+      } finally {
+        globalThis.document = origDoc;
+        settings.autoConvert = origAutoConvert;
+      }
     });
   });
 });
