@@ -306,7 +306,7 @@ const FALLBACK_VIDEOS = [
 let sources = [];
 let settings = {
   allowNsfw: false,
-  nsfwMode: 'mixed', // 'safe' | 'mixed' | 'strict'
+  nsfwMode: 'strict', // 'safe' | 'strict' (Mixed Mode removed: 18+ mode is strictly 18+ only)
   autoMuteNsfw: true,
   resumePlayback: true,
   discreetFilenames: true,
@@ -314,7 +314,7 @@ let settings = {
   nsfwBiometricId: '',
   tubeDurationFilter: 'all', // 'all' | 'short' | 'medium' | 'long'
   tubeQualityFilter: 'all', // 'all' | 'hd'
-  vaultFilter: 'all', // 'all' | 'favorites' | 'nsfw' | 'nsfw_favorites' | 'sfw'
+  vaultFilter: 'all', // 'all' | 'favorites' | 'nsfw' | 'nsfw_favorites'
   playbackSpeed: 1,
   autoPlay: true,
   formatMode: 'all', // 'all' | 'native' | 'mp4'
@@ -1237,6 +1237,12 @@ function loadState() {
     const rawSettings = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     if (rawSettings) {
       settings = { ...settings, ...JSON.parse(rawSettings) };
+      if (settings.nsfwMode === 'mixed' || !settings.nsfwMode) {
+        settings.nsfwMode = settings.allowNsfw ? 'strict' : 'safe';
+      }
+      if (settings.allowNsfw && settings.vaultFilter === 'sfw') {
+        settings.vaultFilter = 'all';
+      }
     }
   } catch {
     // keep defaults
@@ -1559,17 +1565,13 @@ function renderAdultDirectory(filterOverride) {
       : `<p class="muted-center">No 18+ directory sources match "${escapeHtml(rawQuery)}".</p>`;
 }
 
-// Return the active sources filtered by Safe Mode vs Mixed vs Strict 18+ Only Mode
+// Return the active sources filtered by Safe Mode vs 18+ Only Mode (no Mixed Mode)
 function getEffectiveActiveSources() {
   if (!settings.allowNsfw) {
     return sources.filter((s) => s.enabled && !s.isNsfw);
   }
-  if (settings.nsfwMode === 'strict') {
-    const strictSources = sources.filter((s) => s.enabled && s.isNsfw);
-    return strictSources.length > 0 ? strictSources : structuredClone(ADULT_PRESET_SOURCES);
-  }
-  const enabledAll = sources.filter((s) => s.enabled);
-  return enabledAll;
+  const strictSources = sources.filter((s) => s.enabled && s.isNsfw);
+  return strictSources.length > 0 ? strictSources : structuredClone(ADULT_PRESET_SOURCES);
 }
 
 // 4-Digit PIN & WebAuthn FaceID / TouchID Lock Helpers
@@ -1703,6 +1705,65 @@ function scrubNsfwFromActiveSession() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (isItemNsfw(parsed?.currentVideo)) {
+          if (videoQueue.length > 0 && currentIndex >= 0) {
+            savePlaybackState();
+          } else {
+            localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+          }
+        }
+      }
+    }
+  } catch {}
+
+  if (typeof document !== 'undefined') {
+    if (document.getElementById('sourcesList')) renderSourcesList();
+    if (document.getElementById('mainVideo')) updatePlayerUI();
+    if (document.getElementById('vaultList')) {
+      renderVaultList().catch?.(() => {});
+    }
+  }
+}
+
+// Instant 18+ Mode Scrub: removes all safe (non-18+) videos from active player, queue, search results & resume state when 18+ mode is turned on
+function scrubSafeFromActiveSession() {
+  const isItemNsfw = (item) => Boolean(item?.isNsfw || item?.over_18);
+  const current = videoQueue[currentIndex];
+  const wasPlayingSafe = Boolean(current && !isItemNsfw(current));
+
+  videoQueue = videoQueue.filter((item) => isItemNsfw(item));
+  if (videoQueue.length === 0) {
+    currentIndex = -1;
+  } else if (currentIndex >= videoQueue.length) {
+    currentIndex = videoQueue.length - 1;
+  }
+
+  if (wasPlayingSafe) {
+    const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+    if (videoEl) {
+      try {
+        videoEl.pause?.();
+        videoEl.src = '';
+        videoEl.load?.();
+      } catch {}
+    }
+    if (videoQueue.length === 0 && typeof document !== 'undefined') {
+      document.getElementById('playerEmpty')?.classList.remove('hidden');
+    }
+  }
+
+  if (lastSearchResults.some((item) => !isItemNsfw(item))) {
+    lastSearchResults = lastSearchResults.filter((item) => isItemNsfw(item));
+    if (typeof document !== 'undefined' && document.getElementById('searchResultsList')) {
+      renderSearchResults(lastSearchResults);
+    }
+  }
+
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.currentVideo && !isItemNsfw(parsed.currentVideo)) {
           if (videoQueue.length > 0 && currentIndex >= 0) {
             savePlaybackState();
           } else {
@@ -2101,18 +2162,39 @@ function syncAgeGateUI() {
   document.getElementById('adultDirectorySection')?.classList.toggle('hidden', !isAllowed);
   document.getElementById('vaultFilterSelect')?.classList.toggle('hidden', !isAllowed);
 
+  // Remove/hide purely safe video engine options when 18+ mode is On, and hide 18+-only engines in Safe Mode
+  if (typeof document !== 'undefined') {
+    const safeEngineIds = ['engPrelinger', 'engWikimedia', 'engNasa'];
+    for (const id of safeEngineIds) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.checked = !isAllowed;
+        el.closest?.('label')?.classList.toggle('hidden', isAllowed);
+      }
+    }
+    const redgifsEl = document.getElementById('engRedgifs');
+    if (redgifsEl) {
+      redgifsEl.checked = isAllowed;
+      redgifsEl.closest?.('label')?.classList.toggle('hidden', !isAllowed);
+    }
+    const newSourceNsfwEl = document.getElementById('newSourceNsfwCheck');
+    if (newSourceNsfwEl) {
+      newSourceNsfwEl.checked = isAllowed;
+    }
+  }
+
   if (isAllowed && typeof document !== 'undefined' && document.getElementById('adultDirectoryList')) {
     renderAdultDirectory();
   }
 
   const nsfwModeSelect = document.getElementById('nsfwModeSelect');
   if (nsfwModeSelect) {
-    nsfwModeSelect.value = isAllowed ? (settings.nsfwMode === 'strict' ? 'strict' : 'mixed') : 'safe';
+    nsfwModeSelect.value = isAllowed ? 'strict' : 'safe';
   }
 
   const quickModeBtn = document.getElementById('nsfwQuickModeBtn');
   if (quickModeBtn) {
-    quickModeBtn.textContent = settings.nsfwMode === 'strict' ? '🔥 Strict 18+' : '🔞 Mixed 18+';
+    quickModeBtn.textContent = '🔥 18+ Only';
   }
 
   syncNsfwLockUI();
@@ -2127,7 +2209,7 @@ function openAgeGateModal() {
   const modeSelect = document.getElementById('ageGateModeSelect');
 
   if (modeSelect) {
-    modeSelect.value = settings.nsfwMode === 'strict' ? 'strict' : 'mixed';
+    modeSelect.value = 'strict';
   }
   if (pinSection) {
     const needsLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
@@ -2148,18 +2230,16 @@ function closeAgeGateModal() {
   syncAgeGateUI();
 }
 
-function setAdultContentEnabled(enabled, explicitMode = null) {
+function setAdultContentEnabled(enabled) {
   settings.allowNsfw = Boolean(enabled);
   if (settings.allowNsfw) {
-    if (explicitMode === 'strict' || explicitMode === 'mixed') {
-      settings.nsfwMode = explicitMode;
-    } else if (!settings.nsfwMode || settings.nsfwMode === 'safe') {
-      settings.nsfwMode = 'mixed';
-    }
+    settings.nsfwMode = 'strict';
     if (sources.length > 0) {
       unlockAdultPresetSources();
     }
+    scrubSafeFromActiveSession();
   } else {
+    settings.nsfwMode = 'safe';
     scrubNsfwFromActiveSession();
   }
   sourcePoolCache.clear();
@@ -2173,7 +2253,7 @@ function setAdultContentEnabled(enabled, explicitMode = null) {
   }
   showToast(
     settings.allowNsfw
-      ? '🔞 18+ Adult Content Enabled'
+      ? '🔞 18+ Adult Content Enabled (18+ Only — Safe Options Removed)'
       : '🔒 18+ Adult Content Disabled (Safe Mode)'
   );
 }
@@ -2673,7 +2753,7 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
     const post = child?.data;
     if (!post) continue;
     if (post.over_18 && !settings.allowNsfw) continue;
-    if (!allowSfwFallback && settings.allowNsfw && settings.nsfwMode === 'strict' && post.over_18 === false) continue;
+    if (!allowSfwFallback && settings.allowNsfw && post.over_18 === false) continue;
 
     const mediaPost = post.crosspost_parent_list?.[0] || post;
 
@@ -2759,8 +2839,8 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         convertedUrl: normalized.convertedUrl,
         format: normalized.format,
         isAutoConverted: normalized.isAutoConverted,
-        isNsfw: Boolean(post.over_18),
-        over_18: Boolean(post.over_18),
+        isNsfw: Boolean(post.over_18 || settings.allowNsfw),
+        over_18: Boolean(post.over_18 || settings.allowNsfw),
         duration: durationSec,
         tags: postTags,
         isHd: heightPx >= 720 || /720|1080/i.test(normalized.videoUrl),
@@ -2791,7 +2871,7 @@ async function searchRedditVideosByKeyword(keyword) {
   if (!rawKw) return [];
 
   const nsfwFlag = settings.allowNsfw ? '1' : '0';
-  const isStrict = Boolean(settings.allowNsfw && settings.nsfwMode === 'strict');
+  const isStrict = Boolean(settings.allowNsfw);
   const effectiveQuery =
     isStrict && !/\bnsfw:yes\b/i.test(rawKw) ? `${rawKw} nsfw:yes` : rawKw;
   const sorts = ['relevance', 'hot', 'top'];
@@ -2865,11 +2945,7 @@ async function searchRedditVideosByKeyword(keyword) {
 
 // 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
 async function searchPeerTubeVideos(keyword, limit = 4) {
-  const nsfwParam = !settings.allowNsfw
-    ? 'false'
-    : settings.nsfwMode === 'strict'
-    ? 'true'
-    : 'both';
+  const nsfwParam = settings.allowNsfw ? 'true' : 'false';
   const searchUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
     keyword
   )}&count=12&nsfw=${nsfwParam}&sort=-match`;
@@ -3635,19 +3711,18 @@ function filterAndSortTubeResults(
   });
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, FullTaboo.tv, PornOne, Open Tube Discovery & Multi-Sub 18+)
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion in Safe Mode; Eporner API v2, RedGIFs API v2, FullTaboo.tv, PornOne, Open Tube Discovery & Multi-Sub 18+ in 18+ Mode)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
 
-  // A. Dailymotion Public Tube API (Supports both Safe Mode & 18+ Unfiltered Mode)
-  if (!settings.allowNsfw || settings.nsfwMode !== 'strict') {
+  // A. Safe Mode Only: Dailymotion Public Tube API (skipped when 18+ mode is On)
+  if (!settings.allowNsfw) {
     tasks.push(
       (async () => {
-        const nsfwFilter = settings.allowNsfw ? 'true' : 'false';
         const dmUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(
           keyword
-        )}&fields=id,title,url,stream_h264_url,duration&explicit=${nsfwFilter}&limit=${limit}`;
+        )}&fields=id,title,url,stream_h264_url,duration&explicit=false&limit=${limit}`;
         const res = await fetchWithTimeout(dmUrl, 4000);
         if (!res.ok) return;
         const data = await res.json();
@@ -3675,7 +3750,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
     );
   }
 
-  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs & Public Tube Crawlers
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs & Public Tube Crawlers Exclusively
   if (settings.allowNsfw) {
     // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
     tasks.push(
@@ -3790,7 +3865,7 @@ const sourcePoolCache = new Map();
 const SOURCE_CACHE_TTL_MS = 180_000;
 
 function getSourceCacheKey(source) {
-  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${settings.nsfwMode}`;
+  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}`;
 }
 
 // Pull videos from a single source object with fast-first resolution & background pool caching
@@ -3813,7 +3888,7 @@ async function pullFromSource(source) {
   }
   if (source.type === 'url' || /^https?:\/\//i.test(String(source.value || '').trim())) {
     const items = await scanUrlForVideos(source.value, source.label || 'Custom URL');
-    if (source.isNsfw) {
+    if (source.isNsfw || settings.allowNsfw) {
       items.forEach((item) => {
         item.isNsfw = true;
       });
@@ -3829,7 +3904,7 @@ async function pullFromSource(source) {
   const cacheRecord = { items: combined, timestamp: Date.now() };
   sourcePoolCache.set(cacheKey, cacheRecord);
 
-  const isStrictNsfw = Boolean(settings.allowNsfw && (settings.nsfwMode === 'strict' || source.isNsfw));
+  const isStrictNsfw = Boolean(settings.allowNsfw || source.isNsfw);
   const enginePromises = isStrictNsfw
     ? [
         searchRedgifsVideos(source.value, 5),
@@ -3838,8 +3913,7 @@ async function pullFromSource(source) {
         searchRedditVideosByKeyword(source.value),
         searchInternetArchive(source.value, 5),
         searchPeerTubeVideos(source.value, 4),
-        searchFediverseVideos(source.value),
-        searchWikimediaVideos(source.value, 4)
+        searchFediverseVideos(source.value)
       ]
     : [
         searchWikimediaVideos(source.value, 5),
@@ -3850,8 +3924,7 @@ async function pullFromSource(source) {
         searchPeerTubeVideos(source.value, 4),
         searchFediverseVideos(source.value),
         searchFreeTubeSites(source.value, 4),
-        searchOpenWebVideos(source.value, 5),
-        ...(settings.allowNsfw ? [searchRedgifsVideos(source.value, 5)] : [])
+        searchOpenWebVideos(source.value, 5)
       ];
 
   return new Promise((resolve) => {
@@ -3870,6 +3943,11 @@ async function pullFromSource(source) {
       Promise.resolve(p)
         .then((items) => {
           if (Array.isArray(items) && items.length > 0) {
+            if (isStrictNsfw) {
+              items.forEach((item) => {
+                if (item) item.isNsfw = true;
+              });
+            }
             combined.push(...items);
             cacheRecord.timestamp = Date.now();
             // Give fast/medium engines a 750ms window after first result (or 350ms once >=3 videos arrive)
@@ -4487,7 +4565,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         type: 'keyword',
         value: customKeyword,
         label: customKeyword,
-        isNsfw: Boolean(settings.allowNsfw && settings.nsfwMode === 'strict')
+        isNsfw: Boolean(settings.allowNsfw)
       });
     } else {
       const activeSources = getEffectiveActiveSources();
@@ -4519,8 +4597,12 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
     }
 
     if (fresh.length === 0) {
-      if (customKeyword) {
-        showToast(`No matching videos found for "${customKeyword}". Try another keyword!`);
+      if (customKeyword || settings.allowNsfw) {
+        showToast(
+          customKeyword
+            ? `No matching videos found for "${customKeyword}". Try another keyword!`
+            : 'No 18+ videos returned right now. Try another 18+ source or keyword!'
+        );
         setPlayerLoading(false);
         return;
       }
@@ -4540,10 +4622,14 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       showToast(`Added ${selected.length} random videos to your queue!`);
     }
   } catch {
-    const fallbackItem = FALLBACK_VIDEOS[Math.floor(Math.random() * FALLBACK_VIDEOS.length)];
-    videoQueue.push(fallbackItem);
-    currentIndex = videoQueue.length - 1;
-    updatePlayerUI();
+    if (!settings.allowNsfw) {
+      const fallbackItem = FALLBACK_VIDEOS[Math.floor(Math.random() * FALLBACK_VIDEOS.length)];
+      videoQueue.push(fallbackItem);
+      currentIndex = videoQueue.length - 1;
+      updatePlayerUI();
+    } else {
+      showToast('Could not reach 18+ video feeds right now. Try again!');
+    }
   } finally {
     setPlayerLoading(false);
   }
@@ -4675,7 +4761,7 @@ function renderSourcesList() {
   if (!container) return;
 
   const visibleSources = settings.allowNsfw
-    ? sources
+    ? sources.filter((s) => Boolean(s.isNsfw))
     : sources.filter((s) => !s.isNsfw);
 
   if (visibleSources.length === 0) {
@@ -5033,16 +5119,11 @@ if (typeof document !== 'undefined') {
 
   // 1-Tap 18+ Category Chips & Feed Mode Pill on Player Tab
   document.getElementById('nsfwQuickModeBtn')?.addEventListener('click', () => {
-    const nextMode = settings.nsfwMode === 'strict' ? 'mixed' : 'strict';
-    settings.nsfwMode = nextMode;
+    settings.nsfwMode = 'strict';
     sourcePoolCache.clear();
     saveSettings();
     syncAgeGateUI();
-    showToast(
-      nextMode === 'strict'
-        ? '🔥 Switched to Strict 18+ Only Mode'
-        : '🔞 Switched to Mixed (SFW + 18+) Mode'
-    );
+    showToast('🔥 18+ Only Mode Active (All safe video options removed)');
   });
 
   document.getElementById('nsfwQuickChipsBar')?.addEventListener('click', (e) => {
@@ -5514,12 +5595,21 @@ if (typeof document !== 'undefined') {
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
-      listEl.innerHTML = `<p class="muted-center">Searching open video networks, tube sites &amp; public web for "${escapeHtml(query)}"...</p>`;
+      listEl.innerHTML = `<p class="muted-center">Searching ${settings.allowNsfw ? '18+ tube sites &amp; open web' : 'open video networks, tube sites &amp; public web'} for "${escapeHtml(query)}"...</p>`;
     }
 
     const tasks = [];
     if (/^https?:\/\//i.test(query)) {
       tasks.push(scanUrlForVideos(query, 'Scanned Link'));
+    } else if (settings.allowNsfw) {
+      // 18+ Only Mode: exclude purely safe engines (Prelinger, Wikimedia, NASA)
+      if (useRedgifs !== false) tasks.push(searchRedgifsVideos(query, 6));
+      if (useTubeSites !== false) tasks.push(searchFreeTubeSites(query, 6));
+      if (useOpenWeb !== false || useTubeSites !== false) tasks.push(searchOpenWebVideos(query, 6));
+      if (useReddit !== false) tasks.push(searchRedditVideosByKeyword(query));
+      if (useArchive) tasks.push(searchInternetArchive(query, 6));
+      if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
+      if (useFediverse) tasks.push(searchFediverseVideos(query));
     } else {
       if (useArchive) tasks.push(searchInternetArchive(query, 6));
       if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));
@@ -5530,7 +5620,6 @@ if (typeof document !== 'undefined') {
       if (useNasa) tasks.push(searchNasaVideos(query, 6));
       if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
       if (useOpenWeb || useTubeSites) tasks.push(searchOpenWebVideos(query, 6));
-      if (useRedgifs && settings.allowNsfw) tasks.push(searchRedgifsVideos(query, 6));
     }
 
     const settled = await Promise.allSettled(tasks);
@@ -5540,6 +5629,9 @@ if (typeof document !== 'undefined') {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
         for (const item of r.value) {
           if (item?.videoUrl && !seenUrlsInSearch.has(item.videoUrl)) {
+            if (settings.allowNsfw) {
+              item.isNsfw = true;
+            }
             seenUrlsInSearch.add(item.videoUrl);
             combined.push(item);
           }
@@ -5623,7 +5715,7 @@ if (typeof document !== 'undefined') {
     const type = selectedRadio ? selectedRadio.value : 'keyword';
     const rawVal = document.getElementById('newSourceInput')?.value?.trim();
     const rawLabel = document.getElementById('newSourceLabel')?.value?.trim();
-    const markNsfw = Boolean(document.getElementById('newSourceNsfwCheck')?.checked);
+    const markNsfw = Boolean(settings.allowNsfw || document.getElementById('newSourceNsfwCheck')?.checked);
 
     if (!rawVal) return;
 
@@ -5648,6 +5740,8 @@ if (typeof document !== 'undefined') {
     saveSources();
     renderSourcesList();
     e.target.reset();
+    const nsfwCheckEl = document.getElementById('newSourceNsfwCheck');
+    if (nsfwCheckEl) nsfwCheckEl.checked = Boolean(settings.allowNsfw);
     showToast('Added source to your list!');
   });
 
@@ -5783,13 +5877,21 @@ if (typeof document !== 'undefined') {
   });
 
   document.getElementById('enableAllSourcesBtn')?.addEventListener('click', () => {
-    sources.forEach((s) => (s.enabled = true));
+    sources.forEach((s) => {
+      if (Boolean(s.isNsfw) === Boolean(settings.allowNsfw)) {
+        s.enabled = true;
+      }
+    });
     saveSources();
     renderSourcesList();
   });
 
   document.getElementById('disableAllSourcesBtn')?.addEventListener('click', () => {
-    sources.forEach((s) => (s.enabled = false));
+    sources.forEach((s) => {
+      if (Boolean(s.isNsfw) === Boolean(settings.allowNsfw)) {
+        s.enabled = false;
+      }
+    });
     saveSources();
     renderSourcesList();
   });
@@ -5851,9 +5953,9 @@ if (typeof document !== 'undefined') {
     if (val === 'safe') {
       setAdultContentEnabled(false);
     } else {
-      settings.nsfwMode = val;
+      settings.nsfwMode = 'strict';
       if (settings.allowNsfw) {
-        setAdultContentEnabled(true, val);
+        setAdultContentEnabled(true);
       } else {
         openAgeGateModal();
       }
@@ -5946,8 +6048,7 @@ if (typeof document !== 'undefined') {
         return;
       }
     }
-    const chosenMode = document.getElementById('ageGateModeSelect')?.value || settings.nsfwMode || 'strict';
-    setAdultContentEnabled(true, chosenMode);
+    setAdultContentEnabled(true);
     closeAgeGateModal();
   });
 
@@ -5955,8 +6056,7 @@ if (typeof document !== 'undefined') {
     try {
       const verified = await authenticateNsfwBiometric();
       if (verified) {
-        const chosenMode = document.getElementById('ageGateModeSelect')?.value || settings.nsfwMode || 'strict';
-        setAdultContentEnabled(true, chosenMode);
+        setAdultContentEnabled(true);
         closeAgeGateModal();
       } else {
         showToast('FaceID / TouchID verification failed.');
@@ -5984,7 +6084,7 @@ if (typeof document !== 'undefined') {
     sources = structuredClone(DEFAULT_SOURCES);
     settings = {
       allowNsfw: false,
-      nsfwMode: 'mixed',
+      nsfwMode: 'safe',
       autoMuteNsfw: true,
       resumePlayback: true,
       discreetFilenames: true,
@@ -6205,6 +6305,7 @@ if (typeof module !== 'undefined' && module.exports) {
     registerNsfwBiometric,
     authenticateNsfwBiometric,
     scrubNsfwFromActiveSession,
+    scrubSafeFromActiveSession,
     triggerPanicSafeMode,
     getSavedPlaybackTime,
     savePlaybackState,

@@ -135,7 +135,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
   }
 
   describe('1. Strict 18+ Only Mode & Built-In 18+ Source Presets', () => {
-    it('should unlock ADULT_PRESET_SOURCES without duplicating and filter sources by Safe vs Mixed vs Strict 18+ mode', () => {
+    it('should unlock ADULT_PRESET_SOURCES without duplicating and strictly exclude safe sources when 18+ mode is On (no Mixed Mode)', () => {
       setupTestEnv();
       setAppState({ sources: structuredClone(DEFAULT_SOURCES) });
 
@@ -150,26 +150,24 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.ok(safeActive.every((s) => !s.isNsfw), 'Safe mode must exclude all 18+ sources');
       assert.strictEqual(safeActive.length, DEFAULT_SOURCES.length);
 
-      // Strict 18+ mode: only isNsfw sources returned
+      // 18+ mode: always strictly 18+ only (safe sources removed, no mixed mode)
       settings.allowNsfw = true;
-      settings.nsfwMode = 'strict';
       const strictActive = getEffectiveActiveSources();
-      assert.ok(strictActive.length >= ADULT_PRESET_SOURCES.length);
-      assert.ok(strictActive.every((s) => s.isNsfw === true), 'Strict 18+ mode must only include 18+ sources');
-
-      // Mixed mode: both SFW and 18+ sources returned
-      settings.nsfwMode = 'mixed';
-      const mixedActive = getEffectiveActiveSources();
-      assert.strictEqual(mixedActive.length, DEFAULT_SOURCES.length + ADULT_PRESET_SOURCES.length);
+      assert.strictEqual(strictActive.length, ADULT_PRESET_SOURCES.length);
+      assert.ok(strictActive.every((s) => s.isNsfw === true), '18+ mode must only include 18+ sources and remove safe sources');
     });
 
-    it('should hide 18+ sources in renderSourcesList when Safe Mode is active and show them when 18+ is On', () => {
+    it('should hide 18+ sources in Safe Mode and remove all safe sources & safe video options when 18+ is On', () => {
       const { elements } = setupTestEnv();
       setAppState({
         sources: [
           { id: 'sfw-1', type: 'keyword', value: 'nature', label: 'Nature Clips', enabled: true, isNsfw: false },
           { id: 'nsfw-1', type: 'subreddit', value: 'nsfw', label: '🔞 r/NSFW', enabled: true, isNsfw: true }
-        ]
+        ],
+        videoQueue: [
+          { id: 'sfw-q', title: 'Safe Clip', videoUrl: 'https://ex.com/sfw.mp4', format: 'mp4', isNsfw: false }
+        ],
+        currentIndex: 0
       });
 
       settings.allowNsfw = false;
@@ -177,13 +175,14 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.ok(elements.get('sourcesList').innerHTML.includes('Nature Clips'));
       assert.ok(!elements.get('sourcesList').innerHTML.includes('r/NSFW'), '18+ source must be hidden in Safe Mode');
 
-      settings.allowNsfw = true;
-      renderSourcesList();
+      setAdultContentEnabled(true);
+      assert.strictEqual(settings.nsfwMode, 'strict');
       assert.ok(elements.get('sourcesList').innerHTML.includes('r/NSFW'), '18+ source must appear when 18+ is On');
-      assert.ok(elements.get('sourcesList').innerHTML.includes('🔞 18+'));
+      assert.ok(!elements.get('sourcesList').innerHTML.includes('Nature Clips'), 'Safe source must be removed when 18+ is On');
+      assert.strictEqual(getAppState().videoQueue.length, 0, 'Safe video in queue must be scrubbed when 18+ is turned On');
     });
 
-    it('should filter out SFW Reddit posts when nsfwMode is "strict"', () => {
+    it('should filter out SFW Reddit posts whenever 18+ mode is On', () => {
       settings.allowNsfw = true;
       settings.nsfwMode = 'strict';
 

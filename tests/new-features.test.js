@@ -304,9 +304,8 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       );
     });
 
-    it('should query Dailymotion & 18+ Free Tube APIs when allowNsfw is enabled', async () => {
+    it('should query Dailymotion in Safe Mode and exclusively 18+ Free Tube APIs when allowNsfw is enabled', async () => {
       const origFetch = globalThis.fetch;
-      settings.allowNsfw = true;
 
       globalThis.fetch = async (url) => {
         const u = String(url);
@@ -356,9 +355,15 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       };
 
       try {
-        const items = await searchFreeTubeSites('testquery', 4);
-        assert.ok(items.some((i) => i.id === 'dm-dm123' && i.videoUrl.endsWith('dm123.mp4')));
-        assert.ok(items.some((i) => i.id === 'ep-ep999' && i.videoUrl.endsWith('ep999_720p.mp4')));
+        settings.allowNsfw = false;
+        const sfwItems = await searchFreeTubeSites('testquery', 4);
+        assert.ok(sfwItems.some((i) => i.id === 'dm-dm123' && i.videoUrl.endsWith('dm123.mp4')));
+        assert.ok(!sfwItems.some((i) => i.id === 'ep-ep999'));
+
+        settings.allowNsfw = true;
+        const nsfwItems = await searchFreeTubeSites('testquery', 4);
+        assert.ok(!nsfwItems.some((i) => i.id === 'dm-dm123'), 'Safe Dailymotion clips should be excluded in 18+ Mode');
+        assert.ok(nsfwItems.some((i) => i.id === 'ep-ep999' && i.videoUrl.endsWith('ep999_720p.mp4')));
       } finally {
         globalThis.fetch = origFetch;
         settings.allowNsfw = origAllowNsfw;
