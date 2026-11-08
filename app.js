@@ -87,6 +87,55 @@ const DEFAULT_SOURCES = [
   }
 ];
 
+// Curated 18+ source pack that unlocks when 18+ mode is enabled and hides in Safe Mode
+const ADULT_PRESET_SOURCES = [
+  {
+    id: 'src-nsfw-redgifs',
+    type: 'keyword',
+    value: 'redgifs',
+    label: '🔞 RedGIFs HD Trending',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-sub-nsfw',
+    type: 'subreddit',
+    value: 'nsfw',
+    label: '🔞 r/NSFW Highlights',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-sub-gifs',
+    type: 'subreddit',
+    value: 'NSFW_GIF',
+    label: '🔞 r/NSFW_GIF Loops',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-tube-hd',
+    type: 'keyword',
+    value: 'amateur hd',
+    label: '🔞 Free Tube HD Picks',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-vintage',
+    type: 'keyword',
+    value: 'vintage erotica',
+    label: '🔞 Vintage 18+ Archive',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  }
+];
+
 // Reliable public-domain / CC0 fallback clips so the player never fails offline/rate-limited
 const FALLBACK_VIDEOS = [
   {
@@ -135,6 +184,15 @@ const FALLBACK_VIDEOS = [
 let sources = [];
 let settings = {
   allowNsfw: false,
+  nsfwMode: 'mixed', // 'safe' | 'mixed' | 'strict'
+  autoMuteNsfw: true,
+  autoLockOnHide: true,
+  discreetFilenames: true,
+  nsfwPin: '',
+  nsfwBiometricId: '',
+  tubeDurationFilter: 'all', // 'all' | 'short' | 'medium' | 'long'
+  tubeQualityFilter: 'all', // 'all' | 'hd'
+  vaultFilter: 'all', // 'all' | 'nsfw' | 'sfw'
   autoPlay: true,
   formatMode: 'all', // 'all' | 'native' | 'mp4'
   autoConvert: true,
@@ -149,6 +207,8 @@ let lastSearchResults = [];
 let isReelsFullscreen = false;
 let isBackgroundRefilling = false;
 let prebufferVideoEl = null;
+let cachedRedgifsToken = null;
+let cachedRedgifsTokenExpiry = 0;
 
 // ==========================================
 // FORMAT DETECTION & AUTO-CONVERSION HELPERS
@@ -878,8 +938,14 @@ async function saveVideoToVaultDB(videoItem, offlineBlobData = null) {
       copy.hasOfflineBlob = true;
     }
 
+    const isNsfwItem =
+      typeof copy.isNsfw === 'boolean'
+        ? copy.isNsfw
+        : Boolean(copy.over_18 || settings.allowNsfw);
+
     const record = {
       ...copy,
+      isNsfw: isNsfwItem,
       id: copy.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
       savedAt: copy.savedAt || Date.now()
     };
@@ -1009,6 +1075,209 @@ function updateHeaderSummary() {
   }
 }
 
+// Unlock built-in 18+ source presets into the user's sources list (without duplicating)
+function unlockAdultPresetSources() {
+  const existingIds = new Set(sources.map((s) => s.id));
+  let added = 0;
+  for (const preset of ADULT_PRESET_SOURCES) {
+    if (!existingIds.has(preset.id)) {
+      sources.push(structuredClone(preset));
+      existingIds.add(preset.id);
+      added++;
+    }
+  }
+  if (added > 0) {
+    saveSources();
+  }
+  return added;
+}
+
+// Return the active sources filtered by Safe Mode vs Mixed vs Strict 18+ Only Mode
+function getEffectiveActiveSources() {
+  if (!settings.allowNsfw) {
+    return sources.filter((s) => s.enabled && !s.isNsfw);
+  }
+  if (settings.nsfwMode === 'strict') {
+    const strictSources = sources.filter((s) => s.enabled && s.isNsfw);
+    return strictSources.length > 0 ? strictSources : structuredClone(ADULT_PRESET_SOURCES);
+  }
+  const enabledAll = sources.filter((s) => s.enabled);
+  return enabledAll;
+}
+
+// 4-Digit PIN & WebAuthn FaceID / TouchID Lock Helpers
+function syncNsfwLockUI() {
+  const badgeEl = document.getElementById('nsfwLockStatusBadge');
+  if (!badgeEl) return;
+  const hasPin = Boolean(settings.nsfwPin);
+  const hasBio = Boolean(settings.nsfwBiometricId);
+  if (hasPin && hasBio) {
+    badgeEl.textContent = '🔒 Protected by 4-Digit PIN + FaceID';
+  } else if (hasPin) {
+    badgeEl.textContent = '🔒 Protected by 4-Digit PIN';
+  } else if (hasBio) {
+    badgeEl.textContent = '🔒 Protected by FaceID / TouchID';
+  } else {
+    badgeEl.textContent = '🔓 No PIN or FaceID lock set';
+  }
+}
+
+function setNsfwPin(rawPin) {
+  const clean = String(rawPin ?? '').trim();
+  if (!/^\d{4}$/.test(clean)) {
+    return false;
+  }
+  settings.nsfwPin = clean;
+  saveSettings();
+  syncNsfwLockUI();
+  return true;
+}
+
+function clearNsfwPin() {
+  settings.nsfwPin = '';
+  settings.nsfwBiometricId = '';
+  saveSettings();
+  syncNsfwLockUI();
+}
+
+function verifyNsfwPin(inputPin) {
+  if (!settings.nsfwPin) return true;
+  return String(inputPin ?? '').trim() === String(settings.nsfwPin);
+}
+
+async function registerNsfwBiometric() {
+  if (typeof navigator === 'undefined' || !navigator.credentials?.create) {
+    throw new Error('FaceID / TouchID WebAuthn not available on this browser');
+  }
+  const challenge = new Uint8Array(16);
+  const userId = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(challenge);
+    globalThis.crypto.getRandomValues(userId);
+  }
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge,
+      rp: { name: 'ReelVault 18+ Lock' },
+      user: { id: userId, name: 'reelvault-user', displayName: 'ReelVault User' },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform',
+        userVerification: 'required'
+      },
+      timeout: 30000
+    }
+  });
+  if (cred?.id) {
+    settings.nsfwBiometricId = String(cred.id);
+    saveSettings();
+    syncNsfwLockUI();
+    return true;
+  }
+  return false;
+}
+
+async function authenticateNsfwBiometric() {
+  if (typeof navigator === 'undefined' || !navigator.credentials?.get || !settings.nsfwBiometricId) {
+    return false;
+  }
+  const challenge = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(challenge);
+  }
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      userVerification: 'required',
+      timeout: 30000
+    }
+  });
+  return Boolean(assertion);
+}
+
+// Instant Safe-Mode Scrub: purges 18+ videos from active player, queue, search results, sources & Vault view
+function scrubNsfwFromActiveSession() {
+  const isItemNsfw = (item) => Boolean(item?.isNsfw || item?.over_18);
+  const current = videoQueue[currentIndex];
+  const wasPlayingNsfw = isItemNsfw(current);
+
+  videoQueue = videoQueue.filter((item) => !isItemNsfw(item));
+  if (videoQueue.length === 0) {
+    currentIndex = -1;
+  } else if (currentIndex >= videoQueue.length) {
+    currentIndex = videoQueue.length - 1;
+  }
+
+  if (wasPlayingNsfw) {
+    const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+    if (videoEl) {
+      try {
+        videoEl.pause?.();
+        videoEl.src = '';
+        videoEl.load?.();
+      } catch {}
+    }
+    if (videoQueue.length === 0 && typeof document !== 'undefined') {
+      document.getElementById('playerEmpty')?.classList.remove('hidden');
+    }
+  }
+
+  if (lastSearchResults.some(isItemNsfw)) {
+    lastSearchResults = lastSearchResults.filter((item) => !isItemNsfw(item));
+    if (typeof document !== 'undefined' && document.getElementById('searchResultsList')) {
+      renderSearchResults(lastSearchResults);
+    }
+  }
+
+  if (typeof document !== 'undefined') {
+    if (document.getElementById('sourcesList')) renderSourcesList();
+    if (document.getElementById('mainVideo')) updatePlayerUI();
+    if (document.getElementById('vaultList')) {
+      renderVaultList().catch?.(() => {});
+    }
+  }
+}
+
+// Panic / "Boss Key": immediately drops into Safe Mode, exits fullscreen, and loads a safe NASA space clip
+function triggerPanicSafeMode() {
+  if (isReelsFullscreen) {
+    toggleReelsFullscreen(false);
+  }
+  setAdultContentEnabled(false);
+
+  const safeClip = structuredClone(FALLBACK_VIDEOS[0]);
+  videoQueue = [safeClip];
+  currentIndex = 0;
+
+  if (typeof document !== 'undefined') {
+    const videoEl = document.getElementById('mainVideo');
+    if (videoEl) {
+      videoEl.muted = true;
+      try {
+        videoEl.pause?.();
+      } catch {}
+    }
+    switchTab('view-discover');
+    updatePlayerUI();
+  }
+  showToast('🛡️ Safe Mode Active');
+}
+
+// Auto-lock 18+ mode when app is backgrounded or phone is locked
+function handleVisibilityAutoLock() {
+  if (!settings.allowNsfw || !settings.autoLockOnHide) return;
+  const isHidden = typeof document !== 'undefined' && Boolean(document.hidden || document.visibilityState === 'hidden');
+  if (isHidden) {
+    if (typeof document !== 'undefined') {
+      const videoEl = document.getElementById('mainVideo');
+      try {
+        videoEl?.pause?.();
+      } catch {}
+    }
+    setAdultContentEnabled(false);
+  }
+}
+
 function syncAgeGateUI() {
   const isAllowed = Boolean(settings.allowNsfw);
   const headerBtn = document.getElementById('ageGateToggleBtn');
@@ -1021,10 +1290,48 @@ function syncAgeGateUI() {
   if (nsfwToggle) {
     nsfwToggle.checked = isAllowed;
   }
+
+  // Sync Panic Safe button, 18+ Quick Category Chips, Mode Selectors & Preset Pack button
+  document.getElementById('panicSafeBtn')?.classList.toggle('hidden', !isAllowed);
+  document.getElementById('nsfwQuickChipsBar')?.classList.toggle('hidden', !isAllowed);
+  document.getElementById('searchNsfwChipsBar')?.classList.toggle('hidden', !isAllowed);
+  document.getElementById('loadAdultPresetsBtn')?.classList.toggle('hidden', !isAllowed);
+  document.getElementById('vaultFilterSelect')?.classList.toggle('hidden', !isAllowed);
+
+  const nsfwModeSelect = document.getElementById('nsfwModeSelect');
+  if (nsfwModeSelect) {
+    nsfwModeSelect.value = isAllowed ? (settings.nsfwMode === 'strict' ? 'strict' : 'mixed') : 'safe';
+  }
+
+  const quickModeBtn = document.getElementById('nsfwQuickModeBtn');
+  if (quickModeBtn) {
+    quickModeBtn.textContent = settings.nsfwMode === 'strict' ? '🔥 Strict 18+' : '🔞 Mixed 18+';
+  }
+
+  syncNsfwLockUI();
 }
 
 function openAgeGateModal() {
   const modal = document.getElementById('ageGateModal');
+  const pinSection = document.getElementById('ageGatePinSection');
+  const pinInput = document.getElementById('ageGatePinInput');
+  const pinError = document.getElementById('ageGatePinError');
+  const bioBtn = document.getElementById('ageGateBiometricBtn');
+  const modeSelect = document.getElementById('ageGateModeSelect');
+
+  if (modeSelect) {
+    modeSelect.value = settings.nsfwMode === 'strict' ? 'strict' : 'mixed';
+  }
+  if (pinSection) {
+    const needsLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
+    pinSection.classList.toggle('hidden', !needsLock);
+  }
+  if (pinInput) pinInput.value = '';
+  pinError?.classList.add('hidden');
+  if (bioBtn) {
+    bioBtn.classList.toggle('hidden', !settings.nsfwBiometricId);
+  }
+
   modal?.classList.remove('hidden');
 }
 
@@ -1034,11 +1341,29 @@ function closeAgeGateModal() {
   syncAgeGateUI();
 }
 
-function setAdultContentEnabled(enabled) {
+function setAdultContentEnabled(enabled, explicitMode = null) {
   settings.allowNsfw = Boolean(enabled);
+  if (settings.allowNsfw) {
+    if (explicitMode === 'strict' || explicitMode === 'mixed') {
+      settings.nsfwMode = explicitMode;
+    } else if (!settings.nsfwMode || settings.nsfwMode === 'safe') {
+      settings.nsfwMode = 'mixed';
+    }
+    if (sources.length > 0) {
+      unlockAdultPresetSources();
+    }
+  } else {
+    scrubNsfwFromActiveSession();
+  }
   sourcePoolCache.clear();
   saveSettings();
   syncAgeGateUI();
+  if (typeof document !== 'undefined') {
+    if (document.getElementById('sourcesList')) renderSourcesList();
+    if (document.getElementById('vaultList')) {
+      renderVaultList().catch?.(() => {});
+    }
+  }
   showToast(
     settings.allowNsfw
       ? '🔞 18+ Adult Content Enabled'
@@ -1257,6 +1582,147 @@ async function searchWikimediaVideos(keyword, limit = 8) {
   return results;
 }
 
+// ==========================================
+// REDGIFS API V2 HD .MP4 RESOLVER & SEARCH ENGINE
+// ==========================================
+
+function extractRedgifsId(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  const watchMatch = rawUrl.match(/redgifs\.com\/(?:watch|ifr|detail|gifs\/detail)\/([a-zA-Z0-9_-]+)/i);
+  if (watchMatch?.[1]) {
+    return watchMatch[1].toLowerCase();
+  }
+  const thumbMatch = rawUrl.match(
+    /thumbs\d*\.redgifs\.com\/([a-zA-Z0-9_-]+?)(?:-mobile|-silent|-size_restricted|-poster)?\.(?:mp4|webm|gif|jpg)/i
+  );
+  if (thumbMatch?.[1]) {
+    return thumbMatch[1];
+  }
+  return null;
+}
+
+async function getRedgifsTempToken() {
+  if (cachedRedgifsToken && Date.now() < cachedRedgifsTokenExpiry) {
+    return cachedRedgifsToken;
+  }
+  try {
+    const res = await fetchWithTimeout('https://api.redgifs.com/v2/auth/temporary', 3500);
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.token) {
+        cachedRedgifsToken = data.token;
+        cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+        return cachedRedgifsToken;
+      }
+    }
+  } catch {
+    // fallback if blocked
+  }
+  return null;
+}
+
+async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip') {
+  const rgId = extractRedgifsId(rawUrl);
+  if (!rgId) return null;
+
+  // 1. Try RedGIFs API v2 with temporary guest bearer token
+  try {
+    const token = await getRedgifsTempToken();
+    const apiUrl = `https://api.redgifs.com/v2/gifs/${encodeURIComponent(rgId.toLowerCase())}`;
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(apiUrl, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      const gif = data?.gif;
+      const mp4Url = gif?.urls?.hd || gif?.urls?.sd;
+      if (mp4Url) {
+        return {
+          id: `rg-${gif.id || rgId.toLowerCase()}`,
+          title: (Array.isArray(gif.tags) && gif.tags.length ? `RedGIFs: ${gif.tags.slice(0, 4).join(', ')}` : fallbackTitle),
+          videoUrl: mp4Url,
+          originalUrl: rawUrl,
+          convertedUrl: mp4Url,
+          format: 'mp4',
+          duration: Number(gif.duration) || 0,
+          isHd: Boolean(gif?.urls?.hd),
+          isNsfw: true,
+          sourceName: 'RedGIFs HD',
+          pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`
+        };
+      }
+    }
+  } catch {
+    // Fall back to embed HTML scraping
+  }
+
+  // 2. Fallback: scrape RedGIFs embed / watch page HTML for direct .mp4 stream
+  try {
+    const embedUrl = `https://www.redgifs.com/ifr/${encodeURIComponent(rgId.toLowerCase())}`;
+    const html = await fetchWithCorsFallback(embedUrl, true);
+    const streams = extractVideoUrlsFromHtml(html, embedUrl);
+    const bestMp4 = streams.find((u) => /\.mp4(\?|$)/i.test(u)) || streams[0];
+    if (bestMp4) {
+      return {
+        id: `rg-${rgId.toLowerCase()}`,
+        title: fallbackTitle,
+        videoUrl: bestMp4,
+        originalUrl: rawUrl,
+        convertedUrl: bestMp4,
+        format: 'mp4',
+        isHd: true,
+        isNsfw: true,
+        sourceName: 'RedGIFs HD',
+        pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+async function searchRedgifsVideos(keyword, limit = 6) {
+  if (!settings.allowNsfw) return [];
+  const results = [];
+
+  try {
+    const token = await getRedgifsTempToken();
+    const cleanKw = String(keyword || '').replace(/\b(redgifs|nsfw|18\+)\b/gi, '').trim() || 'trending';
+    const searchUrl = `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(
+      cleanKw
+    )}&order=trending&count=${limit}`;
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(searchUrl, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      const gifs = Array.isArray(data?.gifs) ? data.gifs : [];
+      for (const g of gifs) {
+        const mp4Url = g?.urls?.hd || g?.urls?.sd;
+        if (!mp4Url || !isFormatAllowedBySettings('mp4')) continue;
+        const tagLabel = Array.isArray(g.tags) && g.tags.length ? g.tags.slice(0, 4).join(', ') : cleanKw;
+        results.push({
+          id: `rg-${g.id}`,
+          title: `RedGIFs HD — ${tagLabel}`,
+          videoUrl: mp4Url,
+          originalUrl: mp4Url,
+          convertedUrl: null,
+          format: 'mp4',
+          duration: Number(g.duration) || 0,
+          isHd: Boolean(g?.urls?.hd),
+          isNsfw: true,
+          sourceName: `RedGIFs (${cleanKw})`,
+          pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(g.id)}`
+        });
+      }
+    }
+  } catch {
+    // ignore API error
+  }
+
+  return filterAndSortTubeResults(results);
+}
+
 // 4. Reddit Subreddit or Global Keyword Video Search
 function extractRedditVideosFromListing(json, sourceLabel) {
   const children = json?.data?.children || [];
@@ -1266,6 +1732,7 @@ function extractRedditVideosFromListing(json, sourceLabel) {
     const post = child?.data;
     if (!post) continue;
     if (post.over_18 && !settings.allowNsfw) continue;
+    if (settings.allowNsfw && settings.nsfwMode === 'strict' && post.over_18 === false) continue;
 
     const mediaPost = post.crosspost_parent_list?.[0] || post;
 
@@ -1285,6 +1752,23 @@ function extractRedditVideosFromListing(json, sourceLabel) {
     if (!rawVideoUrl && typeof candidateDirectUrl === 'string') {
       if (DIRECT_VIDEO_URL_REGEX.test(candidateDirectUrl)) {
         rawVideoUrl = candidateDirectUrl;
+      } else if (/redgifs\.com/i.test(candidateDirectUrl)) {
+        // Extract RedGIFs direct .mp4 from oembed thumbnail pattern or slug
+        const oembedThumb =
+          mediaPost?.secure_media?.oembed?.thumbnail_url ||
+          mediaPost?.media?.oembed?.thumbnail_url ||
+          '';
+        const thumbSlugMatch = String(oembedThumb).match(
+          /(https?:\/\/thumbs\d*\.redgifs\.com\/[a-zA-Z0-9_-]+?)(?:-poster|-mobile|-size_restricted)?\.(?:jpg|png|gif|mp4)/i
+        );
+        if (thumbSlugMatch?.[1]) {
+          rawVideoUrl = `${thumbSlugMatch[1]}.mp4`;
+        } else {
+          const rgId = extractRedgifsId(candidateDirectUrl);
+          if (rgId) {
+            rawVideoUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
+          }
+        }
       }
     }
 
@@ -1296,6 +1780,15 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       const normalized = normalizeAndAutoRewriteVideoUrl(rawVideoUrl);
       if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
 
+      const durationSec =
+        Number(mediaPost?.secure_media?.reddit_video?.duration) ||
+        Number(mediaPost?.preview?.reddit_video_preview?.duration) ||
+        0;
+      const heightPx =
+        Number(mediaPost?.secure_media?.reddit_video?.height) ||
+        Number(mediaPost?.preview?.reddit_video_preview?.height) ||
+        0;
+
       results.push({
         id: `rd-${post.id}`,
         title: post.title || 'Reddit Video Clip',
@@ -1304,6 +1797,10 @@ function extractRedditVideosFromListing(json, sourceLabel) {
         convertedUrl: normalized.convertedUrl,
         format: normalized.format,
         isAutoConverted: normalized.isAutoConverted,
+        isNsfw: Boolean(post.over_18),
+        over_18: Boolean(post.over_18),
+        duration: durationSec,
+        isHd: heightPx >= 720 || /720|1080/i.test(normalized.videoUrl),
         sourceName: sourceLabel,
         pageUrl: `https://www.reddit.com${post.permalink || ''}`
       });
@@ -1326,10 +1823,14 @@ async function fetchSubredditVideos(subreddit) {
 
 async function searchRedditVideosByKeyword(keyword) {
   const nsfwFlag = settings.allowNsfw ? '1' : '0';
+  const effectiveQuery =
+    settings.allowNsfw && settings.nsfwMode === 'strict' && !/\bnsfw:yes\b/i.test(keyword)
+      ? `${keyword} nsfw:yes`
+      : keyword;
   const sorts = ['relevance', 'hot', 'top'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
   const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-    keyword
+    effectiveQuery
   )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
 
   const json = await fetchWithCorsFallback(url, false);
@@ -1338,7 +1839,11 @@ async function searchRedditVideosByKeyword(keyword) {
 
 // 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
 async function searchPeerTubeVideos(keyword, limit = 4) {
-  const nsfwParam = settings.allowNsfw ? 'both' : 'false';
+  const nsfwParam = !settings.allowNsfw
+    ? 'false'
+    : settings.nsfwMode === 'strict'
+    ? 'true'
+    : 'both';
   const searchUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
     keyword
   )}&count=12&nsfw=${nsfwParam}&sort=-match`;
@@ -1390,6 +1895,9 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
           originalUrl: primaryUrl,
           convertedUrl: fmt.ext !== 'mp4' && mp4File ? mp4File.fileDownloadUrl || mp4File.fileUrl : null,
           format: fmt.ext,
+          isNsfw: Boolean(item.nsfw || detail.nsfw),
+          duration: Number(detail.duration || item.duration) || 0,
+          isHd: Number(mp4File?.resolution?.id || 0) >= 720,
           sourceName: `PeerTube (${host})`,
           pageUrl: item.url || `https://${host}/w/${uuid}`
         });
@@ -1419,6 +1927,7 @@ async function searchFediverseVideos(keyword) {
 
       for (const st of statuses) {
         if (st?.sensitive && !settings.allowNsfw) continue;
+        if (settings.allowNsfw && settings.nsfwMode === 'strict' && !st?.sensitive) continue;
         const attachments = Array.isArray(st?.media_attachments) ? st.media_attachments : [];
         for (const att of attachments) {
           if ((att.type === 'video' || att.type === 'gifv') && att.url) {
@@ -1435,6 +1944,7 @@ async function searchFediverseVideos(keyword) {
               originalUrl: att.url,
               convertedUrl: null,
               format: fmt.ext,
+              isNsfw: Boolean(st?.sensitive),
               sourceName: `Mastodon (#${cleanTag})`,
               pageUrl: st.url || att.url
             });
@@ -1455,9 +1965,18 @@ async function searchFediverseVideos(keyword) {
       for (const entry of posts) {
         const post = entry?.post;
         if (!post) continue;
-        if (post.nsfw && !settings.allowNsfw) continue;
-        const candidateUrl = post.url || post.embed_video_url;
+        const isPostNsfw = Boolean(post.nsfw || entry?.community?.nsfw);
+        if (isPostNsfw && !settings.allowNsfw) continue;
+        if (settings.allowNsfw && settings.nsfwMode === 'strict' && !isPostNsfw) continue;
+        let candidateUrl = post.url || post.embed_video_url;
         if (!candidateUrl || typeof candidateUrl !== 'string') continue;
+
+        if (/redgifs\.com/i.test(candidateUrl)) {
+          const rgId = extractRedgifsId(candidateUrl);
+          if (rgId) {
+            candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
+          }
+        }
 
         if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
           const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
@@ -1470,6 +1989,7 @@ async function searchFediverseVideos(keyword) {
             convertedUrl: normalized.convertedUrl,
             format: normalized.format,
             isAutoConverted: normalized.isAutoConverted,
+            isNsfw: isPostNsfw,
             sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
             pageUrl: post.ap_id || candidateUrl
           });
@@ -1597,6 +2117,14 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSubpageCrawl = true) {
   const trimmed = targetUrl.trim();
 
+  // Direct RedGIFs watch/embed link resolver
+  if (/redgifs\.com\/(?:watch|ifr|detail)\//i.test(trimmed)) {
+    const resolvedRg = await resolveRedgifsUrlToMp4(trimmed, customLabel);
+    if (resolvedRg) {
+      return [resolvedRg];
+    }
+  }
+
   if (DIRECT_VIDEO_URL_REGEX.test(trimmed)) {
     const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
     const fileName = trimmed.split('/').pop().split('?')[0].split('#')[0] || 'Direct Video';
@@ -1679,50 +2207,80 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   return results;
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, 18+ Tube Feeds)
+// Filter & sort tube results by duration ('all' | 'short' | 'medium' | 'long') and quality ('all' | 'hd')
+function filterAndSortTubeResults(
+  items,
+  durationFilter = settings.tubeDurationFilter,
+  qualityFilter = settings.tubeQualityFilter
+) {
+  if (!Array.isArray(items)) return [];
+  return items.filter((item) => {
+    if (!item) return false;
+    if (qualityFilter === 'hd') {
+      const looksHd =
+        Boolean(item.isHd) ||
+        /(?:720p|1080p|1440p|2160p|4k|_hd|hd\.mp4)/i.test(`${item.videoUrl || ''} ${item.title || ''}`);
+      if (!looksHd) return false;
+    }
+    const dur = Number(item.duration) || 0;
+    if (dur > 0 && durationFilter && durationFilter !== 'all') {
+      if (durationFilter === 'short' && dur > 120) return false;
+      if (durationFilter === 'medium' && (dur < 120 || dur > 600)) return false;
+      if (durationFilter === 'long' && dur < 300) return false;
+    }
+    return true;
+  });
+}
+
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, 18+ Tube Feeds)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
 
   // A. Dailymotion Public Tube API (Supports both Safe Mode & 18+ Unfiltered Mode)
-  tasks.push(
-    (async () => {
-      const nsfwFilter = settings.allowNsfw ? 'true' : 'false';
-      const dmUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(
-        keyword
-      )}&fields=id,title,url,stream_h264_url&explicit=${nsfwFilter}&limit=${limit}`;
-      const res = await fetchWithTimeout(dmUrl, 4000);
-      if (!res.ok) return;
-      const data = await res.json();
-      const list = Array.isArray(data?.list) ? data.list : [];
-      for (const item of list) {
-        const directStream = item?.stream_h264_url;
-        if (directStream && typeof directStream === 'string') {
-          const normalized = normalizeAndAutoRewriteVideoUrl(directStream);
-          if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
-          results.push({
-            id: `dm-${item.id}`,
-            title: item.title || 'Dailymotion Tube Clip',
-            videoUrl: normalized.videoUrl,
-            originalUrl: normalized.originalUrl,
-            convertedUrl: normalized.convertedUrl,
-            format: normalized.format,
-            sourceName: 'Dailymotion Tube',
-            pageUrl: item.url || `https://www.dailymotion.com/video/${item.id}`
-          });
+  if (!settings.allowNsfw || settings.nsfwMode !== 'strict') {
+    tasks.push(
+      (async () => {
+        const nsfwFilter = settings.allowNsfw ? 'true' : 'false';
+        const dmUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(
+          keyword
+        )}&fields=id,title,url,stream_h264_url,duration&explicit=${nsfwFilter}&limit=${limit}`;
+        const res = await fetchWithTimeout(dmUrl, 4000);
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = Array.isArray(data?.list) ? data.list : [];
+        for (const item of list) {
+          const directStream = item?.stream_h264_url;
+          if (directStream && typeof directStream === 'string') {
+            const normalized = normalizeAndAutoRewriteVideoUrl(directStream);
+            if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
+            results.push({
+              id: `dm-${item.id}`,
+              title: item.title || 'Dailymotion Tube Clip',
+              videoUrl: normalized.videoUrl,
+              originalUrl: normalized.originalUrl,
+              convertedUrl: normalized.convertedUrl,
+              format: normalized.format,
+              duration: Number(item.duration) || 0,
+              isHd: /720|1080|hd/i.test(directStream),
+              sourceName: 'Dailymotion Tube',
+              pageUrl: item.url || `https://www.dailymotion.com/video/${item.id}`
+            });
+          }
         }
-      }
-    })()
-  );
+      })()
+    );
+  }
 
-  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + 18+ Tube Feeds)
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + 18+ Tube Feeds)
   if (settings.allowNsfw) {
     // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
     tasks.push(
       (async () => {
+        const epOrder = settings.tubeDurationFilter === 'long' ? 'longest' : 'most-popular';
         const epApiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(
           keyword
-        )}&per_page=6&thumbsize=medium&order=most-popular&format=json`;
+        )}&per_page=6&thumbsize=medium&order=${epOrder}&format=json`;
         const data = await fetchWithCorsFallback(epApiUrl, false);
         const videos = Array.isArray(data?.videos) ? data.videos.slice(0, 3) : [];
 
@@ -1732,7 +2290,10 @@ async function searchFreeTubeSites(keyword, limit = 6) {
             const embedUrl = v.embed || `https://www.eporner.com/embed/${v.id}/`;
             const pageHtml = await fetchWithCorsFallback(embedUrl, true);
             const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
-            const bestStream = streams.find((u) => /\.mp4(\?|$)/i.test(u)) || streams[0];
+            const bestStream =
+              streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
+              streams.find((u) => /\.mp4(\?|$)/i.test(u)) ||
+              streams[0];
             if (!bestStream) return;
 
             const normalized = normalizeAndAutoRewriteVideoUrl(bestStream);
@@ -1745,7 +2306,10 @@ async function searchFreeTubeSites(keyword, limit = 6) {
               originalUrl: normalized.originalUrl,
               convertedUrl: normalized.convertedUrl,
               format: normalized.format,
-              sourceName: `Free Tube (${ keyword })`,
+              duration: Number(v.length_sec) || 0,
+              isHd: /720|1080|hd/i.test(bestStream) || Boolean(v.hd),
+              isNsfw: true,
+              sourceName: `Free Tube (${keyword})`,
               pageUrl: v.url || embedUrl
             });
           })
@@ -1753,7 +2317,15 @@ async function searchFreeTubeSites(keyword, limit = 6) {
       })()
     );
 
-    // 2. Direct 18+ Tube Stream Search (RedGIFs / v.redd.it NSFW video streams)
+    // 2. RedGIFs API v2 HD Short Tube Clips
+    tasks.push(
+      (async () => {
+        const rgItems = await searchRedgifsVideos(keyword, 4);
+        results.push(...rgItems);
+      })()
+    );
+
+    // 3. Direct 18+ Tube Stream Search (RedGIFs / v.redd.it NSFW video streams)
     tasks.push(
       (async () => {
         const nsfwTubeUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
@@ -1767,7 +2339,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
   }
 
   await Promise.allSettled(tasks);
-  return results;
+  return filterAndSortTubeResults(results);
 }
 
 // In-memory source pool cache (3-minute TTL) for instant 0ms subsequent pulls
@@ -1775,7 +2347,7 @@ const sourcePoolCache = new Map();
 const SOURCE_CACHE_TTL_MS = 180_000;
 
 function getSourceCacheKey(source) {
-  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}`;
+  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${settings.nsfwMode}`;
 }
 
 // Pull videos from a single source object with fast-first resolution & background pool caching
@@ -1800,21 +2372,31 @@ async function pullFromSource(source) {
     return await scanUrlForVideos(source.value, source.label || 'Custom URL');
   }
 
-  // Default: 'keyword' -> race all 7 engines in parallel and resolve as soon as fast engines respond
+  // Default: 'keyword' -> race open engines in parallel (or 18+-focused engines when Strict 18+ Mode is active)
   const combined = [];
   const cacheRecord = { items: combined, timestamp: Date.now() };
   sourcePoolCache.set(cacheKey, cacheRecord);
 
-  const enginePromises = [
-    searchWikimediaVideos(source.value, 5),
-    searchNasaVideos(source.value, 3),
-    searchRedditVideosByKeyword(source.value),
-    searchInternetArchive(source.value, 3),
-    searchPrelingerArchives(source.value, 2),
-    searchPeerTubeVideos(source.value, 3),
-    searchFediverseVideos(source.value),
-    searchFreeTubeSites(source.value, 4)
-  ];
+  const isStrictNsfw = Boolean(settings.allowNsfw && (settings.nsfwMode === 'strict' || source.isNsfw));
+  const enginePromises = isStrictNsfw
+    ? [
+        searchRedgifsVideos(source.value, 5),
+        searchFreeTubeSites(source.value, 5),
+        searchRedditVideosByKeyword(source.value),
+        searchPeerTubeVideos(source.value, 4),
+        searchFediverseVideos(source.value),
+        searchInternetArchive(source.value, 3, 'collection:(adult) OR mediatype:(movies)')
+      ]
+    : [
+        searchWikimediaVideos(source.value, 5),
+        searchNasaVideos(source.value, 3),
+        searchRedditVideosByKeyword(source.value),
+        searchInternetArchive(source.value, 3),
+        searchPrelingerArchives(source.value, 2),
+        searchPeerTubeVideos(source.value, 3),
+        searchFediverseVideos(source.value),
+        searchFreeTubeSites(source.value, 4)
+      ];
 
   return new Promise((resolve) => {
     let remaining = enginePromises.length;
@@ -1898,11 +2480,11 @@ async function scheduleBackgroundQueuePrebuffer() {
 
   // 1. If fewer than 2 videos remain ahead of currentIndex, silently pull 2 more in the background
   const remainingAhead = videoQueue.length - 1 - currentIndex;
-  if (remainingAhead < 2 && !isBackgroundRefilling && sources.some((s) => s.enabled)) {
+  const effectiveSources = getEffectiveActiveSources();
+  if (remainingAhead < 2 && !isBackgroundRefilling && effectiveSources.length > 0) {
     isBackgroundRefilling = true;
     try {
-      const activeSources = sources.filter((s) => s.enabled);
-      const randomSource = activeSources[Math.floor(Math.random() * activeSources.length)];
+      const randomSource = effectiveSources[Math.floor(Math.random() * effectiveSources.length)];
       if (randomSource) {
         const fetched = await pullFromSource(randomSource);
         const fresh = fetched.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
@@ -2038,6 +2620,9 @@ function updatePlayerUI() {
   const targetPlayUrl = getEffectivePlaybackUrl(current);
   if (videoEl.src !== targetPlayUrl) {
     videoEl.dataset.autoConvertAttempted = 'false';
+    if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
+      videoEl.muted = true;
+    }
     videoEl.src = targetPlayUrl;
     videoEl.load();
     if (settings.autoPlay) {
@@ -2123,10 +2708,11 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       pool = await pullFromSource({
         type: 'keyword',
         value: customKeyword,
-        label: customKeyword
+        label: customKeyword,
+        isNsfw: Boolean(settings.allowNsfw && settings.nsfwMode === 'strict')
       });
     } else {
-      const activeSources = sources.filter((s) => s.enabled);
+      const activeSources = getEffectiveActiveSources();
       if (activeSources.length === 0) {
         showToast('Enable at least one source in the Sources tab!');
         setPlayerLoading(false);
@@ -2186,8 +2772,30 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
 }
 
 // ==========================================
-// DOWNLOAD TO IPHONE (PHOTOS / FILES) WITH AUTO-CONVERSION
+// DOWNLOAD TO IPHONE (PHOTOS / FILES) WITH AUTO-CONVERSION & DISCREET FILENAMES
 // ==========================================
+
+function buildExportFilename(videoItem, ext = 'mp4') {
+  const safeExt = String(ext || 'mp4').replace(/^\./, '').toLowerCase() || 'mp4';
+  const isNsfwVideo = Boolean(videoItem?.isNsfw || videoItem?.over_18 || settings.allowNsfw);
+
+  if (settings.discreetFilenames && isNsfwVideo) {
+    const rawId = String(videoItem?.id || videoItem?.videoUrl || '1042');
+    let hash = 0;
+    for (let i = 0; i < rawId.length; i++) {
+      hash = (hash * 31 + rawId.charCodeAt(i)) % 9000;
+    }
+    const code = 1000 + Math.abs(hash);
+    return `reelvault-clip-${code}.${safeExt}`;
+  }
+
+  const baseSlug = (videoItem?.title || 'reelvault-video')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 42) || 'reelvault-video';
+  return `${baseSlug}.${safeExt}`;
+}
 
 async function downloadVideoToIphone(videoItem) {
   if (!videoItem?.videoUrl && !videoItem?.offlineBlob) return;
@@ -2203,12 +2811,6 @@ async function downloadVideoToIphone(videoItem) {
   if (statusPercent) statusPercent.textContent = '0%';
   if (progressBar) progressBar.style.width = '8%';
   if (saveBtn) saveBtn.disabled = true;
-
-  const baseSlug = (videoItem.title || 'reelvault-video')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 42) || 'reelvault-video';
 
   try {
     const { blob, ext, mime, wasConverted } = await obtainIphoneReadyVideoBlob(
@@ -2229,14 +2831,15 @@ async function downloadVideoToIphone(videoItem) {
     if (statusPercent) statusPercent.textContent = '100%';
     if (progressBar) progressBar.style.width = '100%';
 
-    const cleanFileName = `${baseSlug}.${ext || 'mp4'}`;
+    const cleanFileName = buildExportFilename(videoItem, ext || 'mp4');
+    const isDiscreet = settings.discreetFilenames && Boolean(videoItem?.isNsfw || videoItem?.over_18 || settings.allowNsfw);
     const file = new File([blob], cleanFileName, { type: mime || 'video/mp4' });
 
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       if (statusText) statusText.textContent = 'Opening iPhone Save menu...';
       await navigator.share({
         files: [file],
-        title: videoItem.title || 'ReelVault Video'
+        title: isDiscreet ? 'ReelVault Clip' : (videoItem.title || 'ReelVault Video')
       });
       showToast(
         wasConverted
@@ -2267,7 +2870,7 @@ async function downloadVideoToIphone(videoItem) {
       const fallbackExt = detectVideoFormat(fallbackUrl).ext;
       const a = document.createElement('a');
       a.href = fallbackUrl;
-      a.download = `${baseSlug}.${fallbackExt}`;
+      a.download = buildExportFilename(videoItem, fallbackExt);
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
       document.body.appendChild(a);
@@ -2293,7 +2896,11 @@ function renderSourcesList() {
   const container = document.getElementById('sourcesList');
   if (!container) return;
 
-  if (sources.length === 0) {
+  const visibleSources = settings.allowNsfw
+    ? sources
+    : sources.filter((s) => !s.isNsfw);
+
+  if (visibleSources.length === 0) {
     container.innerHTML = `<p class="muted-center">No sources configured. Add one above!</p>`;
     return;
   }
@@ -2304,12 +2911,15 @@ function renderSourcesList() {
     url: '🔗 URL'
   };
 
-  container.innerHTML = sources
+  container.innerHTML = visibleSources
     .map(
       (s) => `
       <div class="source-item">
         <div class="source-info">
-          <div class="source-name">${escapeHtml(s.label || s.value)}</div>
+          <div class="source-name">
+            ${escapeHtml(s.label || s.value)}
+            ${s.isNsfw ? '<span class="nsfw-badge">🔞 18+</span>' : ''}
+          </div>
           <div class="source-sub">${typeBadges[s.type] || s.type}: <code>${escapeHtml(s.value)}</code></div>
         </div>
         <div class="source-controls">
@@ -2344,11 +2954,13 @@ function renderSearchResults(items) {
   listEl.innerHTML = items
     .map((item, idx) => {
       const fMeta = getFormatBadgeInfo(item);
+      const nsfwTag = item.isNsfw ? `<span class="nsfw-badge">🔞 18+</span>` : '';
       return `
       <div class="video-list-item">
         <div class="vli-header">
           <div class="vli-title">${escapeHtml(item.title)}</div>
           <div class="vli-badges">
+            ${nsfwTag}
             <span class="${fMeta.className}">${escapeHtml(fMeta.text)}</span>
             <span class="source-badge">${escapeHtml(item.sourceName)}</span>
           </div>
@@ -2371,10 +2983,36 @@ function renderSearchResults(items) {
 }
 
 async function renderVaultList() {
-  const items = await getAllVaultVideos();
+  const allItems = await getAllVaultVideos();
   const listEl = document.getElementById('vaultList');
   const badgeEl = document.getElementById('vaultBadge');
   const summaryEl = document.getElementById('vaultStorageSummary');
+  const hiddenNoticeEl = document.getElementById('vaultHiddenNotice');
+  const vaultFilterEl = document.getElementById('vaultFilterSelect');
+
+  const hiddenNsfwCount = !settings.allowNsfw
+    ? allItems.filter((item) => Boolean(item.isNsfw)).length
+    : 0;
+
+  if (hiddenNoticeEl) {
+    hiddenNoticeEl.classList.toggle('hidden', !(hiddenNsfwCount > 0 && !settings.allowNsfw));
+  }
+  if (vaultFilterEl) {
+    vaultFilterEl.classList.toggle('hidden', !settings.allowNsfw);
+  }
+
+  const items = allItems.filter((item) => {
+    if (!settings.allowNsfw) {
+      return !item.isNsfw;
+    }
+    if (settings.vaultFilter === 'nsfw') {
+      return Boolean(item.isNsfw);
+    }
+    if (settings.vaultFilter === 'sfw') {
+      return !item.isNsfw;
+    }
+    return true;
+  });
 
   if (badgeEl) {
     if (items.length > 0) {
@@ -2408,12 +3046,14 @@ async function renderVaultList() {
       const offlineBadgeHtml = isOfflineReady
         ? `<span class="offline-badge">✅ Offline ${sizeMb}</span>`
         : `<button class="btn-inline-convert" data-action="cache-vault-item" data-id="${escapeHtml(item.id)}">☁️ Cache Offline</button>`;
+      const nsfwBadgeHtml = item.isNsfw ? `<span class="nsfw-badge">🔞 18+</span>` : '';
 
       return `
       <div class="video-list-item">
         <div class="vli-header">
           <div class="vli-title">${escapeHtml(item.title)}</div>
           <div class="vli-badges">
+            ${nsfwBadgeHtml}
             ${offlineBadgeHtml}
             <span class="${fMeta.className}">${escapeHtml(fMeta.text)}</span>
             <span class="source-badge">${escapeHtml(item.sourceName || 'Saved')}</span>
@@ -2514,6 +3154,9 @@ function initBookmarkletAndUrlParams() {
 if (typeof document !== 'undefined') {
   document.addEventListener('DOMContentLoaded', async () => {
   loadState();
+  if (settings.allowNsfw) {
+    unlockAdultPresetSources();
+  }
   updateHeaderSummary();
   renderSourcesList();
   await renderVaultList();
@@ -2521,6 +3164,13 @@ if (typeof document !== 'undefined') {
 
   // Sync settings controls
   const nsfwToggle = document.getElementById('allowNsfwToggle');
+  const nsfwModeSelect = document.getElementById('nsfwModeSelect');
+  const autoMuteNsfwToggle = document.getElementById('autoMuteNsfwToggle');
+  const autoLockOnHideToggle = document.getElementById('autoLockOnHideToggle');
+  const discreetFilenamesToggle = document.getElementById('discreetFilenamesToggle');
+  const tubeDurationSelect = document.getElementById('tubeDurationSelect');
+  const tubeQualitySelect = document.getElementById('tubeQualitySelect');
+  const vaultFilterSelect = document.getElementById('vaultFilterSelect');
   const autoPlayToggle = document.getElementById('autoPlayToggle');
   const formatModeSelect = document.getElementById('formatModeSelect');
   const autoConvertToggle = document.getElementById('autoConvertToggle');
@@ -2529,6 +3179,12 @@ if (typeof document !== 'undefined') {
   const offlineVaultToggle = document.getElementById('offlineVaultToggle');
 
   if (nsfwToggle) nsfwToggle.checked = Boolean(settings.allowNsfw);
+  if (autoMuteNsfwToggle) autoMuteNsfwToggle.checked = settings.autoMuteNsfw !== false;
+  if (autoLockOnHideToggle) autoLockOnHideToggle.checked = settings.autoLockOnHide !== false;
+  if (discreetFilenamesToggle) discreetFilenamesToggle.checked = settings.discreetFilenames !== false;
+  if (tubeDurationSelect) tubeDurationSelect.value = settings.tubeDurationFilter || 'all';
+  if (tubeQualitySelect) tubeQualitySelect.value = settings.tubeQualityFilter || 'all';
+  if (vaultFilterSelect) vaultFilterSelect.value = settings.vaultFilter || 'all';
   syncAgeGateUI();
   if (autoPlayToggle) autoPlayToggle.checked = Boolean(settings.autoPlay);
   if (formatModeSelect) formatModeSelect.value = settings.formatMode || 'all';
@@ -2541,6 +3197,83 @@ if (typeof document !== 'undefined') {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
+
+  // Auto-Lock 18+ Mode when backgrounded / iPhone locked
+  document.addEventListener('visibilitychange', () => {
+    handleVisibilityAutoLock();
+  });
+  window.addEventListener?.('pagehide', () => {
+    if (settings.allowNsfw && settings.autoLockOnHide) {
+      setAdultContentEnabled(false);
+    }
+  });
+
+  // Panic / Boss Key Button & Header Triple-Tap Gesture
+  document.getElementById('panicSafeBtn')?.addEventListener('click', () => {
+    triggerPanicSafeMode();
+  });
+
+  let headerTapCount = 0;
+  let headerTapTimer = null;
+  document.getElementById('appHeader')?.addEventListener('click', (e) => {
+    if (e.target.closest('button')) return;
+    headerTapCount++;
+    clearTimeout(headerTapTimer);
+    if (headerTapCount >= 3) {
+      headerTapCount = 0;
+      triggerPanicSafeMode();
+    } else {
+      headerTapTimer = setTimeout(() => {
+        headerTapCount = 0;
+      }, 450);
+    }
+  });
+
+  // 1-Tap 18+ Category Chips & Feed Mode Pill on Player Tab
+  document.getElementById('nsfwQuickModeBtn')?.addEventListener('click', () => {
+    const nextMode = settings.nsfwMode === 'strict' ? 'mixed' : 'strict';
+    settings.nsfwMode = nextMode;
+    sourcePoolCache.clear();
+    saveSettings();
+    syncAgeGateUI();
+    showToast(
+      nextMode === 'strict'
+        ? '🔥 Switched to Strict 18+ Only Mode'
+        : '🔞 Switched to Mixed (SFW + 18+) Mode'
+    );
+  });
+
+  document.getElementById('nsfwQuickChipsBar')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('button[data-nsfw-query]');
+    if (!chip) return;
+    const q = chip.dataset.nsfwQuery;
+    if (!q) return;
+    const qInput = document.getElementById('quickSearchInput');
+    if (qInput) qInput.value = q;
+    pullRandomVideos(1, q);
+  });
+
+  // 1-Tap 18+ Search Category Chips on Search Web Tab
+  document.getElementById('searchNsfwChipsBar')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('button[data-search-chip]');
+    if (!chip) return;
+    const q = chip.dataset.searchChip;
+    const searchInput = document.getElementById('deepSearchInput');
+    if (searchInput && q) {
+      searchInput.value = q;
+      document.getElementById('deepSearchForm')?.requestSubmit?.();
+    }
+  });
+
+  tubeDurationSelect?.addEventListener('change', () => {
+    settings.tubeDurationFilter = tubeDurationSelect.value || 'all';
+    saveSettings();
+  });
+
+  tubeQualitySelect?.addEventListener('change', () => {
+    settings.tubeQualityFilter = tubeQualitySelect.value || 'all';
+    saveSettings();
+  });
 
   const mainVideoEl = document.getElementById('mainVideo');
 
@@ -2703,7 +3436,7 @@ if (typeof document !== 'undefined') {
     await saveAndCacheVideoToVault(current);
   });
 
-  // TAB 2: Multi-Engine Search Form (All 7 Open Networks)
+  // TAB 2: Multi-Engine Search Form (All Open Networks + RedGIFs HD + Tube Filters)
   document.getElementById('deepSearchForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const query = document.getElementById('deepSearchInput')?.value?.trim();
@@ -2717,6 +3450,7 @@ if (typeof document !== 'undefined') {
     const useFediverse = document.getElementById('engFediverse')?.checked;
     const useNasa = document.getElementById('engNasa')?.checked;
     const useTubeSites = document.getElementById('engTubeSites')?.checked;
+    const useRedgifs = document.getElementById('engRedgifs')?.checked;
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
@@ -2732,6 +3466,7 @@ if (typeof document !== 'undefined') {
     if (useFediverse) tasks.push(searchFediverseVideos(query));
     if (useNasa) tasks.push(searchNasaVideos(query, 6));
     if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
+    if (useRedgifs && settings.allowNsfw) tasks.push(searchRedgifsVideos(query, 6));
 
     const settled = await Promise.allSettled(tasks);
     const combined = [];
@@ -2741,7 +3476,7 @@ if (typeof document !== 'undefined') {
       }
     }
 
-    renderSearchResults(combined);
+    renderSearchResults(filterAndSortTubeResults(combined));
   });
 
   // TAB 2: Multi-Format Webpage Video Scanner Form
@@ -2816,6 +3551,7 @@ if (typeof document !== 'undefined') {
     const type = selectedRadio ? selectedRadio.value : 'keyword';
     const rawVal = document.getElementById('newSourceInput')?.value?.trim();
     const rawLabel = document.getElementById('newSourceLabel')?.value?.trim();
+    const markNsfw = Boolean(document.getElementById('newSourceNsfwCheck')?.checked);
 
     if (!rawVal) return;
 
@@ -2833,13 +3569,20 @@ if (typeof document !== 'undefined') {
       value: cleanVal,
       label: rawLabel || defaultLabel,
       enabled: true,
-      builtIn: false
+      builtIn: false,
+      isNsfw: markNsfw
     });
 
     saveSources();
     renderSourcesList();
     e.target.reset();
     showToast('Added source to your list!');
+  });
+
+  document.getElementById('loadAdultPresetsBtn')?.addEventListener('click', () => {
+    const added = unlockAdultPresetSources();
+    renderSourcesList();
+    showToast(added > 0 ? `Unlocked ${added} built-in 18+ sources!` : '18+ Source Pack already in your list');
   });
 
   // TAB 3: Toggle / Delete Source
@@ -2927,6 +3670,72 @@ if (typeof document !== 'undefined') {
     );
   });
 
+  nsfwModeSelect?.addEventListener('change', () => {
+    const val = nsfwModeSelect.value;
+    if (val === 'safe') {
+      setAdultContentEnabled(false);
+    } else {
+      settings.nsfwMode = val;
+      if (settings.allowNsfw) {
+        setAdultContentEnabled(true, val);
+      } else {
+        openAgeGateModal();
+      }
+    }
+  });
+
+  autoMuteNsfwToggle?.addEventListener('change', () => {
+    settings.autoMuteNsfw = autoMuteNsfwToggle.checked;
+    saveSettings();
+    showToast(settings.autoMuteNsfw ? 'Auto-mute enabled for 18+ videos' : 'Auto-mute disabled');
+  });
+
+  autoLockOnHideToggle?.addEventListener('change', () => {
+    settings.autoLockOnHide = autoLockOnHideToggle.checked;
+    saveSettings();
+    showToast(settings.autoLockOnHide ? 'Auto-lock when backgrounded enabled' : 'Auto-lock disabled');
+  });
+
+  discreetFilenamesToggle?.addEventListener('change', () => {
+    settings.discreetFilenames = discreetFilenamesToggle.checked;
+    saveSettings();
+    showToast(
+      settings.discreetFilenames
+        ? 'Discreet filenames enabled for 18+ saves'
+        : 'Using original titles when saving'
+    );
+  });
+
+  // 4-Digit PIN & FaceID Lock Settings
+  document.getElementById('saveNsfwPinBtn')?.addEventListener('click', () => {
+    const pinInput = document.getElementById('nsfwPinInput');
+    const ok = setNsfwPin(pinInput?.value);
+    if (ok) {
+      if (pinInput) pinInput.value = '';
+      showToast('🔒 Saved 4-digit PIN lock for 18+ mode & Vault!');
+    } else {
+      showToast('Please enter a 4-digit numeric PIN (e.g. 1234)');
+    }
+  });
+
+  document.getElementById('clearNsfwPinBtn')?.addEventListener('click', () => {
+    clearNsfwPin();
+    const pinInput = document.getElementById('nsfwPinInput');
+    if (pinInput) pinInput.value = '';
+    showToast('🔓 Cleared PIN & FaceID lock');
+  });
+
+  document.getElementById('setupBiometricBtn')?.addEventListener('click', async () => {
+    try {
+      const ok = await registerNsfwBiometric();
+      if (ok) {
+        showToast('🔒 iPhone FaceID / TouchID lock enabled!');
+      }
+    } catch {
+      showToast('FaceID / TouchID setup unavailable or cancelled.');
+    }
+  });
+
   // 18+ Age Verification Toggle Button (Top Header) & Settings Switch
   document.getElementById('ageGateToggleBtn')?.addEventListener('click', () => {
     if (settings.allowNsfw) {
@@ -2946,8 +3755,31 @@ if (typeof document !== 'undefined') {
   });
 
   document.getElementById('confirmAgeGateBtn')?.addEventListener('click', () => {
-    setAdultContentEnabled(true);
+    if (settings.nsfwPin) {
+      const enteredPin = document.getElementById('ageGatePinInput')?.value;
+      if (!verifyNsfwPin(enteredPin)) {
+        document.getElementById('ageGatePinError')?.classList.remove('hidden');
+        return;
+      }
+    }
+    const chosenMode = document.getElementById('ageGateModeSelect')?.value || settings.nsfwMode || 'strict';
+    setAdultContentEnabled(true, chosenMode);
     closeAgeGateModal();
+  });
+
+  document.getElementById('ageGateBiometricBtn')?.addEventListener('click', async () => {
+    try {
+      const verified = await authenticateNsfwBiometric();
+      if (verified) {
+        const chosenMode = document.getElementById('ageGateModeSelect')?.value || settings.nsfwMode || 'strict';
+        setAdultContentEnabled(true, chosenMode);
+        closeAgeGateModal();
+      } else {
+        showToast('FaceID / TouchID verification failed.');
+      }
+    } catch {
+      showToast('FaceID / TouchID verification cancelled.');
+    }
   });
 
   document.getElementById('cancelAgeGateBtn')?.addEventListener('click', () => {
@@ -2968,6 +3800,15 @@ if (typeof document !== 'undefined') {
     sources = structuredClone(DEFAULT_SOURCES);
     settings = {
       allowNsfw: false,
+      nsfwMode: 'mixed',
+      autoMuteNsfw: true,
+      autoLockOnHide: true,
+      discreetFilenames: true,
+      nsfwPin: '',
+      nsfwBiometricId: '',
+      tubeDurationFilter: 'all',
+      tubeQualityFilter: 'all',
+      vaultFilter: 'all',
       autoPlay: true,
       formatMode: 'all',
       autoConvert: true,
@@ -2993,7 +3834,17 @@ if (typeof document !== 'undefined') {
     showToast('Reset to default sources & settings');
   });
 
-  // TAB 4: Vault Actions (Play Offline, Export, Cache Offline on demand, Delete)
+  // TAB 4: Vault Filter, Unlock & Actions
+  vaultFilterSelect?.addEventListener('change', async () => {
+    settings.vaultFilter = vaultFilterSelect.value || 'all';
+    saveSettings();
+    await renderVaultList();
+  });
+
+  document.getElementById('unlockVaultBtn')?.addEventListener('click', () => {
+    openAgeGateModal();
+  });
+
   document.getElementById('vaultList')?.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
@@ -3047,6 +3898,7 @@ if (typeof module !== 'undefined' && module.exports) {
     ALL_VIDEO_EXTENSIONS,
     VIDEO_EXT_REGEX_PATTERN,
     DEFAULT_SOURCES,
+    ADULT_PRESET_SOURCES,
     FALLBACK_VIDEOS,
     settings,
     detectVideoFormat,
@@ -3056,6 +3908,10 @@ if (typeof module !== 'undefined' && module.exports) {
     getEffectivePlaybackUrl,
     needsMp4Conversion,
     encodeArchiveFilePath,
+    extractRedgifsId,
+    resolveRedgifsUrlToMp4,
+    searchRedgifsVideos,
+    filterAndSortTubeResults,
     extractRedditVideosFromListing,
     extractVideoUrlsFromHtml,
     searchFreeTubeSites,
@@ -3076,12 +3932,23 @@ if (typeof module !== 'undefined' && module.exports) {
     getAllVaultVideos,
     deleteVaultVideoDB,
     clearVaultDB,
+    buildExportFilename,
     downloadVideoToIphone,
     loadState,
     saveSources,
     saveSettings,
     initBookmarkletAndUrlParams,
     updateHeaderSummary,
+    unlockAdultPresetSources,
+    getEffectiveActiveSources,
+    setNsfwPin,
+    clearNsfwPin,
+    verifyNsfwPin,
+    registerNsfwBiometric,
+    authenticateNsfwBiometric,
+    scrubNsfwFromActiveSession,
+    triggerPanicSafeMode,
+    handleVisibilityAutoLock,
     syncAgeGateUI,
     openAgeGateModal,
     closeAgeGateModal,

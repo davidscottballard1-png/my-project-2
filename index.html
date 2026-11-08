@@ -22,7 +22,7 @@
 <body>
   <div class="app-container">
     <!-- Top Header -->
-    <header class="app-header">
+    <header class="app-header" id="appHeader" title="Triple-tap header anytime for instant Panic Safe Mode">
       <div class="brand">
         <img src="./icon.svg" alt="ReelVault" class="brand-icon" />
         <div>
@@ -31,6 +31,15 @@
         </div>
       </div>
       <div class="header-actions">
+        <button
+          id="panicSafeBtn"
+          type="button"
+          class="panic-safe-btn hidden"
+          title="Instant Safe Mode (Boss Key)"
+          aria-label="Instant Safe Mode"
+        >
+          🛡️ Safe
+        </button>
         <button
           id="ageGateToggleBtn"
           type="button"
@@ -60,6 +69,20 @@
           />
           <button type="submit" class="btn-primary btn-compact">Pull</button>
         </form>
+
+        <!-- 1-Tap 18+ Category & Feed Mode Bar (Auto-unhides when 18+ is On) -->
+        <div id="nsfwQuickChipsBar" class="nsfw-chips-bar hidden" aria-label="18+ Quick Categories">
+          <button type="button" id="nsfwQuickModeBtn" class="nsfw-mode-pill" title="Switch between Mixed and Strict 18+ Only">
+            🔥 Strict 18+
+          </button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="redgifs">🎬 RedGIFs HD</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="trending nsfw">🔥 Trending 18+</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="amateur hd">📹 Amateur HD</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="romantic sensual">💋 Romantic</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="solo tease">🍑 Solo</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="vintage erotica">🎞️ Vintage 18+</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="short loop">⚡ Short Clips</button>
+        </div>
 
         <!-- Video Player Card -->
         <div class="video-card" id="videoCard">
@@ -192,6 +215,15 @@
               placeholder="Enter keyword or topic (e.g. ocean, retro, funny, cars)..."
               required
             />
+            <!-- 1-Tap 18+ Search Category Chips (Auto-unhides when 18+ is On) -->
+            <div id="searchNsfwChipsBar" class="nsfw-chips-bar hidden" aria-label="18+ Search Categories">
+              <button type="button" class="nsfw-chip" data-search-chip="redgifs hd">🎬 RedGIFs HD</button>
+              <button type="button" class="nsfw-chip" data-search-chip="trending 18+">🔥 Trending 18+</button>
+              <button type="button" class="nsfw-chip" data-search-chip="amateur">📹 Amateur</button>
+              <button type="button" class="nsfw-chip" data-search-chip="romantic">💋 Romantic</button>
+              <button type="button" class="nsfw-chip" data-search-chip="cosplay">✨ Cosplay</button>
+              <button type="button" class="nsfw-chip" data-search-chip="vintage erotica">🎞️ Vintage 18+</button>
+            </div>
             <div class="engine-checks">
               <label class="chip-check">
                 <input type="checkbox" id="engArchive" checked />
@@ -225,6 +257,22 @@
                 <input type="checkbox" id="engTubeSites" checked />
                 <span>Free Tube Sites</span>
               </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engRedgifs" checked />
+                <span>RedGIFs HD</span>
+              </label>
+            </div>
+            <div class="search-filters-row">
+              <select id="tubeDurationSelect" class="setting-select" aria-label="Video Duration Filter">
+                <option value="all">⏱ Any Duration</option>
+                <option value="short">⚡ Short Clips (&lt; 2 min)</option>
+                <option value="medium">🎬 Medium (2–10 min)</option>
+                <option value="long">📺 Full Length (5+ min)</option>
+              </select>
+              <select id="tubeQualitySelect" class="setting-select" aria-label="Video Quality Filter">
+                <option value="all">✨ All Qualities</option>
+                <option value="hd">💎 HD Only (720p/1080p)</option>
+              </select>
             </div>
             <button type="submit" class="btn-accent">🔍 Search &amp; Pull Videos</button>
           </form>
@@ -233,7 +281,7 @@
         <div class="card-section">
           <h2>🔗 Multi-Format Webpage Video Scanner</h2>
           <p class="section-desc">
-            Paste any webpage or direct video link. ReelVault scans for all video extensions (<code>.mp4</code>, <code>.mov</code>, <code>.m4v</code>, <code>.webm</code>, <code>.ogv</code>, <code>.mkv</code>, <code>.avi</code>, <code>.mpeg</code>, <code>.3gp</code>, <code>.flv</code>, <code>.wmv</code>, <code>.ts</code>, <code>.m3u8</code>, <code>.gifv</code>) and auto-converts non-native formats for iPhone.
+            Paste any webpage, RedGIFs watch link, or direct video URL. ReelVault scans for all video extensions (<code>.mp4</code>, <code>.mov</code>, <code>.m4v</code>, <code>.webm</code>, <code>.ogv</code>, <code>.mkv</code>, <code>.avi</code>, <code>.mpeg</code>, <code>.3gp</code>, <code>.flv</code>, <code>.wmv</code>, <code>.ts</code>, <code>.m3u8</code>, <code>.gifv</code>) and auto-converts non-native formats for iPhone.
           </p>
           <form id="urlScanForm" class="stack-form">
             <input
@@ -312,6 +360,10 @@
               id="newSourceLabel"
               placeholder="Optional display name (leave blank for auto)"
             />
+            <label class="chip-check nsfw-source-check">
+              <input type="checkbox" id="newSourceNsfwCheck" />
+              <span>🔞 Mark as 18+ Adult Source (auto-hides in Safe Mode)</span>
+            </label>
             <button type="submit" class="btn-accent">+ Add to My Sources</button>
           </form>
         </div>
@@ -320,12 +372,13 @@
           <div class="section-header-row">
             <h2>🎛 Active Sources</h2>
             <div class="mini-actions">
+              <button id="loadAdultPresetsBtn" type="button" class="btn-text hidden">🔞 +18+ Pack</button>
               <button id="enableAllSourcesBtn" class="btn-text">All On</button>
               <button id="disableAllSourcesBtn" class="btn-text">All Off</button>
             </div>
           </div>
           <p class="section-desc">
-            Toggle which sources <strong>Shuffle Random</strong> pulls from.
+            Toggle which sources <strong>Shuffle Random</strong> pulls from. 18+ sources automatically unlock when <strong>🔞 18+ On</strong> is active and hide in Safe Mode.
           </p>
           <div id="sourcesList" class="sources-list"></div>
         </div>
@@ -395,6 +448,73 @@
           </div>
           <div class="setting-row">
             <div>
+              <strong>18+ Feed &amp; Shuffle Mode</strong>
+              <p class="setting-sub">Choose between Safe Mode (Off), Mixed (SFW + 18+), or Strict 18+ Only (pulls exclusively from 18+ sources &amp; adult feeds).</p>
+            </div>
+            <select id="nsfwModeSelect" class="setting-select" aria-label="18+ Feed Mode">
+              <option value="safe">🔒 Safe (18+ Off)</option>
+              <option value="mixed">🔞 Mixed (SFW + 18+)</option>
+              <option value="strict">🔥 Strict 18+ Only</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Auto-Mute Audio in 18+ Mode</strong>
+              <p class="setting-sub">Automatically start 18+ videos muted on iPhone so audio never plays unexpectedly until you tap unmute.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autoMuteNsfwToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Auto-Lock 18+ When Backgrounded</strong>
+              <p class="setting-sub">Automatically flip <strong>🔞 18+ Off</strong> and pause playback whenever you swipe home, lock your iPhone, or switch Safari tabs.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autoLockOnHideToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Discreet Filenames on Save</strong>
+              <p class="setting-sub">Use a neutral filename (e.g., <code>reelvault-clip-1042.mp4</code>) when exporting 18+ videos to iPhone Photos or Files.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="discreetFilenamesToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row pin-lock-row">
+            <div>
+              <strong>🔐 4-Digit PIN &amp; FaceID Lock (18+ Vault &amp; Toggle)</strong>
+              <p class="setting-sub">Require a 4-digit PIN or iOS FaceID/TouchID before turning <strong>🔞 18+ On</strong> or viewing your hidden 18+ Vault.</p>
+              <span id="nsfwLockStatusBadge" class="badge-subtle">🔓 No PIN or FaceID lock set</span>
+            </div>
+            <div class="pin-controls">
+              <input
+                type="password"
+                id="nsfwPinInput"
+                inputmode="numeric"
+                pattern="[0-9]*"
+                maxlength="4"
+                placeholder="4-digit PIN"
+                class="pin-input"
+                aria-label="Set 4-Digit 18+ PIN"
+              />
+              <div class="pin-btn-group">
+                <button type="button" id="saveNsfwPinBtn" class="btn-secondary btn-mini">Save PIN</button>
+                <button type="button" id="clearNsfwPinBtn" class="btn-text-danger">Clear</button>
+              </div>
+              <button type="button" id="setupBiometricBtn" class="btn-outline-full btn-biometric">
+                🔓 Enable iPhone FaceID / TouchID
+              </button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div>
               <strong>Auto-Play Pulled Videos</strong>
               <p class="setting-sub">Automatically start playback when a new video is pulled.</p>
             </div>
@@ -419,11 +539,22 @@
               <h2>📥 Saved Offline Vault</h2>
               <span id="vaultStorageSummary" class="badge-subtle">0 videos saved</span>
             </div>
-            <button id="clearVaultBtn" class="btn-text-danger">Clear All</button>
+            <div class="mini-actions">
+              <select id="vaultFilterSelect" class="setting-select hidden" aria-label="Vault Filter">
+                <option value="all">All Vault Videos</option>
+                <option value="nsfw">🔞 18+ Vault Only</option>
+                <option value="sfw">Safe Only</option>
+              </select>
+              <button id="clearVaultBtn" class="btn-text-danger">Clear All</button>
+            </div>
           </div>
           <p class="section-desc">
-            Videos saved inside your iPhone's local <code>IndexedDB</code> storage with full offline video caching for Airplane-Mode replay or instant export to Photos/Files.
+            Videos saved inside your iPhone's local <code>IndexedDB</code> storage with full offline video caching for Airplane-Mode replay or instant export to Photos/Files. 18+ videos are automatically hidden when <strong>🔞 18+ Off</strong> is active.
           </p>
+          <div id="vaultHiddenNotice" class="install-tip age-gate-note hidden">
+            🔒 <strong>Hidden 18+ Vault Locked:</strong> You have private 18+ videos hidden in your Vault.
+            <button type="button" id="unlockVaultBtn" class="btn-text">Unlock 18+ Vault ↗</button>
+          </div>
           <div id="vaultList" class="video-grid-list">
             <p class="muted-center">No videos saved in your Vault yet.</p>
           </div>
@@ -455,7 +586,7 @@
   <!-- Toast Notification -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
-  <!-- 18+ Age Verification Modal -->
+  <!-- 18+ Age Verification & PIN/FaceID Modal -->
   <div id="ageGateModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="ageGateModalTitle">
     <div class="modal-sheet age-gate-sheet">
       <div class="modal-header">
@@ -463,10 +594,34 @@
         <button id="closeAgeGateModalBtn" type="button" class="icon-btn" aria-label="Close">✕</button>
       </div>
       <p class="age-gate-text">
-        Are you <strong>18 years of age or older</strong>, and do you want to enable 18+ adult video content in your searches, random video pulls, and custom sources?
+        Are you <strong>18 years of age or older</strong>, and do you want to enable 18+ adult video content in your searches, random video pulls, and hidden Vault?
       </p>
+      <div class="setting-row modal-mode-row">
+        <strong>18+ Feed Mode:</strong>
+        <select id="ageGateModeSelect" class="setting-select" aria-label="18+ Feed Mode in Modal">
+          <option value="strict">🔥 Strict 18+ Only (Adult Feeds Only)</option>
+          <option value="mixed">🔞 Mixed (SFW + 18+)</option>
+        </select>
+      </div>
+      <div id="ageGatePinSection" class="age-gate-pin-box hidden">
+        <label for="ageGatePinInput"><strong>🔒 Enter 4-Digit 18+ PIN to Unlock:</strong></label>
+        <input
+          type="password"
+          id="ageGatePinInput"
+          inputmode="numeric"
+          pattern="[0-9]*"
+          maxlength="4"
+          placeholder="••••"
+          class="pin-input modal-pin-input"
+          autocomplete="off"
+        />
+        <p id="ageGatePinError" class="pin-error hidden">Incorrect 4-digit PIN. Please try again.</p>
+        <button id="ageGateBiometricBtn" type="button" class="btn-outline-full hidden">
+          🔓 Unlock with FaceID / TouchID
+        </button>
+      </div>
       <div class="install-tip age-gate-note">
-        🔒 Your choice is saved privately on your iPhone. You can turn 18+ content off anytime with 1 tap using the <strong>🔞 18+</strong> toggle button in the top bar.
+        🔒 Your choice is saved privately on your iPhone. Tap <strong>🛡️ Safe</strong> or triple-tap the top bar anytime for instant Safe Mode.
       </div>
       <div class="age-gate-actions">
         <button id="confirmAgeGateBtn" type="button" class="btn-age-confirm">

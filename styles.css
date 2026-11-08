@@ -1068,3 +1068,137 @@ input:checked + .slider:before {
   font-size: 0.95rem;
   box-shadow: 0 4px 16px rgba(236, 72, 153, 0.35);
 }
+
+/* Panic Safe Mode Button */
+.panic-safe-btn {
+  background: rgba(16, 185, 129, 0.2);
+  border: 1px solid rgba(16, 185, 129, 0.5);
+  color: #6ee7b7;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 10px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* 18+ Quick Category Chips & Mode Pill */
+.nsfw-chips-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 2px 1px 4px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.nsfw-chips-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.nsfw-mode-pill {
+  background: linear-gradient(135deg, rgba(236, 72, 153, 0.3), rgba(239, 68, 68, 0.3));
+  border: 1px solid rgba(236, 72, 153, 0.65);
+  color: #fbcfe8;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.nsfw-chip {
+  background: rgba(236, 72, 153, 0.14);
+  border: 1px solid rgba(236, 72, 153, 0.35);
+  color: #f9a8d4;
+  padding: 5px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.nsfw-badge {
+  background: rgba(236, 72, 153, 0.22);
+  color: #f9a8d4;
+  border: 1px solid rgba(236, 72, 153, 0.45);
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.search-filters-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.search-filters-row .setting-select {
+  max-width: 100%;
+  width: 100%;
+}
+
+.nsfw-source-check {
+  width: fit-content;
+}
+
+.pin-lock-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.pin-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pin-input {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-main);
+  padding: 9px 12px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  letter-spacing: 0.2em;
+  text-align: center;
+  width: 100%;
+  outline: none;
+}
+
+.pin-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.age-gate-pin-box {
+  background: var(--bg-elevated);
+  border: 1px solid rgba(236, 72, 153, 0.4);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pin-error {
+  color: #fca5a5;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.modal-mode-row {
+  border-bottom: none;
+  padding: 2px 0;
+}
