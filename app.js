@@ -152,10 +152,11 @@ let prebufferVideoEl = null;
 // ==========================================
 
 function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
+  const fallback = (fallbackExt && VIDEO_FORMAT_CATALOG[fallbackExt.toLowerCase()]) || VIDEO_FORMAT_CATALOG.mp4;
   if (!urlOrName || typeof urlOrName !== 'string') {
-    return VIDEO_FORMAT_CATALOG[fallbackExt] || VIDEO_FORMAT_CATALOG.mp4;
+    return fallback;
   }
-  const clean = urlOrName.split('?')[0].split('#')[0].toLowerCase();
+  const clean = urlOrName.trim().split('?')[0].split('#')[0].toLowerCase();
   const match = clean.match(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'));
   if (match && match[1]) {
     const ext = match[1].toLowerCase();
@@ -163,7 +164,7 @@ function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
       return VIDEO_FORMAT_CATALOG[ext];
     }
   }
-  return VIDEO_FORMAT_CATALOG[fallbackExt] || VIDEO_FORMAT_CATALOG.mp4;
+  return fallback;
 }
 
 function isFormatAllowedBySettings(ext) {
@@ -187,7 +188,7 @@ function normalizeAndAutoRewriteVideoUrl(rawUrl) {
 
   // Auto-convert .gifv (Imgur / web GIF-video wrappers) directly into .mp4
   if (fmtInfo.ext === 'gifv') {
-    const mp4Url = cleaned.replace(/\.gifv(\?.*)?$/i, '.mp4$1');
+    const mp4Url = cleaned.replace(/\.gifv([?#].*)?$/i, '.mp4$1');
     return {
       videoUrl: mp4Url,
       originalUrl: cleaned,
@@ -2099,7 +2100,8 @@ function initBookmarkletAndUrlParams() {
 // INITIALIZATION & EVENT LISTENERS
 // ==========================================
 
-document.addEventListener('DOMContentLoaded', async () => {
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', async () => {
   loadState();
   updateHeaderSummary();
   renderSourcesList();
@@ -2595,3 +2597,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     installModal?.classList.add('hidden');
   });
 });
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    STORAGE_KEYS,
+    VIDEO_FORMAT_CATALOG,
+    ALL_VIDEO_EXTENSIONS,
+    DEFAULT_SOURCES,
+    FALLBACK_VIDEOS,
+    detectVideoFormat,
+    isFormatAllowedBySettings,
+    normalizeAndAutoRewriteVideoUrl,
+    getFormatBadgeInfo
+  };
+}
