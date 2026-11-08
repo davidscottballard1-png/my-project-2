@@ -1931,6 +1931,41 @@ input:checked + .slider:before {
 }
 
 /* ============================================================================
+   RESPONSIVE BREAKPOINT 3B: iPAD PRO 11" & 12.9"/13" (min-width: 1024px)
+   Expands theater stage ratio and scales grids to 3–4 columns across the canvas
+   ============================================================================ */
+@media (min-width: 1024px) and (min-height: 581px) {
+  .app-header {
+    padding: calc(var(--safe-top) + 16px) calc(var(--safe-right) + 36px) 16px calc(var(--safe-left) + 36px);
+  }
+
+  .app-main {
+    padding: 24px calc(var(--safe-right) + 36px) 28px calc(var(--safe-left) + 36px);
+  }
+
+  .video-card {
+    grid-template-columns: minmax(0, 1.9fr) minmax(380px, 460px);
+    gap: 24px;
+    padding: 22px;
+  }
+
+  .video-stage {
+    min-height: 480px;
+  }
+
+  .video-grid-list {
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+  }
+
+  .sources-list,
+  .directory-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+}
+
+/* ============================================================================
    RESPONSIVE BREAKPOINT 4: PHONE LANDSCAPE
    Placed after tablet rules so wide-but-short phone viewports (e.g. 844x390)
    always get the compact side-by-side landscape deck with zero overflow.
