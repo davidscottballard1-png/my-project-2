@@ -453,7 +453,16 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       assert.ok(css.includes('env(safe-area-inset-right'), 'styles.css should respect horizontal safe-area-inset-right in landscape');
       assert.ok(css.includes('@media (orientation: landscape)'), 'styles.css should include phone landscape responsive breakpoint');
       assert.ok(css.includes('@media (min-width: 768px)'), 'styles.css should include iPad/tablet responsive breakpoint');
+      assert.ok(
+        css.includes('.brand > div {\n  flex: 1 1 0%;\n  min-width: 0;\n  overflow: hidden;\n}'),
+        '.brand > div must have min-width: 0 and overflow: hidden so #activeSourceSummary never overlaps #panicSafeBtn'
+      );
+      assert.ok(
+        css.includes('.setting-row > div:first-child {\n  flex: 1 1 0%;\n  min-width: 0;\n}'),
+        '.setting-row > div:first-child must have min-width: 0 so setting descriptions never overlap selects/switches'
+      );
     });
   });
 });
+
 

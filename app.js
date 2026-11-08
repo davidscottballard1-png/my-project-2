@@ -4042,7 +4042,10 @@ if (typeof document !== 'undefined') {
 
   // Register Service Worker for PWA
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker
+      .register('./sw.js', { updateViaCache: 'none' })
+      .then((reg) => reg?.update?.())
+      .catch(() => {});
   }
 
   // Save & resume playback position when backgrounded or returning to the app
