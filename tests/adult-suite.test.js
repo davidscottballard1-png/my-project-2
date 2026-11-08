@@ -3,6 +3,7 @@ const assert = require('node:assert');
 const {
   DEFAULT_SOURCES,
   ADULT_PRESET_SOURCES,
+  ADULT_DIRECTORY_CATALOG,
   FALLBACK_VIDEOS,
   settings,
   extractRedgifsId,
@@ -26,6 +27,18 @@ const {
   renderSourcesList,
   renderVaultList,
   saveVideoToVaultDB,
+  toggleVaultFavorite,
+  toggleCurrentVideoFavorite,
+  shuffleVaultToPlayer,
+  extractSmartVideoTags,
+  buildMoreLikeThisQuery,
+  skipVideoTime,
+  setPlaybackSpeed,
+  findDirectoryEntry,
+  toggleDirectorySource,
+  enableAllDirectorySources,
+  toggleAdultDirectory,
+  renderAdultDirectory,
   clearVaultDB,
   updatePlayerUI,
   getAppState,
@@ -91,6 +104,9 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       'vaultFilterSelect', 'nsfwModeSelect', 'nsfwQuickModeBtn', 'nsfwLockStatusBadge',
       'sourcesList', 'searchResultsList', 'searchResultsCount', 'activeSourceSummary',
       'mainVideo', 'videoTitle', 'videoSourceBadge', 'videoFormatBadge', 'convertNowBtn',
+      'moreLikeThisBtn', 'favoriteCurrentBtn', 'videoTagsBar', 'skipBack10Btn', 'skipFwd15Btn',
+      'skipFwd30Btn', 'playbackSpeedSelect', 'adultDirectorySection', 'adultDirectoryBody',
+      'adultDirectoryList', 'toggleAdultDirectoryBtn',
       'queueCounter', 'videoOriginalLink', 'prevVideoBtn', 'saveToPhoneBtn', 'saveToVaultBtn',
       'playerEmpty', 'playerLoading', 'playerLoadingText', 'reelsHudOverlay', 'reelsHudBadge',
       'reelsHudTitle', 'videoStage', 'prebufferBadge', 'vaultList', 'vaultBadge',
@@ -521,6 +537,208 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(state.videoQueue[0].id, FALLBACK_VIDEOS[0].id);
       assert.strictEqual(elements.get('mainVideo').muted, true);
       assert.ok(elements.get('toast').textContent.includes('Safe Mode Active'));
+    });
+  });
+
+  describe('5. Expandable 18+ Subreddit & Niche Directory', () => {
+    it('should expand/collapse the directory and toggle individual or all 18+ directory sources', () => {
+      const { elements } = setupTestEnv();
+      settings.allowNsfw = true;
+      setAppState({ sources: structuredClone(DEFAULT_SOURCES), isAdultDirectoryExpanded: false });
+
+      assert.ok(ADULT_DIRECTORY_CATALOG.length >= 3);
+      const entry = findDirectoryEntry('dir-sub-realgirls');
+      assert.ok(entry);
+      assert.strictEqual(entry.value, 'RealGirls');
+
+      // Expand directory
+      const expanded = toggleAdultDirectory(true);
+      assert.strictEqual(expanded, true);
+      assert.strictEqual(elements.get('adultDirectoryBody').classList.contains('hidden'), false);
+      assert.ok(elements.get('adultDirectoryList').innerHTML.includes('r/RealGirls'));
+
+      // 1-tap toggle adds and enables the source
+      const addedSrc = toggleDirectorySource('dir-sub-realgirls');
+      assert.ok(addedSrc);
+      assert.strictEqual(addedSrc.enabled, true);
+      assert.strictEqual(addedSrc.isNsfw, true);
+
+      // Tapping again disables it
+      const toggledOff = toggleDirectorySource('dir-sub-realgirls');
+      assert.strictEqual(toggledOff.enabled, false);
+
+      // Enable all directory sources at once
+      const enabledCount = enableAllDirectorySources();
+      assert.ok(enabledCount > 0);
+      renderAdultDirectory();
+      assert.ok(elements.get('adultDirectoryList').innerHTML.includes('✓ Active'));
+    });
+  });
+
+  describe('6. Smarter 18+ Discovery & Vault Playback (Interactive Tags, More Like This, Vault Favorites & Shuffle)', () => {
+    it('should extract smart interactive video tags and build "More Like This" queries', () => {
+      const { elements } = setupTestEnv();
+      settings.prebuffer = false;
+      settings.allowNsfw = true;
+
+      const sampleItem = {
+        id: 'rg-smart-1',
+        title: 'RedGIFs HD — amateur, romantic, sensual, couple',
+        videoUrl: 'https://thumbs4.redgifs.com/Smart1.mp4',
+        format: 'mp4',
+        tags: ['amateur', 'romantic', 'sensual'],
+        sourceName: 'RedGIFs (amateur)',
+        isNsfw: true
+      };
+
+      const tags = extractSmartVideoTags(sampleItem, 5);
+      assert.ok(tags.includes('amateur'));
+      assert.ok(tags.includes('romantic'));
+      assert.strictEqual(buildMoreLikeThisQuery(sampleItem), 'amateur romantic');
+
+      setAppState({ videoQueue: [sampleItem], currentIndex: 0 });
+      updatePlayerUI();
+
+      assert.strictEqual(elements.get('videoTagsBar').classList.contains('hidden'), false);
+      assert.ok(elements.get('videoTagsBar').innerHTML.includes('data-tag="amateur"'));
+      assert.strictEqual(elements.get('moreLikeThisBtn').disabled, false);
+      assert.strictEqual(elements.get('favoriteCurrentBtn').disabled, false);
+    });
+
+    it('should toggle Vault favorites (❤️) and shuffle 18+ Vault videos directly into the Player or Reels mode', async () => {
+      const { elements } = setupTestEnv();
+      settings.prebuffer = false;
+      settings.allowNsfw = true;
+
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        clear: () => {
+          records.clear();
+          const req = { onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      await saveVideoToVaultDB({
+        id: 'v-fav-1',
+        title: 'Favorite 18+ Clip',
+        videoUrl: 'https://ex.com/fav1.mp4',
+        isNsfw: true,
+        isFavorite: false,
+        savedAt: 100
+      });
+      await saveVideoToVaultDB({
+        id: 'v-other-2',
+        title: 'Second 18+ Clip',
+        videoUrl: 'https://ex.com/other2.mp4',
+        isNsfw: true,
+        isFavorite: false,
+        savedAt: 200
+      });
+
+      // Toggle favorite on v-fav-1
+      const updated = await toggleVaultFavorite('v-fav-1');
+      assert.strictEqual(updated.isFavorite, true);
+
+      // Filter Vault by Favorites Only
+      settings.vaultFilter = 'favorites';
+      await renderVaultList();
+      assert.strictEqual(elements.get('vaultBadge').textContent, '1');
+      assert.ok(elements.get('vaultList').innerHTML.includes('Favorite 18+ Clip'));
+      assert.ok(!elements.get('vaultList').innerHTML.includes('Second 18+ Clip'));
+
+      // Shuffle Favorites into Fullscreen Reels Mode
+      const shuffled = await shuffleVaultToPlayer({ favoritesOnly: true, startReels: true });
+      assert.strictEqual(shuffled.length, 1);
+      assert.strictEqual(shuffled[0].id, 'v-fav-1');
+      assert.strictEqual(getAppState().isReelsFullscreen, true);
+
+      // Toggle favorite on current player video
+      const nowFav = await toggleCurrentVideoFavorite();
+      assert.strictEqual(nowFav, false);
+
+      await clearVaultDB();
+    });
+  });
+
+  describe('7. Quick Skip (-10s / +15s / +30s) & Playback Speed Control (0.5x – 2x)', () => {
+    it('should skip forward (+15s / +30s) and backward (-10s) with duration clamping and save playback state', () => {
+      const { elements } = setupTestEnv();
+      settings.prebuffer = false;
+      settings.resumePlayback = true;
+
+      const clip = {
+        id: 'skip-clip-1',
+        title: 'Full Length Tube Clip',
+        videoUrl: 'https://ex.com/long.mp4',
+        format: 'mp4',
+        isNsfw: true
+      };
+      setAppState({ videoQueue: [clip], currentIndex: 0 });
+      updatePlayerUI();
+
+      const mainVideo = elements.get('mainVideo');
+      mainVideo.duration = 100;
+      mainVideo.currentTime = 20;
+
+      // Skip +15s -> 35s
+      assert.strictEqual(skipVideoTime(15), 35);
+      assert.strictEqual(mainVideo.currentTime, 35);
+      assert.strictEqual(getSavedPlaybackTime(clip), 35);
+
+      // Skip +30s -> 65s
+      assert.strictEqual(skipVideoTime(30), 65);
+      assert.strictEqual(mainVideo.currentTime, 65);
+
+      // Skip -10s -> 55s
+      assert.strictEqual(skipVideoTime(-10), 55);
+      assert.strictEqual(mainVideo.currentTime, 55);
+
+      // Clamp at 0s and duration (100s)
+      assert.strictEqual(skipVideoTime(-999), 0);
+      assert.strictEqual(skipVideoTime(500), 100);
+    });
+
+    it('should set playback speed (0.5x – 2x) and preserve speed across video changes', () => {
+      const { elements } = setupTestEnv();
+      settings.prebuffer = false;
+
+      assert.strictEqual(setPlaybackSpeed(1.5), 1.5);
+      assert.strictEqual(settings.playbackSpeed, 1.5);
+      assert.strictEqual(elements.get('mainVideo').playbackRate, 1.5);
+      assert.strictEqual(elements.get('playbackSpeedSelect').value, '1.5');
+
+      assert.strictEqual(setPlaybackSpeed(0.5), 0.5);
+      assert.strictEqual(elements.get('mainVideo').playbackRate, 0.5);
+
+      // Invalid speed falls back to 1x
+      assert.strictEqual(setPlaybackSpeed(99), 1);
+      assert.strictEqual(elements.get('mainVideo').playbackRate, 1);
     });
   });
 });

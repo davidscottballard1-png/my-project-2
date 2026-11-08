@@ -3,6 +3,19 @@
   "name": "Anymore 18+ features we should add?",
   "createdAt": "2026-11-08T03:07:28.188Z",
   "filename": "6ca92ed4-0cca-49cd-8c76-7ceea249661e.json",
-  "geminiStarted": false,
-  "messages": []
+  "geminiStarted": true,
+  "messages": [
+    {
+      "id": "672c64c7-6d19-4232-8821-c01973c658d2",
+      "role": "user",
+      "content": "Expandable, Smarter 18+, and quick skip.",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T03:16:23.190Z",
+      "sender": "ios",
+      "is_cancelled": false
+    }
+  ]
 }

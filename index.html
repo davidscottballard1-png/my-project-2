@@ -114,6 +114,14 @@
                     <span>🎲</span>
                     <small>Next</small>
                   </button>
+                  <button type="button" id="reelsSkip15Btn" class="reels-rail-btn" title="Quick Skip +15s">
+                    <span>⏩</span>
+                    <small>+15s</small>
+                  </button>
+                  <button type="button" id="reelsMoreLikeBtn" class="reels-rail-btn" title="More Like This">
+                    <span>🔥</span>
+                    <small>Similar</small>
+                  </button>
                   <button type="button" id="reelsSavePhoneBtn" class="reels-rail-btn" title="Save to iPhone">
                     <span>📲</span>
                     <small>Save</small>
@@ -151,13 +159,37 @@
               <span class="queue-counter" id="queueCounter">0 in queue</span>
             </div>
             <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
+            <div id="videoTagsBar" class="video-tags-bar hidden" aria-label="Interactive Video Tags"></div>
             <div class="meta-links">
               <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
               <div class="meta-inline-btns">
+                <button type="button" id="favoriteCurrentBtn" class="btn-inline-fav" disabled title="Favorite &amp; Save to Vault">🤍 Favorite</button>
+                <button type="button" id="moreLikeThisBtn" class="btn-inline-more" disabled title="Pull more videos like this">🔥 More Like This</button>
                 <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
                 <button type="button" id="reelsModeBtn" class="btn-inline-reels">📱 Fullscreen Swipe</button>
               </div>
             </div>
+          </div>
+
+          <!-- Quick Skip (-10s / +15s / +30s) & Playback Speed Bar -->
+          <div id="quickSkipBar" class="quick-skip-bar" aria-label="Quick Skip and Speed Controls">
+            <button type="button" id="skipBack10Btn" class="btn-skip" data-skip="-10" disabled title="Rewind 10 seconds">
+              ⏪ -10s
+            </button>
+            <button type="button" id="skipFwd15Btn" class="btn-skip" data-skip="15" disabled title="Skip forward 15 seconds">
+              +15s ⏩
+            </button>
+            <button type="button" id="skipFwd30Btn" class="btn-skip" data-skip="30" disabled title="Skip forward 30 seconds">
+              +30s ⏭
+            </button>
+            <select id="playbackSpeedSelect" class="speed-select" aria-label="Playback Speed">
+              <option value="0.5">0.5x Slow</option>
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x Speed</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x Fast</option>
+              <option value="2">2x Turbo</option>
+            </select>
           </div>
 
           <!-- Download Progress Bar -->
@@ -368,6 +400,26 @@
           </form>
         </div>
 
+        <div id="adultDirectorySection" class="card-section hidden">
+          <div class="section-header-row">
+            <h2>📚 Expandable 18+ Subreddit &amp; Niche Directory</h2>
+            <button id="toggleAdultDirectoryBtn" type="button" class="btn-text" aria-expanded="false">
+              ▼ Expand Directory
+            </button>
+          </div>
+          <p class="section-desc">
+            Browse curated 18+ subreddits, RedGIFs HD loop niches, and full-length tube categories. Tap any niche to toggle it in your active sources or pull clips immediately.
+          </p>
+          <div id="adultDirectoryBody" class="adult-directory-body hidden">
+            <div class="directory-toolbar">
+              <button id="enableAllDirectoryBtn" type="button" class="btn-outline-full">
+                🔞 Enable All 18+ Directory Sources
+              </button>
+            </div>
+            <div id="adultDirectoryList" class="adult-directory-list"></div>
+          </div>
+        </div>
+
         <div class="card-section">
           <div class="section-header-row">
             <h2>🎛 Active Sources</h2>
@@ -540,9 +592,11 @@
               <span id="vaultStorageSummary" class="badge-subtle">0 videos saved</span>
             </div>
             <div class="mini-actions">
-              <select id="vaultFilterSelect" class="setting-select hidden" aria-label="Vault Filter">
+              <select id="vaultFilterSelect" class="setting-select" aria-label="Vault Filter">
                 <option value="all">All Vault Videos</option>
+                <option value="favorites">❤️ Favorites Only</option>
                 <option value="nsfw">🔞 18+ Vault Only</option>
+                <option value="nsfw_favorites">🔞❤️ 18+ Favorites</option>
                 <option value="sfw">Safe Only</option>
               </select>
               <button id="clearVaultBtn" class="btn-text-danger">Clear All</button>
@@ -551,6 +605,14 @@
           <p class="section-desc">
             Videos saved inside your iPhone's local <code>IndexedDB</code> storage with full offline video caching for Airplane-Mode replay or instant export to Photos/Files. 18+ videos are automatically hidden when <strong>🔞 18+ Off</strong> is active.
           </p>
+          <div id="vaultPlaybackBar" class="vault-playback-bar">
+            <button type="button" id="shuffleVaultBtn" class="btn-accent btn-mini">
+              🎲 Shuffle Vault in Player
+            </button>
+            <button type="button" id="reelsVaultPlayBtn" class="btn-secondary btn-mini">
+              📱 Swipe Vault in Reels
+            </button>
+          </div>
           <div id="vaultHiddenNotice" class="install-tip age-gate-note hidden">
             🔒 <strong>Hidden 18+ Vault Locked:</strong> You have private 18+ videos hidden in your Vault.
             <button type="button" id="unlockVaultBtn" class="btn-text">Unlock 18+ Vault ↗</button>

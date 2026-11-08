@@ -1202,3 +1202,220 @@ input:checked + .slider:before {
   border-bottom: none;
   padding: 2px 0;
 }
+
+/* Quick Skip (-10s / +15s / +30s) & Speed Controls */
+.quick-skip-bar {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr auto;
+  gap: 7px;
+  align-items: center;
+}
+
+.btn-skip {
+  background: var(--bg-elevated);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+  padding: 8px 6px;
+  border-radius: 10px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.btn-skip:active:not(:disabled) {
+  background: rgba(99, 102, 241, 0.25);
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.speed-select {
+  background: var(--bg-elevated);
+  color: #c7d2fe;
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 10px;
+  padding: 8px 8px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  outline: none;
+}
+
+/* Interactive Video Tags & More Like This / Favorite Inline Controls */
+.video-tags-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 3px 0;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.video-tags-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.video-tag-chip {
+  background: rgba(236, 72, 153, 0.14);
+  color: #f9a8d4;
+  border: 1px solid rgba(236, 72, 153, 0.35);
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.71rem;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.btn-inline-more {
+  background: rgba(236, 72, 153, 0.2);
+  color: #f9a8d4;
+  border: 1px solid rgba(236, 72, 153, 0.45);
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 0.73rem;
+  font-weight: 700;
+}
+
+.btn-inline-fav {
+  background: rgba(244, 63, 94, 0.16);
+  color: #fda4af;
+  border: 1px solid rgba(244, 63, 94, 0.38);
+  padding: 3px 9px;
+  border-radius: 8px;
+  font-size: 0.73rem;
+  font-weight: 700;
+}
+
+.btn-inline-fav.active {
+  background: rgba(244, 63, 94, 0.32);
+  color: #fff;
+  border-color: rgba(244, 63, 94, 0.75);
+}
+
+/* Expandable 18+ Subreddit & Niche Directory */
+.adult-directory-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.adult-directory-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.directory-category {
+  background: var(--bg-main);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.directory-category-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #f9a8d4;
+  letter-spacing: 0.01em;
+}
+
+.directory-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.directory-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.directory-card.active {
+  border-color: rgba(236, 72, 153, 0.5);
+  background: rgba(236, 72, 153, 0.1);
+}
+
+.directory-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.directory-card-title {
+  font-size: 0.84rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.directory-card-sub {
+  font-size: 0.71rem;
+  color: var(--text-muted);
+}
+
+.directory-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.btn-dir-toggle {
+  background: var(--bg-card);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+.btn-dir-toggle.active {
+  background: rgba(16, 185, 129, 0.22);
+  color: #6ee7b7;
+  border-color: rgba(16, 185, 129, 0.5);
+}
+
+.btn-dir-pull {
+  background: rgba(236, 72, 153, 0.2);
+  color: #f9a8d4;
+  border: 1px solid rgba(236, 72, 153, 0.45);
+  padding: 5px 9px;
+  border-radius: 8px;
+  font-size: 0.74rem;
+  font-weight: 700;
+}
+
+/* Vault Shuffle & Favorites Controls */
+.vault-playback-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.fav-btn {
+  background: rgba(244, 63, 94, 0.14);
+  color: #fda4af;
+  border: 1px solid rgba(244, 63, 94, 0.3);
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  font-size: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.fav-btn.active {
+  background: rgba(244, 63, 94, 0.3);
+  border-color: rgba(244, 63, 94, 0.7);
+}
