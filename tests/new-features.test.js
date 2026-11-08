@@ -573,8 +573,159 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         globalThis.document = origDoc;
       }
     });
+
+    it('should snap back at the top of the feed on upward pull (prev at index 0) and strip native video controls in Fullscreen Reels Mode', () => {
+      const origDoc = globalThis.document;
+      const origRaf = globalThis.requestAnimationFrame;
+      const removedAttrs = [];
+      const setAttrs = [];
+
+      const makeClassList = (initial = []) => {
+        const set = new Set(initial);
+        return {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          toggle: (c, force) => {
+            const add = typeof force === 'boolean' ? force : !set.has(c);
+            if (add) set.add(c);
+            else set.delete(c);
+            return add;
+          },
+          contains: (c) => set.has(c)
+        };
+      };
+
+      const makeStubEl = () => ({
+        textContent: '',
+        innerHTML: '',
+        value: '',
+        href: '',
+        src: '',
+        disabled: false,
+        controls: true,
+        muted: true,
+        paused: false,
+        currentTime: 0,
+        duration: 60,
+        dataset: {},
+        style: { transition: '', transform: '', opacity: '', setProperty() {} },
+        classList: makeClassList(),
+        load() {},
+        play: () => Promise.resolve(),
+        pause() {},
+        setAttribute(k, v) {
+          setAttrs.push([k, v]);
+        },
+        removeAttribute(k) {
+          removedAttrs.push(k);
+        },
+        addEventListener() {}
+      });
+
+      const elements = {
+        videoStage: makeStubEl(),
+        reelsHudOverlay: makeStubEl(),
+        appHeader: makeStubEl(),
+        bottomNav: makeStubEl(),
+        appContainer: makeStubEl(),
+        appMain: makeStubEl(),
+        mainVideo: makeStubEl(),
+        toast: makeStubEl()
+      };
+      elements.reelsHudOverlay.classList.add('hidden');
+      elements.toast.classList.add('hidden');
+
+      // Synchronous requestAnimationFrame so we can verify slide-in transform completion
+      let immediateRaf = false;
+      globalThis.requestAnimationFrame = (cb) => {
+        if (immediateRaf) cb();
+        return 1;
+      };
+
+      globalThis.document = {
+        body: { classList: makeClassList(), appendChild() {} },
+        createElement: () => makeStubEl(),
+        getElementById: (id) => {
+          if (!elements[id]) elements[id] = makeStubEl();
+          return elements[id];
+        },
+        querySelector: (sel) => {
+          if (sel === '.bottom-nav') return elements.bottomNav;
+          if (sel === '.app-container') return elements.appContainer;
+          if (sel === '.app-main') return elements.appMain;
+          return makeStubEl();
+        },
+        querySelectorAll: () => []
+      };
+
+      try {
+        setAppState({
+          videoQueue: [
+            { id: 'r1', title: 'Reel 1', videoUrl: 'https://example.com/1.mp4', sourceName: 'Test' },
+            { id: 'r2', title: 'Reel 2', videoUrl: 'https://example.com/2.mp4', sourceName: 'Test' }
+          ],
+          currentIndex: 0
+        });
+
+        toggleReelsFullscreen(true);
+        assert.strictEqual(elements.mainVideo.controls, false, 'Native video controls should be disabled in Fullscreen Reels Mode');
+        assert.ok(removedAttrs.includes('controls'), 'controls attribute should be removed from #mainVideo in Fullscreen Reels Mode');
+        assert.strictEqual(elements.appMain.classList.contains('reels-mode-active'), true, '.app-main should have .reels-mode-active');
+
+        // Attempting to swipe down ("prev") at index 0 should snap back and return false
+        elements.mainVideo.style.transform = 'translate3d(0, 60px, 0)';
+        const prevAtTop = animateReelsSlide('prev');
+        assert.strictEqual(prevAtTop, false, 'animateReelsSlide("prev") at index 0 should return false');
+        assert.strictEqual(getAppState().currentIndex, 0, 'currentIndex should remain 0 at top of feed');
+        assert.strictEqual(elements.mainVideo.style.transform, 'translate3d(0, 0, 0)', '#mainVideo should snap back to 0px');
+        assert.ok(elements.toast.textContent.includes('Top of feed'), 'Toast should notify user they are at the top of the feed');
+
+        // Swiping up ("next") with deferred rAF should position video at +82% before sliding in
+        immediateRaf = false;
+        animateReelsSlide('next');
+        assert.strictEqual(elements.mainVideo.style.transform, 'translate3d(0, 82%, 0)', 'Next reel should start at +82% Y offset');
+        assert.strictEqual(elements.mainVideo.style.opacity, '0.45', 'Next reel should start at 0.45 opacity');
+
+        // With immediate rAF, slide-in settles at translate3d(0, 0, 0) and opacity 1
+        immediateRaf = true;
+        animateReelsSlide('prev');
+        assert.strictEqual(elements.mainVideo.style.transform, 'translate3d(0, 0, 0)', 'Slide-in should settle at translate3d(0, 0, 0)');
+        assert.strictEqual(elements.mainVideo.style.opacity, '1', 'Slide-in should settle at opacity 1');
+
+        toggleReelsFullscreen(false);
+        assert.strictEqual(elements.mainVideo.controls, true, 'Native video controls should be restored on exit');
+        assert.ok(setAttrs.some(([k]) => k === 'controls'), 'controls attribute should be restored on exit');
+      } finally {
+        globalThis.document = origDoc;
+        globalThis.requestAnimationFrame = origRaf;
+      }
+    });
+
+    it('should enforce proper CSS media query cascade so phone landscape is not overridden by iPad breakpoint and header text truncates cleanly', () => {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+
+      const ipadLandscapeIdx = css.indexOf('(min-width: 768px) and (min-height: 581px) and (orientation: landscape)');
+      const phoneLandscapeIdx = css.indexOf('@media (orientation: landscape) and (max-height: 580px)');
+
+      assert.ok(ipadLandscapeIdx !== -1, 'iPad landscape media query should require min-height: 581px');
+      assert.ok(phoneLandscapeIdx !== -1, 'Phone landscape media query should target max-height: 580px');
+      assert.ok(
+        phoneLandscapeIdx > ipadLandscapeIdx,
+        'Phone landscape media query must appear after iPad media queries so wide phones (e.g. 844x390) are never overridden'
+      );
+
+      assert.ok(
+        css.includes('.subtitle {\n  display: block;\n  max-width: 100%;\n  font-size: 0.73rem;\n  color: var(--text-muted);\n  white-space: nowrap;\n  overflow: hidden;\n  text-overflow: ellipsis;'),
+        'Header .subtitle (#activeSourceSummary) must truncate with ellipsis instead of overlapping action buttons'
+      );
+      assert.ok(
+        css.includes('touch-action: none;'),
+        '.video-stage.reels-fullscreen must set touch-action: none for 1:1 vertical swipe tracking'
+      );
+    });
   });
 });
+
 
 
 
