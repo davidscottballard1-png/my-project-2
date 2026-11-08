@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="ReelVault" />
+  <meta name="theme-color" content="#090d16" />
+  <title>ReelVault — Random Video Puller &amp; Downloader</title>
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="apple-touch-icon" href="./icon.svg" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <img src="./icon.svg" alt="ReelVault" class="brand-icon" />
+        <div>
+          <h1>ReelVault</h1>
+          <span class="subtitle" id="activeSourceSummary">Loading sources...</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="installGuideBtn" class="icon-btn" title="Install on iPhone" aria-label="Install on iPhone">
+          📲
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Views -->
+    <main class="app-main">
+      <!-- TAB 1: DISCOVER / PLAYER -->
+      <section id="view-discover" class="tab-view active">
+        <!-- Quick Keyword Search Bar -->
+        <form id="quickSearchForm" class="quick-search-bar">
+          <input
+            type="search"
+            id="quickSearchInput"
+            placeholder="Search any keyword/topic across the web..."
+            autocomplete="off"
+          />
+          <button type="submit" class="btn-primary btn-compact">Pull</button>
+        </form>
+
+        <!-- Video Player Card -->
+        <div class="video-card" id="videoCard">
+          <div class="video-stage" id="videoStage">
+            <video
+              id="mainVideo"
+              playsinline
+              webkit-playsinline
+              controls
+              preload="metadata"
+            ></video>
+
+            <!-- Loading Overlay -->
+            <div id="playerLoading" class="player-overlay hidden">
+              <div class="spinner"></div>
+              <p id="playerLoadingText">Pulling random video...</p>
+            </div>
+
+            <!-- Empty / Welcome State -->
+            <div id="playerEmpty" class="player-overlay">
+              <div class="empty-icon">🎲</div>
+              <h2>Ready to Pull Videos</h2>
+              <p>Tap <strong>Shuffle Random</strong> below or enter any keyword above to pull &amp; download free videos.</p>
+            </div>
+          </div>
+
+          <!-- Video Info & Controls -->
+          <div class="video-meta">
+            <div class="meta-top">
+              <span class="source-badge" id="videoSourceBadge">Ready</span>
+              <span class="queue-counter" id="queueCounter">0 in queue</span>
+            </div>
+            <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
+            <div class="meta-links">
+              <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
+            </div>
+          </div>
+
+          <!-- Download Progress Bar -->
+          <div id="downloadStatusBox" class="download-status hidden">
+            <div class="download-status-row">
+              <span id="downloadStatusText">Preparing download...</span>
+              <span id="downloadStatusPercent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="downloadProgressBar" class="progress-fill"></div>
+            </div>
+          </div>
+
+          <!-- Action Buttons -->
+          <div class="player-actions">
+            <button id="prevVideoBtn" class="btn-secondary" disabled title="Previous video">
+              ⏮ Prev
+            </button>
+            <button id="shuffleBtn" class="btn-accent">
+              🎲 Shuffle Random
+            </button>
+            <button id="nextVideoBtn" class="btn-secondary" title="Next video">
+              Next ⏭
+            </button>
+          </div>
+
+          <div class="download-actions">
+            <button id="saveToPhoneBtn" class="btn-download" disabled>
+              📲 Save to iPhone (Photos / Files)
+            </button>
+            <button id="saveToVaultBtn" class="btn-vault" disabled title="Save to offline app vault">
+              📥 Vault
+            </button>
+          </div>
+
+          <div class="batch-bar">
+            <button id="batchPullBtn" class="btn-outline-full">
+              ⚡ Pull &amp; Queue 5 Random Videos at Once
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: MULTI-ENGINE SEARCH & WEBPAGE SCANNER -->
+      <section id="view-search" class="tab-view">
+        <div class="card-section">
+          <h2>🌐 Multi-Engine Video Search</h2>
+          <p class="section-desc">
+            Search any keyword or topic across multiple open video networks at once and pull direct <code>.mp4</code> videos.
+          </p>
+          <form id="deepSearchForm" class="stack-form">
+            <input
+              type="search"
+              id="deepSearchInput"
+              placeholder="Enter keyword or topic (e.g. ocean, retro, funny, cars)..."
+              required
+            />
+            <div class="engine-checks">
+              <label class="chip-check">
+                <input type="checkbox" id="engArchive" checked />
+                <span>Internet Archive</span>
+              </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engWikimedia" checked />
+                <span>Wikimedia Commons</span>
+              </label>
+              <label class="chip-check">
+                <input type="checkbox" id="engReddit" checked />
+                <span>Reddit Global Videos</span>
+              </label>
+            </div>
+            <button type="submit" class="btn-accent">🔍 Search &amp; Pull Videos</button>
+          </form>
+        </div>
+
+        <div class="card-section">
+          <h2>🔗 Webpage <code>.mp4</code> Scanner</h2>
+          <p class="section-desc">
+            Paste a link to a webpage or direct video URL. ReelVault will scan the page for downloadable <code>.mp4</code> / <code>.webm</code> video files.
+          </p>
+          <form id="urlScanForm" class="stack-form">
+            <input
+              type="url"
+              id="urlScanInput"
+              placeholder="https://example.com/page-with-video"
+              required
+            />
+            <button type="submit" class="btn-primary">📡 Scan Page for Videos</button>
+          </form>
+        </div>
+
+        <div class="card-section">
+          <div class="section-header-row">
+            <h2>Search &amp; Scan Results</h2>
+            <span id="searchResultsCount" class="badge-subtle">0 videos</span>
+          </div>
+          <div id="searchResultsList" class="video-grid-list">
+            <p class="muted-center">Run a keyword search or webpage scan above to see matching videos.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: CUSTOM SOURCES MENU -->
+      <section id="view-sources" class="tab-view">
+        <div class="card-section">
+          <h2>➕ Add Custom Source</h2>
+          <p class="section-desc">
+            Add any keyword topic, subreddit name, or custom video/JSON URL. Stored privately on your iPhone.
+          </p>
+          <form id="addSourceForm" class="stack-form">
+            <div class="segmented-control" role="radiogroup" aria-label="Source Type">
+              <label class="segment active" data-type="keyword">
+                <input type="radio" name="sourceType" value="keyword" checked />
+                Keyword / Topic
+              </label>
+              <label class="segment" data-type="subreddit">
+                <input type="radio" name="sourceType" value="subreddit" />
+                Subreddit
+              </label>
+              <label class="segment" data-type="url">
+                <input type="radio" name="sourceType" value="url" />
+                Direct / JSON URL
+              </label>
+            </div>
+
+            <input
+              type="text"
+              id="newSourceInput"
+              placeholder="e.g. vintage cartoons, synthwave, nature..."
+              required
+            />
+            <input
+              type="text"
+              id="newSourceLabel"
+              placeholder="Optional display name (leave blank for auto)"
+            />
+            <button type="submit" class="btn-accent">+ Add to My Sources</button>
+          </form>
+        </div>
+
+        <div class="card-section">
+          <div class="section-header-row">
+            <h2>🎛 Active Sources</h2>
+            <div class="mini-actions">
+              <button id="enableAllSourcesBtn" class="btn-text">All On</button>
+              <button id="disableAllSourcesBtn" class="btn-text">All Off</button>
+            </div>
+          </div>
+          <p class="section-desc">
+            Toggle which sources <strong>Shuffle Random</strong> pulls from.
+          </p>
+          <div id="sourcesList" class="sources-list"></div>
+        </div>
+
+        <div class="card-section">
+          <h2>⚙️ Search &amp; Privacy Settings</h2>
+          <div class="setting-row">
+            <div>
+              <strong>Include 18+ Results in Custom Searches</strong>
+              <p class="setting-sub">Allow unfiltered search results when querying custom keywords or subreddits on your device.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="allowNsfwToggle" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Auto-Play Pulled Videos</strong>
+              <p class="setting-sub">Automatically start playback when a new video is pulled.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autoPlayToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="setting-actions">
+            <button id="resetSourcesBtn" class="btn-danger-outline">
+              🗑 Reset Custom Sources &amp; Clear History
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: OFFLINE VAULT -->
+      <section id="view-vault" class="tab-view">
+        <div class="card-section">
+          <div class="section-header-row">
+            <h2>📥 Saved Vault</h2>
+            <button id="clearVaultBtn" class="btn-text-danger">Clear All</button>
+          </div>
+          <p class="section-desc">
+            Videos saved inside your iPhone's local browser storage for quick replay or one-tap export to Photos/Files.
+          </p>
+          <div id="vaultList" class="video-grid-list">
+            <p class="muted-center">No videos saved in your Vault yet.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Bottom Tab Navigation -->
+    <nav class="bottom-nav" aria-label="Primary Navigation">
+      <button class="nav-tab active" data-target="view-discover">
+        <span class="nav-icon">🎬</span>
+        <span class="nav-label">Player</span>
+      </button>
+      <button class="nav-tab" data-target="view-search">
+        <span class="nav-icon">🌐</span>
+        <span class="nav-label">Search Web</span>
+      </button>
+      <button class="nav-tab" data-target="view-sources">
+        <span class="nav-icon">🎛</span>
+        <span class="nav-label">Sources</span>
+      </button>
+      <button class="nav-tab" data-target="view-vault">
+        <span class="nav-icon">📥</span>
+        <span class="nav-label">Vault <small id="vaultBadge" class="nav-badge hidden">0</small></span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <!-- iPhone Install Guide Modal -->
+  <div id="installModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="installModalTitle">
+    <div class="modal-sheet">
+      <div class="modal-header">
+        <h3 id="installModalTitle">📲 Install ReelVault on iPhone</h3>
+        <button id="closeInstallModalBtn" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <ol class="install-steps">
+        <li>Open this page in <strong>Safari</strong> on your iPhone.</li>
+        <li>Tap the <strong>Share</strong> button <span class="ios-badge">⬆️</span> at the bottom of Safari.</li>
+        <li>Scroll down and tap <strong>Add to Home Screen</strong>.</li>
+        <li>Launch <strong>ReelVault</strong> from your Home Screen for a full-screen native experience!</li>
+      </ol>
+      <div class="install-tip">
+        💡 <strong>Saving Videos to Camera Roll:</strong> When you tap <em>"Save to iPhone"</em> on any video, iOS opens the Share sheet—tap <strong>"Save Video"</strong> to save straight to your Photos app, or <strong>"Save to Files"</strong>!
+      </div>
+      <button id="gotItModalBtn" class="btn-accent">Got It</button>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
