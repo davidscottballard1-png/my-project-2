@@ -171,87 +171,89 @@
             </div>
           </div>
 
-          <!-- Video Info & Controls -->
-          <div class="video-meta">
-            <div class="meta-top">
-              <div class="badge-group">
-                <span class="source-badge" id="videoSourceBadge">Ready</span>
-                <span class="format-badge hidden" id="videoFormatBadge">MP4</span>
-                <span class="prebuffer-badge hidden" id="prebufferBadge">⚡ Next Preloaded</span>
+          <!-- Video Info & Controls Panel (Stacks in portrait, docks side-by-side in landscape & iPad) -->
+          <div class="video-controls-panel" id="videoControlsPanel">
+            <div class="video-meta">
+              <div class="meta-top">
+                <div class="badge-group">
+                  <span class="source-badge" id="videoSourceBadge">Ready</span>
+                  <span class="format-badge hidden" id="videoFormatBadge">MP4</span>
+                  <span class="prebuffer-badge hidden" id="prebufferBadge">⚡ Next Preloaded</span>
+                </div>
+                <span class="queue-counter" id="queueCounter">0 in queue</span>
               </div>
-              <span class="queue-counter" id="queueCounter">0 in queue</span>
-            </div>
-            <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
-            <div id="videoTagsBar" class="video-tags-bar hidden" aria-label="Interactive Video Tags"></div>
-            <div class="meta-links">
-              <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
-              <div class="meta-inline-btns">
-                <button type="button" id="favoriteCurrentBtn" class="btn-inline-fav" disabled title="Favorite &amp; Save to Vault">🤍 Favorite</button>
-                <button type="button" id="moreLikeThisBtn" class="btn-inline-more" disabled title="Pull more videos like this">🔥 More Like This</button>
-                <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
-                <button type="button" id="reelsModeBtn" class="btn-inline-reels">📱 Fullscreen Swipe</button>
+              <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
+              <div id="videoTagsBar" class="video-tags-bar hidden" aria-label="Interactive Video Tags"></div>
+              <div class="meta-links">
+                <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
+                <div class="meta-inline-btns">
+                  <button type="button" id="favoriteCurrentBtn" class="btn-inline-fav" disabled title="Favorite &amp; Save to Vault">🤍 Favorite</button>
+                  <button type="button" id="moreLikeThisBtn" class="btn-inline-more" disabled title="Pull more videos like this">🔥 More Like This</button>
+                  <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
+                  <button type="button" id="reelsModeBtn" class="btn-inline-reels">📱 Fullscreen Swipe</button>
+                </div>
               </div>
             </div>
-          </div>
 
-          <!-- Quick Skip (-10s / +15s / +30s) & Playback Speed Bar -->
-          <div id="quickSkipBar" class="quick-skip-bar" aria-label="Quick Skip and Speed Controls">
-            <button type="button" id="skipBack10Btn" class="btn-skip" data-skip="-10" disabled title="Rewind 10 seconds">
-              ⏪ -10s
-            </button>
-            <button type="button" id="skipFwd15Btn" class="btn-skip" data-skip="15" disabled title="Skip forward 15 seconds">
-              +15s ⏩
-            </button>
-            <button type="button" id="skipFwd30Btn" class="btn-skip" data-skip="30" disabled title="Skip forward 30 seconds">
-              +30s ⏭
-            </button>
-            <select id="playbackSpeedSelect" class="speed-select" aria-label="Playback Speed">
-              <option value="0.5">0.5x Slow</option>
-              <option value="0.75">0.75x</option>
-              <option value="1" selected>1x Speed</option>
-              <option value="1.25">1.25x</option>
-              <option value="1.5">1.5x Fast</option>
-              <option value="2">2x Turbo</option>
-            </select>
-          </div>
-
-          <!-- Download Progress Bar -->
-          <div id="downloadStatusBox" class="download-status hidden">
-            <div class="download-status-row">
-              <span id="downloadStatusText">Preparing download...</span>
-              <span id="downloadStatusPercent">0%</span>
+            <!-- Quick Skip (-10s / +15s / +30s) & Playback Speed Bar -->
+            <div id="quickSkipBar" class="quick-skip-bar" aria-label="Quick Skip and Speed Controls">
+              <button type="button" id="skipBack10Btn" class="btn-skip" data-skip="-10" disabled title="Rewind 10 seconds">
+                ⏪ -10s
+              </button>
+              <button type="button" id="skipFwd15Btn" class="btn-skip" data-skip="15" disabled title="Skip forward 15 seconds">
+                +15s ⏩
+              </button>
+              <button type="button" id="skipFwd30Btn" class="btn-skip" data-skip="30" disabled title="Skip forward 30 seconds">
+                +30s ⏭
+              </button>
+              <select id="playbackSpeedSelect" class="speed-select" aria-label="Playback Speed">
+                <option value="0.5">0.5x Slow</option>
+                <option value="0.75">0.75x</option>
+                <option value="1" selected>1x Speed</option>
+                <option value="1.25">1.25x</option>
+                <option value="1.5">1.5x Fast</option>
+                <option value="2">2x Turbo</option>
+              </select>
             </div>
-            <div class="progress-track">
-              <div id="downloadProgressBar" class="progress-fill"></div>
+
+            <!-- Download Progress Bar -->
+            <div id="downloadStatusBox" class="download-status hidden">
+              <div class="download-status-row">
+                <span id="downloadStatusText">Preparing download...</span>
+                <span id="downloadStatusPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div id="downloadProgressBar" class="progress-fill"></div>
+              </div>
             </div>
-          </div>
 
-          <!-- Action Buttons -->
-          <div class="player-actions">
-            <button id="prevVideoBtn" class="btn-secondary" disabled title="Previous video">
-              ⏮ Prev
-            </button>
-            <button id="shuffleBtn" class="btn-accent">
-              🎲 Shuffle Random
-            </button>
-            <button id="nextVideoBtn" class="btn-secondary" title="Next video">
-              Next ⏭
-            </button>
-          </div>
+            <!-- Action Buttons -->
+            <div class="player-actions">
+              <button id="prevVideoBtn" class="btn-secondary" disabled title="Previous video">
+                ⏮ Prev
+              </button>
+              <button id="shuffleBtn" class="btn-accent">
+                🎲 Shuffle Random
+              </button>
+              <button id="nextVideoBtn" class="btn-secondary" title="Next video">
+                Next ⏭
+              </button>
+            </div>
 
-          <div class="download-actions">
-            <button id="saveToPhoneBtn" class="btn-download" disabled>
-              📲 Save to iPhone (Photos / Files)
-            </button>
-            <button id="saveToVaultBtn" class="btn-vault" disabled title="Save to offline app vault">
-              📥 Vault
-            </button>
-          </div>
+            <div class="download-actions">
+              <button id="saveToPhoneBtn" class="btn-download" disabled>
+                📲 Save to iPhone (Photos / Files)
+              </button>
+              <button id="saveToVaultBtn" class="btn-vault" disabled title="Save to offline app vault">
+                📥 Vault
+              </button>
+            </div>
 
-          <div class="batch-bar">
-            <button id="batchPullBtn" class="btn-outline-full">
-              ⚡ Pull &amp; Queue 5 Random Videos at Once
-            </button>
+            <div class="batch-bar">
+              <button id="batchPullBtn" class="btn-outline-full">
+                ⚡ Pull &amp; Queue 5 Random Videos at Once
+              </button>
+            </div>
           </div>
         </div>
       </section>

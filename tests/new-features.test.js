@@ -440,5 +440,20 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         '.bottom-nav should be a non-overlapping flex item so it never covers the video'
       );
     });
+
+    it('should fill the screen in phone landscape and scale across iPad portrait and landscape without a 520px width cap', () => {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+      const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+      const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
+
+      assert.strictEqual(manifest.orientation, 'any', 'manifest.json should allow both portrait and landscape orientations');
+      assert.ok(html.includes('id="videoControlsPanel"'), 'index.html should contain #videoControlsPanel for split landscape/iPad layout');
+      assert.ok(!css.includes('max-width: 520px'), 'styles.css should not cap .app-container or .bottom-nav to 520px');
+      assert.ok(css.includes('env(safe-area-inset-left'), 'styles.css should respect horizontal safe-area-inset-left in landscape');
+      assert.ok(css.includes('env(safe-area-inset-right'), 'styles.css should respect horizontal safe-area-inset-right in landscape');
+      assert.ok(css.includes('@media (orientation: landscape)'), 'styles.css should include phone landscape responsive breakpoint');
+      assert.ok(css.includes('@media (min-width: 768px)'), 'styles.css should include iPad/tablet responsive breakpoint');
+    });
   });
 });
+
