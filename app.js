@@ -4753,6 +4753,34 @@ if (typeof document !== 'undefined') {
   document.getElementById('gotItModalBtn')?.addEventListener('click', () => {
     installModal?.classList.add('hidden');
   });
+  document.getElementById('copyAppLinkBtn')?.addEventListener('click', async () => {
+    const shareUrl =
+      typeof window !== 'undefined' && window.location && /^https?:/i.test(window.location.href)
+        ? window.location.href.split('#')[0]
+        : 'https://davidscottballard1-png.github.io/my-project-2/';
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: 'ReelVault — iPhone Video Puller',
+          text: 'Open ReelVault in Safari on iPhone and tap Add to Home Screen:',
+          url: shareUrl
+        });
+        return;
+      } catch (_err) {
+        // Fallback to clipboard copy if share sheet dismissed
+      }
+    }
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        showToast('iPhone app link copied to clipboard!');
+        return;
+      } catch (_err) {
+        // ignore
+      }
+    }
+    showToast(`Open in Safari: ${shareUrl}`);
+  });
 });
 }
 

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>FullScreen</key>
+      <true/>
+      <key>Icon</key>
+      <data>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</data>
+      <key>IgnoreManifestScope</key>
+      <true/>
+      <key>IsRemovable</key>
+      <true/>
+      <key>Label</key>
+      <string>ReelVault</string>
+      <key>PayloadDescription</key>
+      <string>Installs the ReelVault full-screen web app onto your iPhone Home Screen.</string>
+      <key>PayloadDisplayName</key>
+      <string>ReelVault App</string>
+      <key>PayloadIdentifier</key>
+      <string>com.reelvault.webclip</string>
+      <key>PayloadType</key>
+      <string>com.apple.webClip.managed</string>
+      <key>PayloadUUID</key>
+      <string>8A9C7E12-4F5B-4D3E-9A1B-2C3D4E5F6A7B</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>Precomposed</key>
+      <true/>
+      <key>URL</key>
+      <string>https://davidscottballard1-png.github.io/my-project-2/</string>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Installs ReelVault (iPhone Random Video Puller &amp; Downloader) directly onto your iPhone Home Screen.</string>
+  <key>PayloadDisplayName</key>
+  <string>ReelVault iPhone App</string>
+  <key>PayloadIdentifier</key>
+  <string>com.reelvault.profile</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>1F2E3D4C-5B6A-4789-8A9B-0C1D2E3F4A5B</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>

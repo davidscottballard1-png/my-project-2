@@ -1,11 +1,15 @@
-const CACHE_NAME = 'reelvault-v3';
+const CACHE_NAME = 'reelvault-v4';
 const APP_SHELL = [
   './',
   './index.html',
   './styles.css',
   './app.js',
   './manifest.json',
-  './icon.svg'
+  './icon.svg',
+  './apple-touch-icon.png',
+  './icon-192.png',
+  './icon-512.png',
+  './ReelVault.mobileconfig'
 ];
 
 self.addEventListener('install', (event) => {

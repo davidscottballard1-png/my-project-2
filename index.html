@@ -10,7 +10,8 @@
   <title>ReelVault — Random Video Puller &amp; Downloader</title>
   <link rel="manifest" href="./manifest.json" />
   <link rel="icon" type="image/svg+xml" href="./icon.svg" />
-  <link rel="apple-touch-icon" href="./icon.svg" />
+  <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
   <link rel="preconnect" href="https://archive.org" crossorigin />
   <link rel="preconnect" href="https://commons.wikimedia.org" crossorigin />
   <link rel="preconnect" href="https://images-api.nasa.gov" crossorigin />
@@ -709,6 +710,20 @@
         <li>Scroll down and tap <strong>Add to Home Screen</strong>.</li>
         <li>Launch <strong>ReelVault</strong> from your Home Screen for a full-screen native experience!</li>
       </ol>
+      <div class="age-gate-actions" style="margin-bottom: 12px;">
+        <a
+          id="downloadMobileConfigBtn"
+          href="./ReelVault.mobileconfig"
+          download="ReelVault.mobileconfig"
+          class="btn-accent"
+          style="text-align: center; text-decoration: none; display: block;"
+        >
+          📥 Download iPhone App Profile (.mobileconfig)
+        </a>
+        <button id="copyAppLinkBtn" type="button" class="btn-secondary">
+          🔗 Copy / Share iPhone App Link
+        </button>
+      </div>
       <div class="install-tip">
         💡 <strong>Saving Videos to Camera Roll:</strong> When you tap <em>"Save to iPhone"</em> on any video, iOS opens the Share sheet—tap <strong>"Save Video"</strong> to save straight to your Photos app, or <strong>"Save to Files"</strong>!
       </div>
