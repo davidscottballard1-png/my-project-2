@@ -40,6 +40,18 @@
       "created_at": "2026-11-08T02:49:58.464Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "83315a04-f50d-4e81-8048-6af77ba4b152",
+      "role": "agent",
+      "content": "We've removed **Auto-Lock When Backgrounded** and replaced it with **Resume Video Where You Left Off**. Everything is saved.\n\n### What Changed\n1. **Removed Auto-Lock on Background & Added Resume Setting ([index.html](https://github.com/davidscottballard1-png/my-project-2/blob/main/index.html#L470-L479)):**\n   * Replaced `#autoLockOnHideToggle` with **Resume Video Where You Left Off** (`#resumePlaybackToggle`, enabled by default).\n   * Backgrounding the app, switching Safari tabs, or locking your iPhone no longer turns off 18+ mode or scrubs your active video.\n\n2. **Persistent Video & Timestamp Resume ([app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1281-L1433)):**\n   * [`savePlaybackState`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1326-L1369) continuously saves your active video, queue, and exact playback timestamp (`currentTime`) to `localStorage` (`STORAGE_KEYS.PLAYBACK_STATE`) on `timeupdate`, `pause`, `pagehide`, `visibilitychange`, and when navigating between Prev/Next videos.\n   * [`restorePlaybackState`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1371-L1419) and [`handleVisibilityPlaybackChange`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1422-L1443) automatically reload your active video and seek `#mainVideo` to the exact second you were watching ([`getSavedPlaybackTime`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1300-L1324)) inside [`updatePlayerUI`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L2803-L2840) when you return to or reopen the app.\n   * When a video finishes (`ended`), its saved timestamp resets to `0` so replaying it later starts fresh.\n\n3. **Unit Tests Updated ([tests/adult-suite.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/adult-suite.test.js#L456-L499)):**\n   * Updated the test suite to verify that backgrounding the app preserves 18+ mode, saves the exact playback position, and restores the video right where you left off upon returning — **all 93 unit tests pass**.",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "33d6f471-4ea9-45a5-b496-7cb4f467436f",
+      "created_at": "2026-11-08T02:57:29.997Z",
+      "sender": "macOS",
+      "is_cancelled": false
     }
   ]
 }
