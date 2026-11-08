@@ -1697,10 +1697,11 @@ async function convertCurrentVideoForPlayer(videoItem) {
     showToast('Could not auto-convert this stream in browser.');
   } finally {
     if (convertNowBtn) convertNowBtn.disabled = false;
-    setTimeout(() => {
+    const hideTimer = setTimeout(() => {
       statusBox?.classList.add('hidden');
       if (progressBar) progressBar.style.width = '0%';
     }, 1000);
+    hideTimer.unref?.();
   }
 }
 
@@ -1849,7 +1850,8 @@ async function downloadVideoToIphone(videoItem) {
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      const revokeTimer = setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      revokeTimer.unref?.();
       showToast(
         wasConverted
           ? 'Auto-converted to .MP4 and downloaded!'
@@ -1874,10 +1876,11 @@ async function downloadVideoToIphone(videoItem) {
     }
   } finally {
     if (saveBtn) saveBtn.disabled = false;
-    setTimeout(() => {
+    const hideTimer = setTimeout(() => {
       statusBox?.classList.add('hidden');
       if (progressBar) progressBar.style.width = '0%';
     }, 1200);
+    hideTimer.unref?.();
   }
 }
 
@@ -2633,6 +2636,16 @@ if (typeof module !== 'undefined' && module.exports) {
     switchTab,
     renderSourcesList,
     renderSearchResults,
+    renderVaultList,
+    saveVideoToVaultDB,
+    getAllVaultVideos,
+    deleteVaultVideoDB,
+    clearVaultDB,
+    downloadVideoToIphone,
+    loadState,
+    saveSources,
+    saveSettings,
+    initBookmarkletAndUrlParams,
     updateHeaderSummary,
     showToast,
     getAppState: () => ({

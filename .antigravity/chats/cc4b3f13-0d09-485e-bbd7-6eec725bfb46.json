@@ -352,6 +352,42 @@
       "created_at": "2026-11-08T01:35:32.660Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "a95efd40-071b-4e2a-b623-fa61eef435fc",
+      "role": "user",
+      "content": "Anything else we should test?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:40:02.657Z",
+      "sender": "ios",
+      "is_cancelled": false
+    },
+    {
+      "id": "a6c21e6f-afdb-4bb9-8fc3-6cd377af8015",
+      "role": "agent",
+      "content": "Right now, **all 63 tests across 20 suites are passing in ~117 ms** (including the 4 UI test suites just added to [app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js)).\n\nAt this point, your core logic, format detection, XSS sanitization, DOM wiring, PWA Service Worker assets, and main UI views are well-covered and ready to use. \n\nIf you want to reach **complete end-to-end coverage** of the remaining functions in [app.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js), here are the **last 4 areas** left that aren't tested yet:\n\n---\n\n### 1. Offline Vault UI & Storage Summary ([`renderVaultList`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1969-L2033) & [`saveVideoToVaultDB`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L701-L731))\n* **Empty Vault state:** Verifies `#vaultBadge` is hidden and `#vaultStorageSummary` reads `\"0 videos saved\"`.\n* **Cached Offline state:** Verifies `#vaultBadge` displays the count, `#vaultStorageSummary` calculates total MB cached (`\"2 saved • 5.0 MB cached offline\"`), and items with `hasOfflineBlob` render the `✅ Offline` badge and `▶ Watch (Offline)` button while link-only items show `☁️ Cache Offline`.\n\n---\n\n### 2. iPhone Share Sheet & Download Flow ([`downloadVideoToIphone`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L1790-L1882))\n* **Filename slug sanitization:** Verifies titles with symbols/spaces (e.g., `\"Apollo 11: Launch & Landing! (1969)\"`) are cleanly formatted into `\"apollo-11-launch-landing-1969.mp4\"`.\n* **iOS Share Sheet (`navigator.share`):** Verifies that when `navigator.canShare` is supported on iPhone, it passes a valid `File` object to `navigator.share` and handles user cancellation (`AbortError`) cleanly without crashing.\n\n---\n\n### 3. LocalStorage Persistence & Corruption Recovery ([`loadState`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L793-L813), [`saveSources`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L815-L818), [`saveSettings`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L820-L823))\n* **Corrupted storage recovery:** Verifies that if `localStorage` contains malformed JSON (`\"{corrupted\"`), [`loadState`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L793-L813) safely falls back to [`DEFAULT_SOURCES`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L36-L85) instead of crashing on startup.\n* **Saving state:** Verifies [`saveSources`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L815-L818) and [`saveSettings`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L820-L823) persist changes under [`STORAGE_KEYS`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L3-L6).\n\n---\n\n### 4. Safari Bookmarklet & Deep-Link Parameters ([`initBookmarkletAndUrlParams`](https://github.com/davidscottballard1-png/my-project-2/blob/main/app.js#L2057-L2104))\n* **Bookmarklet generation:** Verifies `#bookmarkletCodeInput` is populated with a valid `javascript:(function(){...})()` snippet matching the app's URL.\n* **URL `?scan=` auto-launch:** Verifies opening ReelVault with `?scan=https://example.com/clip.mp4` automatically switches to the Search tab (`view-search`) and fills `#urlScanInput`.\n\n---\n\nWould you like me to add these final 4 suites to [app.test.js](https://github.com/davidscottballard1-png/my-project-2/blob/main/tests/app.test.js), or are you happy with the current 63-test suite?",
+      "status": "completed",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": "a95efd40-071b-4e2a-b623-fa61eef435fc",
+      "created_at": "2026-11-08T01:41:46.783Z",
+      "sender": "macOS",
+      "is_cancelled": false
+    },
+    {
+      "id": "2e8164fb-2cf2-4fcb-948c-d282736feb76",
+      "role": "user",
+      "content": "Yes",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T01:42:45.601Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }

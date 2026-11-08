@@ -3,6 +3,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const {
+  STORAGE_KEYS,
   detectVideoFormat,
   normalizeAndAutoRewriteVideoUrl,
   VIDEO_FORMAT_CATALOG,
@@ -26,6 +27,16 @@ const {
   switchTab,
   renderSourcesList,
   renderSearchResults,
+  renderVaultList,
+  saveVideoToVaultDB,
+  getAllVaultVideos,
+  deleteVaultVideoDB,
+  clearVaultDB,
+  downloadVideoToIphone,
+  loadState,
+  saveSources,
+  saveSettings,
+  initBookmarkletAndUrlParams,
   updateHeaderSummary,
   showToast,
   getAppState,
@@ -781,8 +792,16 @@ describe('ReelVault Unit Tests', () => {
         get className() {
           return [...classes].join(' ');
         },
+        value: '',
+        download: '',
+        target: '',
+        rel: '',
         load: () => {},
         play: () => Promise.resolve(),
+        click: () => {},
+        remove: () => {},
+        select: () => {},
+        addEventListener: () => {},
         appendChild: () => {}
       };
       if (id) elements.set(id, el);
@@ -796,7 +815,10 @@ describe('ReelVault Unit Tests', () => {
       'saveToPhoneBtn', 'saveToVaultBtn', 'playerEmpty', 'playerLoading',
       'playerLoadingText', 'reelsHudOverlay', 'reelsHudBadge', 'reelsHudTitle',
       'videoStage', 'prebufferBadge', 'sourcesList', 'searchResultsCount',
-      'searchResultsList', 'activeSourceSummary', 'toast'
+      'searchResultsList', 'activeSourceSummary', 'toast',
+      'vaultList', 'vaultBadge', 'vaultStorageSummary',
+      'downloadStatusBox', 'downloadStatusText', 'downloadStatusPercent', 'downloadProgressBar',
+      'bookmarkletCodeInput', 'copyBookmarkletBtn', 'urlScanInput'
     ].forEach((id) => makeElement(id));
 
     const tabViews = [
@@ -1056,6 +1078,270 @@ describe('ReelVault Unit Tests', () => {
       showToast('Saved to Offline Vault!');
       assert.strictEqual(elements.get('toast').textContent, 'Saved to Offline Vault!');
       assert.strictEqual(elements.get('toast').classList.contains('hidden'), false);
+    });
+  });
+
+  describe('UI & IndexedDB: Offline Vault Rendering & Storage Summary (renderVaultList, saveVideoToVaultDB, deleteVaultVideoDB, clearVaultDB)', () => {
+    function setupMockIndexedDB() {
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null, onerror: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (record) => {
+          records.set(record.id, record);
+          const req = { result: record.id, onsuccess: null, onerror: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        delete: (id) => {
+          records.delete(id);
+          const req = { onsuccess: null, onerror: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        clear: () => {
+          records.clear();
+          const req = { onsuccess: null, onerror: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      const db = {
+        objectStoreNames: { contains: () => true },
+        createObjectStore: () => store,
+        transaction: () => ({
+          objectStore: () => store
+        })
+      };
+
+      globalThis.indexedDB = {
+        open: () => {
+          const req = { result: db, onupgradeneeded: null, onsuccess: null, onerror: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      return records;
+    }
+
+    it('should render empty state, hide #vaultBadge, and show "0 videos saved" when Vault is empty', async () => {
+      const { elements } = createMockDom();
+      setupMockIndexedDB();
+
+      await renderVaultList();
+
+      assert.strictEqual(elements.get('vaultBadge').classList.contains('hidden'), true);
+      assert.strictEqual(elements.get('vaultStorageSummary').textContent, '0 videos saved');
+      assert.ok(elements.get('vaultList').innerHTML.includes('No videos saved in your Vault yet'));
+    });
+
+    it('should calculate cached MB, update #vaultBadge, and render offline vs link-only Vault cards', async () => {
+      const { elements } = createMockDom();
+      setupMockIndexedDB();
+
+      // 1. Save a 5.0 MB offline-cached video
+      const fiveMbBlob = new Blob([new Uint8Array(5 * 1024 * 1024)], { type: 'video/mp4' });
+      await saveVideoToVaultDB(
+        {
+          id: 'vault-cached-1',
+          title: 'Cached Space Launch <script>',
+          videoUrl: 'https://example.com/launch.mp4',
+          format: 'mp4',
+          sourceName: 'NASA',
+          savedAt: 2000
+        },
+        { blob: fiveMbBlob, ext: 'mp4', mime: 'video/mp4' }
+      );
+
+      // 2. Save a link-only video
+      await saveVideoToVaultDB({
+        id: 'vault-link-2',
+        title: 'Link Only Clip',
+        videoUrl: 'https://example.com/clip.webm',
+        format: 'webm',
+        sourceName: 'Wikimedia',
+        savedAt: 1000
+      });
+
+      const allItems = await getAllVaultVideos();
+      assert.strictEqual(allItems.length, 2);
+      assert.strictEqual(allItems[0].id, 'vault-cached-1', 'Newest item should be sorted first');
+
+      await renderVaultList();
+
+      assert.strictEqual(elements.get('vaultBadge').classList.contains('hidden'), false);
+      assert.strictEqual(elements.get('vaultBadge').textContent, '2');
+      assert.strictEqual(elements.get('vaultStorageSummary').textContent, '2 saved • 5.0 MB cached offline');
+
+      const html = elements.get('vaultList').innerHTML;
+      assert.ok(html.includes('&lt;script&gt;'), 'Vault item title must be XSS-escaped');
+      assert.ok(html.includes('✅ Offline 5.0 MB'), 'Cached item should show offline size badge');
+      assert.ok(html.includes('▶ Watch (Offline)'), 'Cached item should show Watch (Offline) label');
+      assert.ok(html.includes('☁️ Cache Offline'), 'Link-only item should show Cache Offline button');
+
+      // Delete one item and verify count updates
+      await deleteVaultVideoDB('vault-link-2');
+      await renderVaultList();
+      assert.strictEqual(elements.get('vaultBadge').textContent, '1');
+
+      // Clear Vault and verify empty state returns
+      await clearVaultDB();
+      await renderVaultList();
+      assert.strictEqual(elements.get('vaultBadge').classList.contains('hidden'), true);
+      assert.strictEqual(elements.get('vaultStorageSummary').textContent, '0 videos saved');
+    });
+  });
+
+  describe('UI: iPhone Share Sheet & Download Flow (downloadVideoToIphone)', () => {
+    it('should sanitize filename slug and invoke iOS navigator.share with a valid File object', async () => {
+      const { elements } = createMockDom();
+      let sharedPayload = null;
+
+      Object.defineProperty(globalThis, 'navigator', {
+        value: {
+          canShare: () => true,
+          share: async (data) => {
+            sharedPayload = data;
+          }
+        },
+        configurable: true,
+        writable: true
+      });
+
+      const item = {
+        id: 'dl-1',
+        title: 'Apollo 11: Launch & Landing! (1969)',
+        videoUrl: 'https://archive.org/download/apollo.mp4',
+        offlineBlob: new Blob(['mp4-bytes'], { type: 'video/mp4' }),
+        offlineExt: 'mp4',
+        offlineMime: 'video/mp4'
+      };
+
+      await downloadVideoToIphone(item);
+
+      assert.ok(sharedPayload, 'navigator.share should have been called');
+      assert.strictEqual(sharedPayload.files.length, 1);
+      assert.strictEqual(sharedPayload.files[0].name, 'apollo-11-launch-landing-1969.mp4');
+      assert.strictEqual(sharedPayload.files[0].type, 'video/mp4');
+      assert.strictEqual(elements.get('downloadStatusPercent').textContent, '100%');
+      assert.strictEqual(elements.get('saveToPhoneBtn').disabled, false);
+      assert.ok(elements.get('toast').textContent.includes('Save Video'));
+    });
+
+    it('should gracefully handle user cancelling the iOS Share Sheet (AbortError)', async () => {
+      const { elements } = createMockDom();
+
+      Object.defineProperty(globalThis, 'navigator', {
+        value: {
+          canShare: () => true,
+          share: async () => {
+            const abortErr = new Error('User cancelled share');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
+        },
+        configurable: true,
+        writable: true
+      });
+
+      const item = {
+        id: 'dl-2',
+        title: 'Cancel Test Video',
+        offlineBlob: new Blob(['mp4-bytes'], { type: 'video/mp4' })
+      };
+
+      await downloadVideoToIphone(item);
+
+      assert.strictEqual(elements.get('toast').textContent, 'Share menu closed');
+      assert.strictEqual(elements.get('saveToPhoneBtn').disabled, false);
+    });
+  });
+
+  describe('State Persistence & Corruption Recovery (loadState, saveSources, saveSettings)', () => {
+    function setupMockLocalStorage(initial = {}) {
+      const store = new Map(Object.entries(initial));
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+      return store;
+    }
+
+    it('should recover cleanly from corrupted JSON in localStorage and fallback to DEFAULT_SOURCES', () => {
+      createMockDom();
+      setupMockLocalStorage({
+        [STORAGE_KEYS.SOURCES]: '{corrupted-json-data',
+        [STORAGE_KEYS.SETTINGS]: '{bad-settings-json'
+      });
+
+      assert.doesNotThrow(() => {
+        loadState();
+      });
+
+      const state = getAppState();
+      assert.strictEqual(state.sources.length, DEFAULT_SOURCES.length);
+      assert.strictEqual(state.sources[0].id, DEFAULT_SOURCES[0].id);
+    });
+
+    it('should persist custom sources and settings to localStorage and refresh header summary', () => {
+      const { elements } = createMockDom();
+      const store = setupMockLocalStorage();
+      const origMode = settings.formatMode;
+
+      setAppState({
+        sources: [
+          { id: 'custom-1', type: 'keyword', value: 'cyberpunk', label: 'Cyberpunk', enabled: true }
+        ]
+      });
+      settings.formatMode = 'native';
+
+      saveSources();
+      saveSettings();
+
+      const savedSources = JSON.parse(store.get(STORAGE_KEYS.SOURCES));
+      const savedSettings = JSON.parse(store.get(STORAGE_KEYS.SETTINGS));
+
+      assert.strictEqual(savedSources.length, 1);
+      assert.strictEqual(savedSources[0].value, 'cyberpunk');
+      assert.strictEqual(savedSettings.formatMode, 'native');
+      assert.strictEqual(elements.get('activeSourceSummary').textContent, '1 source • iPhone native formats');
+
+      settings.formatMode = origMode;
+    });
+  });
+
+  describe('Safari Bookmarklet & Deep-Link Parameters (initBookmarkletAndUrlParams)', () => {
+    it('should generate Safari bookmarklet code and auto-scan when ?scan= parameter is present', async () => {
+      const { elements, tabViews } = createMockDom();
+
+      globalThis.window = {
+        location: {
+          origin: 'https://davidscottballard1-png.github.io',
+          pathname: '/my-project-2/',
+          search: '?scan=https%3A%2F%2Fexample.com%2Fsample-clip.mp4'
+        }
+      };
+
+      initBookmarkletAndUrlParams();
+
+      const bookmarkletVal = elements.get('bookmarkletCodeInput').value;
+      assert.ok(bookmarkletVal.startsWith('javascript:(function(){'));
+      assert.ok(bookmarkletVal.includes('https://davidscottballard1-png.github.io/my-project-2/?scan='));
+
+      // Verify ?scan= switched to Search tab and populated the URL input
+      assert.strictEqual(tabViews[1].classList.contains('active'), true, 'Search tab should be activated');
+      assert.strictEqual(elements.get('urlScanInput').value, 'https://example.com/sample-clip.mp4');
+
+      // Wait a microtask tick for scanUrlForVideos promise resolution on direct .mp4 URL
+      await new Promise((r) => setTimeout(r, 10));
+      assert.strictEqual(elements.get('searchResultsCount').textContent, '1 video');
+      assert.ok(elements.get('searchResultsList').innerHTML.includes('sample-clip.mp4'));
     });
   });
 });
