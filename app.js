@@ -2164,7 +2164,7 @@ function syncAgeGateUI() {
 
   // Remove/hide purely safe video engine options when 18+ mode is On, and hide 18+-only engines in Safe Mode
   if (typeof document !== 'undefined') {
-    const safeEngineIds = ['engPrelinger', 'engWikimedia', 'engNasa'];
+    const safeEngineIds = ['engArchive', 'engPrelinger', 'engWikimedia', 'engNasa', 'engFediverse'];
     for (const id of safeEngineIds) {
       const el = document.getElementById(id);
       if (el) {
@@ -3911,9 +3911,7 @@ async function pullFromSource(source) {
         searchFreeTubeSites(source.value, 5),
         searchOpenWebVideos(source.value, 5),
         searchRedditVideosByKeyword(source.value),
-        searchInternetArchive(source.value, 5),
-        searchPeerTubeVideos(source.value, 4),
-        searchFediverseVideos(source.value)
+        searchPeerTubeVideos(source.value, 4)
       ]
     : [
         searchWikimediaVideos(source.value, 5),
@@ -5602,14 +5600,12 @@ if (typeof document !== 'undefined') {
     if (/^https?:\/\//i.test(query)) {
       tasks.push(scanUrlForVideos(query, 'Scanned Link'));
     } else if (settings.allowNsfw) {
-      // 18+ Only Mode: exclude purely safe engines (Prelinger, Wikimedia, NASA)
+      // 18+ Only Mode: exclude safe engines (Archive.org, Prelinger, Wikimedia, NASA, Fediverse)
       if (useRedgifs !== false) tasks.push(searchRedgifsVideos(query, 6));
       if (useTubeSites !== false) tasks.push(searchFreeTubeSites(query, 6));
       if (useOpenWeb !== false || useTubeSites !== false) tasks.push(searchOpenWebVideos(query, 6));
       if (useReddit !== false) tasks.push(searchRedditVideosByKeyword(query));
-      if (useArchive) tasks.push(searchInternetArchive(query, 6));
       if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
-      if (useFediverse) tasks.push(searchFediverseVideos(query));
     } else {
       if (useArchive) tasks.push(searchInternetArchive(query, 6));
       if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));

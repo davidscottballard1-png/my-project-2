@@ -742,6 +742,16 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         css.includes('@media (min-width: 768px) and (min-height: 581px) and (max-height: 820px)'),
         'styles.css should include compact vertical spacing for tablet landscape with browser toolbars (581px–820px) so the top search bar is never clipped'
       );
+      assert.match(
+        css,
+        /\.vli-header\s*\{[^}]*flex-direction:\s*column/s,
+        '.vli-header should stack vertically so .vli-badges never crushes .vli-title into a 1-character vertical column'
+      );
+      assert.match(
+        css,
+        /\.vli-title\s*\{[^}]*width:\s*100%/s,
+        '.vli-title should span 100% card width horizontally'
+      );
     });
 
     it('should prefer Archive.org H.264 .ia.mp4 web derivative for iOS playback and skip private/restricted items', async () => {
