@@ -74,12 +74,16 @@
           <!-- Video Info & Controls -->
           <div class="video-meta">
             <div class="meta-top">
-              <span class="source-badge" id="videoSourceBadge">Ready</span>
+              <div class="badge-group">
+                <span class="source-badge" id="videoSourceBadge">Ready</span>
+                <span class="format-badge hidden" id="videoFormatBadge">MP4</span>
+              </div>
               <span class="queue-counter" id="queueCounter">0 in queue</span>
             </div>
             <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
             <div class="meta-links">
               <a id="videoOriginalLink" href="#" target="_blank" rel="noopener noreferrer" class="hidden">View Source Page ↗</a>
+              <button type="button" id="convertNowBtn" class="btn-inline-convert hidden">🔄 Auto-Convert to .MP4</button>
             </div>
           </div>
 
@@ -129,7 +133,7 @@
         <div class="card-section">
           <h2>🌐 Multi-Engine Video Search</h2>
           <p class="section-desc">
-            Search any keyword or topic across multiple open video networks at once and pull direct <code>.mp4</code> videos.
+            Search any keyword across open video networks and pull iPhone-ready videos (<code>.mp4</code>, <code>.mov</code>, <code>.m4v</code>, <code>.3gp</code>, <code>.m3u8</code>) plus web formats (<code>.webm</code>, <code>.ogv</code>, <code>.mkv</code>, <code>.avi</code>, <code>.mpeg</code>, <code>.flv</code>, <code>.wmv</code>, <code>.gifv</code>) with automatic iPhone conversion.
           </p>
           <form id="deepSearchForm" class="stack-form">
             <input
@@ -157,18 +161,18 @@
         </div>
 
         <div class="card-section">
-          <h2>🔗 Webpage <code>.mp4</code> Scanner</h2>
+          <h2>🔗 Multi-Format Webpage Video Scanner</h2>
           <p class="section-desc">
-            Paste a link to a webpage or direct video URL. ReelVault will scan the page for downloadable <code>.mp4</code> / <code>.webm</code> video files.
+            Paste any webpage or direct video link. ReelVault scans for all video extensions (<code>.mp4</code>, <code>.mov</code>, <code>.m4v</code>, <code>.webm</code>, <code>.ogv</code>, <code>.mkv</code>, <code>.avi</code>, <code>.mpeg</code>, <code>.3gp</code>, <code>.flv</code>, <code>.wmv</code>, <code>.ts</code>, <code>.m3u8</code>, <code>.gifv</code>) and auto-converts non-native formats for iPhone.
           </p>
           <form id="urlScanForm" class="stack-form">
             <input
               type="url"
               id="urlScanInput"
-              placeholder="https://example.com/page-with-video"
+              placeholder="https://example.com/page-with-videos"
               required
             />
-            <button type="submit" class="btn-primary">📡 Scan Page for Videos</button>
+            <button type="submit" class="btn-primary">📡 Scan Page for All Video Formats</button>
           </form>
         </div>
 
@@ -236,7 +240,28 @@
         </div>
 
         <div class="card-section">
-          <h2>⚙️ Search &amp; Privacy Settings</h2>
+          <h2>⚙️ Formats, Conversion &amp; Privacy Settings</h2>
+          <div class="setting-row">
+            <div>
+              <strong>Pulled Video File Extensions</strong>
+              <p class="setting-sub">Choose whether to pull all web video formats (with auto-conversion) or only native iPhone formats.</p>
+            </div>
+            <select id="formatModeSelect" class="setting-select" aria-label="Pulled Video File Extensions">
+              <option value="all">All Formats + Auto-Convert (.mp4, .mov, .m4v, .webm, .ogv, .mkv, .avi, .mpeg, .3gp, .flv, .wmv, .gifv)</option>
+              <option value="native">iPhone Native Only (.mp4, .mov, .m4v, .3gp, .webm, .m3u8)</option>
+              <option value="mp4">Strict .MP4 Only</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div>
+              <strong>Auto-Convert Non-MP4 Videos for iPhone</strong>
+              <p class="setting-sub">Automatically convert or transcode <code>.webm</code>, <code>.ogv</code>, <code>.mkv</code>, <code>.avi</code>, <code>.mpeg</code>, <code>.flv</code>, <code>.wmv</code>, and <code>.gifv</code> into iPhone-compatible <code>.mp4</code> for playback &amp; Camera Roll saving.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="autoConvertToggle" checked />
+              <span class="slider"></span>
+            </label>
+          </div>
           <div class="setting-row">
             <div>
               <strong>Include 18+ Results in Custom Searches</strong>

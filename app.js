@@ -1,9 +1,37 @@
-// ReelVault — iPhone Random Video Discovery, Multi-Engine Search & Downloader PWA
+// ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter & Downloader PWA
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
   SETTINGS: 'reelvault_settings_v1'
 };
+
+// Comprehensive catalog of video extensions across the internet:
+// - iphoneNative: Plays directly in iPhone Safari <video>
+// - photosNative: Accepted directly by iOS Share Sheet -> "Save Video" (Camera Roll) without conversion
+const VIDEO_FORMAT_CATALOG = {
+  mp4:  { ext: 'mp4',  mime: 'video/mp4',                      iphoneNative: true,  photosNative: true,  label: 'MP4' },
+  mov:  { ext: 'mov',  mime: 'video/quicktime',                iphoneNative: true,  photosNative: true,  label: 'MOV' },
+  m4v:  { ext: 'm4v',  mime: 'video/x-m4v',                    iphoneNative: true,  photosNative: true,  label: 'M4V' },
+  '3gp':{ ext: '3gp',  mime: 'video/3gpp',                     iphoneNative: true,  photosNative: false, label: '3GP' },
+  '3g2':{ ext: '3g2',  mime: 'video/3gpp2',                    iphoneNative: true,  photosNative: false, label: '3G2' },
+  m3u8: { ext: 'm3u8', mime: 'application/vnd.apple.mpegurl',  iphoneNative: true,  photosNative: false, label: 'M3U8' },
+  webm: { ext: 'webm', mime: 'video/webm',                     iphoneNative: true,  photosNative: false, label: 'WEBM' },
+  ogv:  { ext: 'ogv',  mime: 'video/ogg',                      iphoneNative: false, photosNative: false, label: 'OGV' },
+  ogg:  { ext: 'ogg',  mime: 'video/ogg',                      iphoneNative: false, photosNative: false, label: 'OGG' },
+  mkv:  { ext: 'mkv',  mime: 'video/x-matroska',               iphoneNative: false, photosNative: false, label: 'MKV' },
+  avi:  { ext: 'avi',  mime: 'video/x-msvideo',                iphoneNative: false, photosNative: false, label: 'AVI' },
+  mpeg: { ext: 'mpeg', mime: 'video/mpeg',                     iphoneNative: false, photosNative: false, label: 'MPEG' },
+  mpg:  { ext: 'mpg',  mime: 'video/mpeg',                     iphoneNative: false, photosNative: false, label: 'MPG' },
+  flv:  { ext: 'flv',  mime: 'video/x-flv',                    iphoneNative: false, photosNative: false, label: 'FLV' },
+  f4v:  { ext: 'f4v',  mime: 'video/mp4',                      iphoneNative: false, photosNative: false, label: 'F4V' },
+  wmv:  { ext: 'wmv',  mime: 'video/x-ms-wmv',                 iphoneNative: false, photosNative: false, label: 'WMV' },
+  ts:   { ext: 'ts',   mime: 'video/mp2t',                     iphoneNative: false, photosNative: false, label: 'TS' },
+  m2ts: { ext: 'm2ts', mime: 'video/mp2t',                     iphoneNative: false, photosNative: false, label: 'M2TS' },
+  gifv: { ext: 'gifv', mime: 'video/mp4',                      iphoneNative: true,  photosNative: true,  label: 'GIFV→MP4' }
+};
+
+const ALL_VIDEO_EXTENSIONS = Object.keys(VIDEO_FORMAT_CATALOG);
+const VIDEO_EXT_REGEX_PATTERN = ALL_VIDEO_EXTENSIONS.join('|');
 
 const DEFAULT_SOURCES = [
   {
@@ -56,12 +84,13 @@ const DEFAULT_SOURCES = [
   }
 ];
 
-// Reliable public-domain / CC0 direct .mp4 fallback clips so the player never fails offline/rate-limited
+// Reliable public-domain / CC0 fallback clips across multiple formats so the player never fails offline/rate-limited
 const FALLBACK_VIDEOS = [
   {
     id: 'fb-apollo11',
     title: 'Apollo 11 Saturn V Launch (NASA Archive)',
     videoUrl: 'https://archive.org/download/Apollo11Audio/Apollo11Launch.mp4',
+    format: 'mp4',
     sourceName: 'Internet Archive (NASA)',
     pageUrl: 'https://archive.org/details/Apollo11Audio'
   },
@@ -69,6 +98,7 @@ const FALLBACK_VIDEOS = [
     id: 'fb-bigbuck',
     title: 'Big Buck Bunny — Open Movie Short Clip',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
+    format: 'mp4',
     sourceName: 'Open Movie Archive',
     pageUrl: 'https://peach.blender.org/'
   },
@@ -76,6 +106,7 @@ const FALLBACK_VIDEOS = [
     id: 'fb-forbiggerblazes',
     title: 'High Speed Nature & Fire Reel',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    format: 'mp4',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   },
@@ -83,6 +114,7 @@ const FALLBACK_VIDEOS = [
     id: 'fb-forbiggerescapes',
     title: 'Scenic Mountain & Alpine Escape Reel',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
+    format: 'mp4',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   },
@@ -90,6 +122,7 @@ const FALLBACK_VIDEOS = [
     id: 'fb-wearegoingonbullrun',
     title: 'Rally & Roadtrip Action Clip',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4',
+    format: 'mp4',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   }
@@ -99,14 +132,517 @@ const FALLBACK_VIDEOS = [
 let sources = [];
 let settings = {
   allowNsfw: false,
-  autoPlay: true
+  autoPlay: true,
+  formatMode: 'all', // 'all' | 'native' | 'mp4'
+  autoConvert: true
 };
 let videoQueue = [];
 let currentIndex = -1;
 let seenUrls = new Set();
 let lastSearchResults = [];
 
-// IndexedDB for Vault
+// ==========================================
+// FORMAT DETECTION & AUTO-CONVERSION HELPERS
+// ==========================================
+
+function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
+  if (!urlOrName || typeof urlOrName !== 'string') {
+    return VIDEO_FORMAT_CATALOG[fallbackExt] || VIDEO_FORMAT_CATALOG.mp4;
+  }
+  const clean = urlOrName.split('?')[0].split('#')[0].toLowerCase();
+  const match = clean.match(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'));
+  if (match && match[1]) {
+    const ext = match[1].toLowerCase();
+    if (VIDEO_FORMAT_CATALOG[ext]) {
+      return VIDEO_FORMAT_CATALOG[ext];
+    }
+  }
+  return VIDEO_FORMAT_CATALOG[fallbackExt] || VIDEO_FORMAT_CATALOG.mp4;
+}
+
+function isFormatAllowedBySettings(ext) {
+  const cleanExt = (ext || 'mp4').toLowerCase().replace(/^\./, '');
+  const info = VIDEO_FORMAT_CATALOG[cleanExt];
+  if (!info) return false;
+
+  if (settings.formatMode === 'mp4') {
+    return cleanExt === 'mp4' || cleanExt === 'gifv';
+  }
+  if (settings.formatMode === 'native') {
+    return Boolean(info.iphoneNative);
+  }
+  return true; // 'all' allows all supported extensions
+}
+
+function normalizeAndAutoRewriteVideoUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  const cleaned = rawUrl.replace(/&amp;/g, '&').trim();
+  const fmtInfo = detectVideoFormat(cleaned);
+
+  // Auto-convert .gifv (Imgur / web GIF-video wrappers) directly into .mp4
+  if (fmtInfo.ext === 'gifv') {
+    const mp4Url = cleaned.replace(/\.gifv(\?.*)?$/i, '.mp4$1');
+    return {
+      videoUrl: mp4Url,
+      originalUrl: cleaned,
+      convertedUrl: mp4Url,
+      format: 'gifv',
+      isAutoConverted: true
+    };
+  }
+
+  return {
+    videoUrl: cleaned,
+    originalUrl: cleaned,
+    convertedUrl: null,
+    format: fmtInfo.ext,
+    isAutoConverted: false
+  };
+}
+
+function getFormatBadgeInfo(videoItem) {
+  if (!videoItem) {
+    return { text: 'MP4', className: 'format-badge hidden' };
+  }
+  const ext = (videoItem.format || detectVideoFormat(videoItem.originalUrl || videoItem.videoUrl).ext).toLowerCase();
+  const info = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+
+  if (videoItem.convertedBlobUrl || videoItem.isAutoConverted || ext === 'gifv') {
+    const srcLabel = ext === 'gifv' ? 'GIFV' : info.label;
+    return {
+      text: `${srcLabel} → MP4 ✓`,
+      className: 'format-badge converted'
+    };
+  }
+
+  if (videoItem.convertedUrl && !info.photosNative && settings.autoConvert) {
+    return {
+      text: `${info.label} → MP4`,
+      className: 'format-badge converted'
+    };
+  }
+
+  if (info.photosNative) {
+    return {
+      text: `${info.label} • iPhone Native`,
+      className: 'format-badge'
+    };
+  }
+
+  if (info.iphoneNative) {
+    return {
+      text: settings.autoConvert ? `${info.label} • Auto-MP4` : `${info.label} • Stream`,
+      className: 'format-badge convert'
+    };
+  }
+
+  return {
+    text: `${info.label} • Auto-Convert`,
+    className: 'format-badge convert'
+  };
+}
+
+function needsMp4Conversion(videoItem) {
+  if (!videoItem) return false;
+  if (videoItem.convertedBlobUrl) return false;
+  const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
+  const info = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+  return !info.photosNative;
+}
+
+// ==========================================
+// ON-DEVICE VIDEO AUTO-CONVERTER ENGINE
+// (Derivative Resolution -> FFmpeg.wasm -> Native iOS MediaRecorder)
+// ==========================================
+
+let ffmpegInstance = null;
+let ffmpegLoadingPromise = null;
+
+async function loadFfmpegConverter(onStatus) {
+  if (ffmpegInstance) return ffmpegInstance;
+  if (ffmpegLoadingPromise) return ffmpegLoadingPromise;
+
+  ffmpegLoadingPromise = (async () => {
+    if (onStatus) onStatus('Loading auto-converter engine...');
+    // Load @ffmpeg/ffmpeg & @ffmpeg/util UMD scripts from jsDelivr CDN
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js');
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js');
+
+    const FFmpegWasm = window.FFmpegWASM?.FFmpeg;
+    const toBlobURL = window.FFmpegUtil?.toBlobURL;
+    if (!FFmpegWasm || !toBlobURL) {
+      throw new Error('FFmpeg UMD globals not available');
+    }
+
+    const ffmpeg = new FFmpegWasm();
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    const workerURL = await toBlobURL(
+      'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js',
+      'text/javascript'
+    );
+    const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
+    const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+
+    await ffmpeg.load({ coreURL, wasmURL, classWorkerURL: workerURL });
+    ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+
+  try {
+    return await ffmpegLoadingPromise;
+  } catch (err) {
+    ffmpegLoadingPromise = null;
+    throw err;
+  }
+}
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === 'true') return resolve();
+      existing.addEventListener('load', () => resolve(), { once: true });
+      existing.addEventListener('error', () => reject(new Error(`Failed to load ${src}`)), { once: true });
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.crossOrigin = 'anonymous';
+    script.onload = () => {
+      script.dataset.loaded = 'true';
+      resolve();
+    };
+    script.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+// Convert a downloaded video Blob into an iPhone-native .mp4 Blob using FFmpeg.wasm
+async function transcodeBlobWithFfmpegWasm(sourceBlob, inputExt, onProgress) {
+  const ffmpeg = await loadFfmpegConverter((msg) => onProgress?.(msg, 15));
+  const safeExt = (inputExt || 'webm').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'webm';
+  const inputName = `input_${Date.now()}.${safeExt}`;
+  const outputName = `output_${Date.now()}.mp4`;
+
+  const progressHandler = ({ progress }) => {
+    if (typeof progress === 'number' && isFinite(progress)) {
+      const pct = Math.min(98, Math.max(20, Math.round(20 + progress * 78)));
+      onProgress?.(`Auto-converting .${safeExt.toUpperCase()} to iPhone .MP4...`, pct);
+    }
+  };
+
+  ffmpeg.on('progress', progressHandler);
+
+  try {
+    const uint8 = new Uint8Array(await sourceBlob.arrayBuffer());
+    await ffmpeg.writeFile(inputName, uint8);
+
+    // Try fast container stream copy first (instant for MKV/MOV/TS/FLV/AVI containing H.264)
+    let remuxSucceeded = false;
+    if (['mkv', 'mov', 'm4v', 'ts', 'm2ts', 'flv', 'f4v', 'avi'].includes(safeExt)) {
+      onProgress?.(`Remuxing .${safeExt.toUpperCase()} container to .MP4...`, 35);
+      const copyExitCode = await ffmpeg.exec([
+        '-i', inputName,
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        outputName
+      ]);
+      if (copyExitCode === 0) {
+        try {
+          const copiedData = await ffmpeg.readFile(outputName);
+          if (copiedData && copiedData.byteLength > 1024) {
+            remuxSucceeded = true;
+            return new Blob([copiedData.buffer], { type: 'video/mp4' });
+          }
+        } catch {
+          remuxSucceeded = false;
+        }
+      }
+    }
+
+    // Full transcode to iPhone-compatible MP4 (MPEG-4 / H.264 + AAC with yuv420p)
+    if (!remuxSucceeded) {
+      onProgress?.(`Transcoding .${safeExt.toUpperCase()} to iPhone .MP4...`, 25);
+      const exitCode = await ffmpeg.exec([
+        '-i', inputName,
+        '-c:v', 'mpeg4',
+        '-q:v', '5',
+        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        outputName
+      ]);
+      if (exitCode !== 0) {
+        throw new Error(`FFmpeg transcode exited with code ${exitCode}`);
+      }
+      const data = await ffmpeg.readFile(outputName);
+      if (!data || data.byteLength < 512) {
+        throw new Error('FFmpeg produced empty output');
+      }
+      return new Blob([data.buffer], { type: 'video/mp4' });
+    }
+  } finally {
+    ffmpeg.off('progress', progressHandler);
+    try { await ffmpeg.deleteFile(inputName); } catch {}
+    try { await ffmpeg.deleteFile(outputName); } catch {}
+  }
+}
+
+// Native iOS Safari Hardware MediaRecorder('video/mp4') fallback converter
+async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
+  if (typeof MediaRecorder === 'undefined') {
+    throw new Error('MediaRecorder not supported');
+  }
+
+  const supportedMp4Type = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1',
+    'video/mp4',
+    'video/quicktime'
+  ].find((t) => MediaRecorder.isTypeSupported(t));
+
+  if (!supportedMp4Type) {
+    throw new Error('Native video/mp4 MediaRecorder not supported on this browser');
+  }
+
+  return new Promise((resolve, reject) => {
+    const srcUrl = URL.createObjectURL(sourceBlob);
+    const tempVideo = document.createElement('video');
+    tempVideo.muted = true;
+    tempVideo.playsInline = true;
+    tempVideo.preload = 'auto';
+    tempVideo.src = srcUrl;
+
+    const cleanup = () => {
+      try {
+        tempVideo.pause();
+        tempVideo.removeAttribute('src');
+        tempVideo.load();
+      } catch {}
+      URL.revokeObjectURL(srcUrl);
+    };
+
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Hardware conversion timed out'));
+    }, 45000);
+
+    tempVideo.onerror = () => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(new Error('Browser could not decode source video for MediaRecorder'));
+    };
+
+    tempVideo.onloadedmetadata = async () => {
+      try {
+        const width = Math.min(1280, tempVideo.videoWidth || 640);
+        const height = Math.min(720, tempVideo.videoHeight || 360);
+        const canvas = document.createElement('canvas');
+        canvas.width = width % 2 === 0 ? width : width - 1;
+        canvas.height = height % 2 === 0 ? height : height - 1;
+        const ctx = canvas.getContext('2d');
+
+        const stream = canvas.captureStream ? canvas.captureStream(30) : null;
+        if (!stream) {
+          throw new Error('Canvas captureStream unavailable');
+        }
+
+        const chunks = [];
+        const recorder = new MediaRecorder(stream, {
+          mimeType: supportedMp4Type,
+          videoBitsPerSecond: 2_500_000
+        });
+
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) chunks.push(e.data);
+        };
+
+        recorder.onstop = () => {
+          clearTimeout(timeout);
+          cleanup();
+          if (chunks.length === 0) {
+            reject(new Error('No data recorded'));
+            return;
+          }
+          resolve(new Blob(chunks, { type: 'video/mp4' }));
+        };
+
+        const drawFrame = () => {
+          if (!tempVideo.paused && !tempVideo.ended) {
+            ctx.drawImage(tempVideo, 0, 0, canvas.width, canvas.height);
+            if (tempVideo.duration && isFinite(tempVideo.duration)) {
+              const pct = Math.min(98, Math.round((tempVideo.currentTime / tempVideo.duration) * 100));
+              onProgress?.('Hardware converting to iPhone .MP4...', pct);
+            }
+            requestAnimationFrame(drawFrame);
+          }
+        };
+
+        tempVideo.onended = () => {
+          if (recorder.state !== 'inactive') recorder.stop();
+        };
+
+        recorder.start(250);
+        await tempVideo.play();
+        drawFrame();
+      } catch (err) {
+        clearTimeout(timeout);
+        cleanup();
+        reject(err);
+      }
+    };
+  });
+}
+
+// Fetch video bytes with CORS proxy fallback and live progress
+async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progressLabel = 'Downloading video...') {
+  let response = null;
+  const candidateUrls = [
+    targetUrl,
+    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
+  ];
+
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        response = res;
+        break;
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+
+  if (!response) {
+    throw new Error('Direct stream requires browser fallback');
+  }
+
+  const contentLength = Number(response.headers.get('content-length')) || 0;
+  const reader = response.body?.getReader();
+
+  if (reader) {
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (contentLength > 0) {
+        const pct = Math.min(99, Math.round((received / contentLength) * 100));
+        onProgress?.(progressLabel, pct, `${pct}%`);
+      } else {
+        const mb = (received / (1024 * 1024)).toFixed(1);
+        onProgress?.(progressLabel, 65, `${mb} MB`);
+      }
+    }
+    return new Blob(chunks, { type: mimeType || 'video/mp4' });
+  }
+
+  const blob = await response.blob();
+  return new Blob([blob], { type: mimeType || blob.type || 'video/mp4' });
+}
+
+// Unified pipeline: takes any videoItem and returns { blob, ext, mime, wasConverted } ready for iPhone
+async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false, onProgress = null) {
+  const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
+  const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+  const shouldConvert = forceMp4Conversion || (settings.autoConvert && !fmtInfo.photosNative);
+
+  // 1. If already converted on-device in this session, reuse the cached MP4 blob
+  if (videoItem.convertedBlob instanceof Blob) {
+    onProgress?.('Ready (.MP4 converted)', 100, '100%');
+    return {
+      blob: videoItem.convertedBlob,
+      ext: 'mp4',
+      mime: 'video/mp4',
+      wasConverted: true
+    };
+  }
+
+  // 2. If a server-transcoded .mp4 derivative URL is available (Archive.org / Wikimedia / Reddit / Imgur .gifv)
+  if (shouldConvert && videoItem.convertedUrl) {
+    try {
+      const mp4Blob = await fetchVideoBlobWithProgress(
+        videoItem.convertedUrl,
+        'video/mp4',
+        onProgress,
+        `Pulling auto-converted .MP4 (from .${fmtInfo.label})...`
+      );
+      videoItem.convertedBlob = mp4Blob;
+      videoItem.convertedBlobUrl = URL.createObjectURL(mp4Blob);
+      return {
+        blob: mp4Blob,
+        ext: 'mp4',
+        mime: 'video/mp4',
+        wasConverted: true
+      };
+    } catch {
+      // Fall through to on-device conversion of originalUrl/videoUrl
+    }
+  }
+
+  // 3. Download the primary file
+  const rawBlob = await fetchVideoBlobWithProgress(
+    videoItem.videoUrl,
+    fmtInfo.mime,
+    onProgress,
+    `Downloading .${fmtInfo.label} video...`
+  );
+
+  if (!shouldConvert) {
+    return {
+      blob: rawBlob,
+      ext: fmtInfo.ext === 'gifv' ? 'mp4' : fmtInfo.ext,
+      mime: fmtInfo.mime,
+      wasConverted: false
+    };
+  }
+
+  // 4. On-device conversion to .mp4 (FFmpeg.wasm -> Native iOS MediaRecorder fallback)
+  let mp4Blob = null;
+  try {
+    mp4Blob = await transcodeBlobWithFfmpegWasm(rawBlob, fmtInfo.ext, (msg, pct) => {
+      onProgress?.(msg, pct, `${pct}%`);
+    });
+  } catch {
+    try {
+      mp4Blob = await transcodeBlobWithMediaRecorder(rawBlob, (msg, pct) => {
+        onProgress?.(msg, pct, `${pct}%`);
+      });
+    } catch {
+      mp4Blob = null;
+    }
+  }
+
+  if (mp4Blob) {
+    videoItem.convertedBlob = mp4Blob;
+    videoItem.convertedBlobUrl = URL.createObjectURL(mp4Blob);
+    return {
+      blob: mp4Blob,
+      ext: 'mp4',
+      mime: 'video/mp4',
+      wasConverted: true
+    };
+  }
+
+  // 5. Graceful fallback: if on-device transcode wasn't possible, return original or MP4-wrapped blob
+  return {
+    blob: rawBlob,
+    ext: fmtInfo.iphoneNative ? fmtInfo.ext : 'mp4',
+    mime: fmtInfo.iphoneNative ? fmtInfo.mime : 'video/mp4',
+    wasConverted: false
+  };
+}
+
+// ==========================================
+// INDEXEDDB VAULT
+// ==========================================
+
 const DB_NAME = 'ReelVaultDB';
 const DB_VERSION = 1;
 const VAULT_STORE = 'vault_videos';
@@ -145,9 +681,13 @@ async function saveVideoToVaultDB(videoItem) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(VAULT_STORE, 'readwrite');
     const store = tx.objectStore(VAULT_STORE);
+    // Avoid storing ephemeral blob URLs in IndexedDB
+    const copy = { ...videoItem };
+    delete copy.convertedBlob;
+    delete copy.convertedBlobUrl;
     const record = {
-      ...videoItem,
-      id: videoItem.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+      ...copy,
+      id: copy.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
       savedAt: Date.now()
     };
     const req = store.put(record);
@@ -208,6 +748,7 @@ function saveSources() {
 
 function saveSettings() {
   localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+  updateHeaderSummary();
 }
 
 // UI Helpers
@@ -227,7 +768,13 @@ function updateHeaderSummary() {
   const enabledCount = sources.filter((s) => s.enabled).length;
   const el = document.getElementById('activeSourceSummary');
   if (el) {
-    el.textContent = `${enabledCount} active source${enabledCount === 1 ? '' : 's'} ready`;
+    const modeLabel =
+      settings.formatMode === 'mp4'
+        ? '.mp4 only'
+        : settings.formatMode === 'native'
+        ? 'iPhone native formats'
+        : 'All formats + Auto-Convert';
+    el.textContent = `${enabledCount} source${enabledCount === 1 ? '' : 's'} • ${modeLabel}`;
   }
 }
 
@@ -256,10 +803,17 @@ async function fetchWithCorsFallback(url, asText = false) {
 }
 
 // ==========================================
-// VIDEO DISCOVERY ENGINES
+// MULTI-FORMAT VIDEO DISCOVERY ENGINES
 // ==========================================
 
-// 1. Internet Archive Engine (Native CORS support + direct .mp4 files)
+function encodeArchiveFilePath(fileName) {
+  return String(fileName || '')
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+}
+
+// 1. Internet Archive Engine (Supports .mp4, .mov, .m4v, .webm, .ogv, .mkv, .avi, .mpeg, .mpg, .3gp, .flv, .wmv + auto-derivative pairing)
 async function searchInternetArchive(keyword, limit = 12) {
   const safeQuery = keyword.replace(/["()]/g, ' ').trim();
   const nsfwFilter = settings.allowNsfw ? '' : ' AND NOT collection:(adult)';
@@ -276,7 +830,7 @@ async function searchInternetArchive(keyword, limit = 12) {
   const docs = data?.response?.docs || [];
   if (!docs.length) return [];
 
-  // Shuffle docs and inspect metadata of up to 5 items in parallel to get direct .mp4 links
+  // Shuffle docs and inspect metadata of up to 6 items in parallel
   const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(6, limit));
   const results = [];
 
@@ -287,32 +841,64 @@ async function searchInternetArchive(keyword, limit = 12) {
         if (!metaRes.ok) return;
         const meta = await metaRes.json();
         const files = meta?.files || [];
-        // Find a direct .mp4 file (prefer reasonable size < 80MB if size is listed)
-        const mp4Files = files.filter(
-          (f) =>
-            f.name &&
-            f.name.toLowerCase().endsWith('.mp4') &&
-            !f.name.toLowerCase().includes('.ia.mp4')
-        );
-        const chosen =
-          mp4Files.find((f) => f.size && Number(f.size) < 75_000_000) ||
-          mp4Files[0] ||
-          files.find((f) => f.name && f.name.toLowerCase().endsWith('.mp4'));
 
-        if (chosen) {
-          const encodedPath = chosen.name
-            .split('/')
-            .map((part) => encodeURIComponent(part))
-            .join('/');
-          const videoUrl = `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodedPath}`;
-          results.push({
-            id: `ia-${doc.identifier}`,
-            title: doc.title || doc.identifier,
-            videoUrl,
-            sourceName: `Archive.org (${keyword})`,
-            pageUrl: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`
+        // Collect all recognized video files in the item
+        const videoFiles = files
+          .filter((f) => {
+            if (!f?.name || f.name.toLowerCase().includes('.ia.mp4')) return false;
+            const clean = f.name.toLowerCase();
+            const m = clean.match(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'));
+            if (!m) return false;
+            return isFormatAllowedBySettings(m[1]);
+          })
+          .map((f) => {
+            const fmt = detectVideoFormat(f.name);
+            return {
+              file: f,
+              ext: fmt.ext,
+              size: Number(f.size) || 0
+            };
           });
-        }
+
+        if (videoFiles.length === 0) return;
+
+        // Also locate a lightweight .mp4 derivative if present (for instant auto-conversion of .ogv/.avi/.mkv/.mpeg/.mov)
+        const mp4Candidate =
+          files.find(
+            (f) =>
+              f?.name &&
+              f.name.toLowerCase().endsWith('.mp4') &&
+              !f.name.toLowerCase().includes('.ia.mp4') &&
+              (!f.size || Number(f.size) < 90_000_000)
+          ) ||
+          files.find((f) => f?.name && f.name.toLowerCase().endsWith('.mp4'));
+
+        const mp4DerivativeUrl = mp4Candidate
+          ? `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(mp4Candidate.name)}`
+          : null;
+
+        // Filter to reasonable sizes (< 95MB when size metadata exists)
+        const sizedPool = videoFiles.filter((vf) => !vf.size || vf.size < 95_000_000);
+        const candidatePool = sizedPool.length > 0 ? sizedPool : videoFiles;
+
+        // Pick a file: in 'all' mode, allow variety across formats (.mov, .webm, .ogv, .mkv, .mp4, .avi, .mpeg)
+        const chosenEntry = candidatePool[Math.floor(Math.random() * candidatePool.length)];
+        if (!chosenEntry) return;
+
+        const chosenUrl = `https://archive.org/download/${encodeURIComponent(doc.identifier)}/${encodeArchiveFilePath(
+          chosenEntry.file.name
+        )}`;
+
+        results.push({
+          id: `ia-${doc.identifier}-${chosenEntry.ext}`,
+          title: doc.title || doc.identifier,
+          videoUrl: chosenUrl,
+          originalUrl: chosenUrl,
+          convertedUrl: chosenEntry.ext !== 'mp4' ? mp4DerivativeUrl : null,
+          format: chosenEntry.ext,
+          sourceName: `Archive.org (${keyword})`,
+          pageUrl: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`
+        });
       } catch {
         // ignore individual metadata error
       }
@@ -322,12 +908,12 @@ async function searchInternetArchive(keyword, limit = 12) {
   return results;
 }
 
-// 2. Wikimedia Commons Video Search Engine (Native CORS via origin=*)
+// 2. Wikimedia Commons Video Search Engine (Pulls .webm, .ogv, .ogg, .mpeg, .mpg, .mov, .mp4 + auto-transcoded derivatives via videoinfo API)
 async function searchWikimediaVideos(keyword, limit = 10) {
   const query = `${keyword} filetype:video`;
   const apiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
     query
-  )}&gsrnamespace=6&gsrlimit=${limit}&prop=imageinfo&iiprop=url|mime|size&format=json&origin=*`;
+  )}&gsrnamespace=6&gsrlimit=${limit}&prop=videoinfo&viprop=url|mime|size|derivatives&format=json&origin=*`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 7500);
@@ -340,29 +926,46 @@ async function searchWikimediaVideos(keyword, limit = 10) {
   const results = [];
 
   for (const page of pages) {
-    const info = page?.imageinfo?.[0];
+    const info = page?.videoinfo?.[0] || page?.imageinfo?.[0];
     if (!info || !info.url) continue;
+
+    const fmt = detectVideoFormat(info.url, 'webm');
+    if (!isFormatAllowedBySettings(fmt.ext)) continue;
+
+    // Inspect Wikimedia's pre-transcoded derivatives for an iPhone-ready MP4 or WebM stream
+    const derivatives = Array.isArray(info.derivatives) ? info.derivatives : [];
+    const mp4Deriv = derivatives.find(
+      (d) => d?.src && (d.type?.includes('mp4') || d.src.toLowerCase().endsWith('.mp4'))
+    );
+    const webmDeriv = derivatives.find(
+      (d) =>
+        d?.src &&
+        !d.src.endsWith('.ogv') &&
+        (d.type?.includes('webm') || d.src.toLowerCase().endsWith('.webm')) &&
+        Number(d.height || 0) <= 720
+    );
+
     const cleanTitle = (page.title || 'Wikimedia Video')
       .replace(/^File:/i, '')
-      .replace(/\.(webm|ogv|mp4|mov)$/i, '')
+      .replace(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'), '')
       .replace(/_/g, ' ');
 
-    // Prefer direct mp4 or webm playable stream
-    if (info.url.match(/\.(mp4|mov|m4v|webm)$/i)) {
-      results.push({
-        id: `wiki-${page.pageid}`,
-        title: cleanTitle,
-        videoUrl: info.url,
-        sourceName: `Wikimedia (${keyword})`,
-        pageUrl: info.descriptionurl || info.url
-      });
-    }
+    results.push({
+      id: `wiki-${page.pageid}`,
+      title: cleanTitle,
+      videoUrl: info.url,
+      originalUrl: info.url,
+      convertedUrl: mp4Deriv?.src || (!fmt.iphoneNative && webmDeriv?.src ? webmDeriv.src : null),
+      format: fmt.ext,
+      sourceName: `Wikimedia (${keyword})`,
+      pageUrl: info.descriptionurl || info.url
+    });
   }
 
   return results;
 }
 
-// 3. Reddit Subreddit or Global Keyword Video Search
+// 3. Reddit Subreddit or Global Keyword Video Search (Supports Reddit MP4, HLS .m3u8, GIF->MP4 variants, .gifv, .mov, .webm, .m4v, .mkv, etc.)
 function extractRedditVideosFromListing(json, sourceLabel) {
   const children = json?.data?.children || [];
   const results = [];
@@ -375,21 +978,44 @@ function extractRedditVideosFromListing(json, sourceLabel) {
     // Check crosspost parent too
     const mediaPost = post.crosspost_parent_list?.[0] || post;
 
-    let videoUrl =
+    let rawVideoUrl =
       mediaPost?.secure_media?.reddit_video?.fallback_url ||
       mediaPost?.media?.reddit_video?.fallback_url ||
       mediaPost?.preview?.reddit_video_preview?.fallback_url ||
+      mediaPost?.preview?.images?.[0]?.variants?.mp4?.source?.url ||
       null;
 
-    if (!videoUrl && typeof mediaPost.url === 'string' && mediaPost.url.match(/\.mp4(\?.*)?$/i)) {
-      videoUrl = mediaPost.url;
+    const hlsUrl =
+      mediaPost?.secure_media?.reddit_video?.hls_url ||
+      mediaPost?.media?.reddit_video?.hls_url ||
+      null;
+
+    // Check direct link to any video extension (.mp4, .mov, .m4v, .webm, .gifv, .ogv, .mkv, .avi, .3gp, .m3u8, etc.)
+    if (!rawVideoUrl && typeof mediaPost.url === 'string') {
+      const directMatch = mediaPost.url.match(
+        new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i')
+      );
+      if (directMatch) {
+        rawVideoUrl = mediaPost.url;
+      }
     }
 
-    if (videoUrl) {
+    if (!rawVideoUrl && hlsUrl && isFormatAllowedBySettings('m3u8')) {
+      rawVideoUrl = hlsUrl;
+    }
+
+    if (rawVideoUrl) {
+      const normalized = normalizeAndAutoRewriteVideoUrl(rawVideoUrl);
+      if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
+
       results.push({
         id: `rd-${post.id}`,
         title: post.title || 'Reddit Video Clip',
-        videoUrl: videoUrl.replace(/&amp;/g, '&'),
+        videoUrl: normalized.videoUrl,
+        originalUrl: normalized.originalUrl,
+        convertedUrl: normalized.convertedUrl,
+        format: normalized.format,
+        isAutoConverted: normalized.isAutoConverted,
         sourceName: sourceLabel,
         pageUrl: `https://www.reddit.com${post.permalink || ''}`
       });
@@ -421,18 +1047,24 @@ async function searchRedditVideosByKeyword(keyword) {
   return extractRedditVideosFromListing(json, `Reddit (${keyword})`);
 }
 
-// 4. Custom URL / Webpage .mp4 Scanner
+// 4. Custom URL / Webpage Multi-Format Video Scanner
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   const trimmed = targetUrl.trim();
 
-  // Direct video URL
-  if (trimmed.match(/\.(mp4|mov|m4v|webm)(\?.*)?$/i)) {
+  // Direct video URL across any supported video extension
+  const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})(\\?.*)?$`, 'i');
+  if (directRegex.test(trimmed)) {
+    const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
     const fileName = trimmed.split('/').pop().split('?')[0] || 'Direct Video';
     return [
       {
         id: `url-${Date.now()}`,
         title: decodeURIComponent(fileName),
-        videoUrl: trimmed,
+        videoUrl: normalized.videoUrl,
+        originalUrl: normalized.originalUrl,
+        convertedUrl: normalized.convertedUrl,
+        format: normalized.format,
+        isAutoConverted: normalized.isAutoConverted,
         sourceName: customLabel,
         pageUrl: trimmed
       }
@@ -447,38 +1079,55 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
     }
   }
 
-  // Otherwise fetch raw text/JSON and extract all direct .mp4 / .webm links
+  // Otherwise fetch raw text/JSON and extract all video links across all supported extensions
   const rawText = await fetchWithCorsFallback(trimmed, true);
   const foundUrls = new Set();
 
-  // Absolute video URLs
-  const absRegex = /https?:\/\/[^\s"'<>\\]+\.(?:mp4|m4v|mov|webm)(?:\?[^\s"'<>\\]*)?/gi;
+  // Absolute video URLs for all 19 extensions
+  const absRegex = new RegExp(
+    `https?:\\/\\/[^\\s"'<>\\\\]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^\\s"'<>\\\\]*)?`,
+    'gi'
+  );
   let m;
   while ((m = absRegex.exec(rawText)) !== null) {
     foundUrls.add(m[0].replace(/&amp;/g, '&'));
   }
 
-  // Relative video src attributes
-  const relRegex = /(?:src|href)=["']([^"']+\.(?:mp4|m4v|mov|webm)(?:\?[^"']*)?)["']/gi;
+  // Relative video src/href/data-src/content attributes
+  const relRegex = new RegExp(
+    `(?:src|href|data-src|data-video|content)=["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
+    'gi'
+  );
   while ((m = relRegex.exec(rawText)) !== null) {
     try {
-      const resolved = new URL(m[1], trimmed).href;
+      const resolved = new URL(m[1].replace(/&amp;/g, '&'), trimmed).href;
       foundUrls.add(resolved);
     } catch {
       // ignore invalid relative URL
     }
   }
 
-  return Array.from(foundUrls).map((vUrl, idx) => {
+  const results = [];
+  let idx = 0;
+  for (const vUrl of foundUrls) {
+    const normalized = normalizeAndAutoRewriteVideoUrl(vUrl);
+    if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
     const shortName = vUrl.split('/').pop().split('?')[0] || `Video #${idx + 1}`;
-    return {
+    results.push({
       id: `scan-${Date.now()}-${idx}`,
       title: decodeURIComponent(shortName),
-      videoUrl: vUrl,
+      videoUrl: normalized.videoUrl,
+      originalUrl: normalized.originalUrl,
+      convertedUrl: normalized.convertedUrl,
+      format: normalized.format,
+      isAutoConverted: normalized.isAutoConverted,
       sourceName: customLabel,
       pageUrl: trimmed
-    };
-  });
+    });
+    idx++;
+  }
+
+  return results;
 }
 
 // Pull videos from a single source object
@@ -522,10 +1171,27 @@ function setPlayerLoading(isLoading, message = 'Pulling random video...') {
   }
 }
 
+function getEffectivePlaybackUrl(videoItem) {
+  if (!videoItem) return '';
+  if (videoItem.convertedBlobUrl) return videoItem.convertedBlobUrl;
+
+  const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
+  const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+
+  // If the original format isn't iPhone-native (e.g. .ogv, .mkv, .avi, .mpeg, .flv, .wmv) and a converted stream URL exists, use it automatically
+  if (settings.autoConvert && !fmtInfo.iphoneNative && videoItem.convertedUrl) {
+    return videoItem.convertedUrl;
+  }
+
+  return videoItem.videoUrl;
+}
+
 function updatePlayerUI() {
   const videoEl = document.getElementById('mainVideo');
   const titleEl = document.getElementById('videoTitle');
   const badgeEl = document.getElementById('videoSourceBadge');
+  const formatBadgeEl = document.getElementById('videoFormatBadge');
+  const convertNowBtn = document.getElementById('convertNowBtn');
   const queueEl = document.getElementById('queueCounter');
   const origLink = document.getElementById('videoOriginalLink');
   const prevBtn = document.getElementById('prevVideoBtn');
@@ -544,6 +1210,8 @@ function updatePlayerUI() {
   if (!current) {
     savePhoneBtn.disabled = true;
     saveVaultBtn.disabled = true;
+    formatBadgeEl?.classList.add('hidden');
+    convertNowBtn?.classList.add('hidden');
     return;
   }
 
@@ -554,6 +1222,23 @@ function updatePlayerUI() {
   titleEl.textContent = current.title || 'Untitled Video';
   badgeEl.textContent = current.sourceName || 'Random Feed';
 
+  // Update Format Badge & Convert Button
+  if (formatBadgeEl) {
+    const fMeta = getFormatBadgeInfo(current);
+    formatBadgeEl.textContent = fMeta.text;
+    formatBadgeEl.className = fMeta.className;
+  }
+
+  if (convertNowBtn) {
+    if (needsMp4Conversion(current)) {
+      convertNowBtn.classList.remove('hidden');
+      const extLabel = (current.format || 'video').toUpperCase();
+      convertNowBtn.textContent = `🔄 Convert .${extLabel} to .MP4`;
+    } else {
+      convertNowBtn.classList.add('hidden');
+    }
+  }
+
   if (current.pageUrl) {
     origLink.href = current.pageUrl;
     origLink.classList.remove('hidden');
@@ -561,14 +1246,54 @@ function updatePlayerUI() {
     origLink.classList.add('hidden');
   }
 
-  if (videoEl.src !== current.videoUrl) {
-    videoEl.src = current.videoUrl;
+  const targetPlayUrl = getEffectivePlaybackUrl(current);
+  if (videoEl.src !== targetPlayUrl) {
+    videoEl.dataset.autoConvertAttempted = 'false';
+    videoEl.src = targetPlayUrl;
     videoEl.load();
     if (settings.autoPlay) {
       videoEl.play().catch(() => {
         // iOS may require user tap if unmuted; user can tap play on controls
       });
     }
+  }
+}
+
+// Convert the currently active video in-place to .MP4 and reload the player
+async function convertCurrentVideoForPlayer(videoItem) {
+  if (!videoItem || videoItem.convertedBlobUrl) return;
+
+  const statusBox = document.getElementById('downloadStatusBox');
+  const statusText = document.getElementById('downloadStatusText');
+  const statusPercent = document.getElementById('downloadStatusPercent');
+  const progressBar = document.getElementById('downloadProgressBar');
+  const convertNowBtn = document.getElementById('convertNowBtn');
+
+  statusBox?.classList.remove('hidden');
+  if (convertNowBtn) convertNowBtn.disabled = true;
+
+  try {
+    const result = await obtainIphoneReadyVideoBlob(videoItem, true, (label, pct, rightText) => {
+      if (statusText) statusText.textContent = label;
+      if (statusPercent) statusPercent.textContent = rightText || `${pct}%`;
+      if (progressBar) progressBar.style.width = `${pct}%`;
+    });
+
+    if (!videoItem.convertedBlobUrl && result.blob) {
+      videoItem.convertedBlob = result.blob;
+      videoItem.convertedBlobUrl = URL.createObjectURL(result.blob);
+    }
+    videoItem.isAutoConverted = true;
+    updatePlayerUI();
+    showToast('Converted to iPhone-native .MP4!');
+  } catch {
+    showToast('Could not auto-convert this stream in browser.');
+  } finally {
+    if (convertNowBtn) convertNowBtn.disabled = false;
+    setTimeout(() => {
+      statusBox?.classList.add('hidden');
+      if (progressBar) progressBar.style.width = '0%';
+    }, 1000);
   }
 }
 
@@ -625,7 +1350,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
     // Fallback if offline or no matches returned
     if (fresh.length === 0) {
       if (customKeyword) {
-        showToast(`No direct .mp4 videos found for "${customKeyword}". Try another keyword!`);
+        showToast(`No matching videos found for "${customKeyword}". Try another keyword!`);
         setPlayerLoading(false);
         return;
       }
@@ -656,7 +1381,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
 }
 
 // ==========================================
-// DOWNLOAD TO IPHONE (PHOTOS / FILES)
+// DOWNLOAD TO IPHONE (PHOTOS / FILES) WITH AUTO-CONVERSION
 // ==========================================
 
 async function downloadVideoToIphone(videoItem) {
@@ -669,73 +1394,38 @@ async function downloadVideoToIphone(videoItem) {
   const saveBtn = document.getElementById('saveToPhoneBtn');
 
   statusBox?.classList.remove('hidden');
-  if (statusText) statusText.textContent = 'Downloading .mp4 to iPhone...';
+  if (statusText) statusText.textContent = 'Preparing video for iPhone...';
   if (statusPercent) statusPercent.textContent = '0%';
   if (progressBar) progressBar.style.width = '8%';
   if (saveBtn) saveBtn.disabled = true;
 
-  const cleanFileName =
-    (videoItem.title || 'reelvault-video')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '')
-      .slice(0, 42) + '.mp4';
+  const baseSlug = (videoItem.title || 'reelvault-video')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 42) || 'reelvault-video';
 
   try {
-    // Attempt direct CORS fetch or proxy fetch to get a Blob for iOS Share Sheet ("Save Video")
-    let response = null;
-    const candidateUrls = [
-      videoItem.videoUrl,
-      `https://corsproxy.io/?${encodeURIComponent(videoItem.videoUrl)}`
-    ];
-
-    for (const url of candidateUrls) {
-      try {
-        const res = await fetch(url);
-        if (res.ok) {
-          response = res;
-          break;
-        }
-      } catch {
-        // try next
+    const { blob, ext, mime, wasConverted } = await obtainIphoneReadyVideoBlob(
+      videoItem,
+      false,
+      (label, pct, rightText) => {
+        if (statusText) statusText.textContent = label;
+        if (statusPercent) statusPercent.textContent = rightText || `${pct}%`;
+        if (progressBar) progressBar.style.width = `${pct}%`;
       }
-    }
+    );
 
-    if (!response) {
-      throw new Error('Direct stream requires browser download fallback');
-    }
-
-    const contentLength = Number(response.headers.get('content-length')) || 0;
-    const reader = response.body?.getReader();
-    let blob;
-
-    if (reader) {
-      const chunks = [];
-      let received = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (contentLength > 0) {
-          const pct = Math.min(99, Math.round((received / contentLength) * 100));
-          if (statusPercent) statusPercent.textContent = `${pct}%`;
-          if (progressBar) progressBar.style.width = `${pct}%`;
-        } else {
-          const mb = (received / (1024 * 1024)).toFixed(1);
-          if (statusPercent) statusPercent.textContent = `${mb} MB`;
-          if (progressBar) progressBar.style.width = '70%';
-        }
-      }
-      blob = new Blob(chunks, { type: 'video/mp4' });
-    } else {
-      blob = await response.blob();
+    if (wasConverted) {
+      videoItem.isAutoConverted = true;
+      updatePlayerUI();
     }
 
     if (statusPercent) statusPercent.textContent = '100%';
     if (progressBar) progressBar.style.width = '100%';
 
-    const file = new File([blob], cleanFileName, { type: 'video/mp4' });
+    const cleanFileName = `${baseSlug}.${ext || 'mp4'}`;
+    const file = new File([blob], cleanFileName, { type: mime || 'video/mp4' });
 
     // On iPhone Safari, navigator.share({ files }) opens the native sheet with "Save Video" (to Photos) & "Save to Files"
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
@@ -744,7 +1434,11 @@ async function downloadVideoToIphone(videoItem) {
         files: [file],
         title: videoItem.title || 'ReelVault Video'
       });
-      showToast('Saved! Choose "Save Video" for Photos app.');
+      showToast(
+        wasConverted
+          ? 'Auto-converted to .MP4! Tap "Save Video" for Photos.'
+          : 'Saved! Choose "Save Video" for Photos app.'
+      );
     } else {
       // Standard browser file download
       const blobUrl = URL.createObjectURL(blob);
@@ -755,17 +1449,23 @@ async function downloadVideoToIphone(videoItem) {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
-      showToast('Video downloaded to your device!');
+      showToast(
+        wasConverted
+          ? 'Auto-converted to .MP4 and downloaded!'
+          : 'Video downloaded to your device!'
+      );
     }
   } catch (err) {
     if (err?.name === 'AbortError') {
       // User dismissed iOS share sheet
       showToast('Share menu closed');
     } else {
-      // Fallback: open direct .mp4 link for native Safari download
+      // Fallback: open direct link (prefer convertedUrl if present)
+      const fallbackUrl = videoItem.convertedUrl || videoItem.videoUrl;
+      const fallbackExt = detectVideoFormat(fallbackUrl).ext;
       const a = document.createElement('a');
-      a.href = videoItem.videoUrl;
-      a.download = cleanFileName;
+      a.href = fallbackUrl;
+      a.download = `${baseSlug}.${fallbackExt}`;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
       document.body.appendChild(a);
@@ -834,17 +1534,21 @@ function renderSearchResults(items) {
   if (!listEl) return;
 
   if (items.length === 0) {
-    listEl.innerHTML = `<p class="muted-center">No direct .mp4 videos found for that query. Try another keyword or enable more engines.</p>`;
+    listEl.innerHTML = `<p class="muted-center">No matching videos found for that query. Try another keyword or enable more engines/formats.</p>`;
     return;
   }
 
   listEl.innerHTML = items
-    .map(
-      (item, idx) => `
+    .map((item, idx) => {
+      const fMeta = getFormatBadgeInfo(item);
+      return `
       <div class="video-list-item">
         <div class="vli-header">
           <div class="vli-title">${escapeHtml(item.title)}</div>
-          <span class="source-badge">${escapeHtml(item.sourceName)}</span>
+          <div class="vli-badges">
+            <span class="${fMeta.className}">${escapeHtml(fMeta.text)}</span>
+            <span class="source-badge">${escapeHtml(item.sourceName)}</span>
+          </div>
         </div>
         <div class="vli-actions">
           <button class="btn-primary btn-mini" data-action="play-search-item" data-index="${idx}">
@@ -858,8 +1562,8 @@ function renderSearchResults(items) {
           </button>
         </div>
       </div>
-    `
-    )
+    `;
+    })
     .join('');
 }
 
@@ -884,12 +1588,16 @@ async function renderVaultList() {
   }
 
   listEl.innerHTML = items
-    .map(
-      (item) => `
+    .map((item) => {
+      const fMeta = getFormatBadgeInfo(item);
+      return `
       <div class="video-list-item">
         <div class="vli-header">
           <div class="vli-title">${escapeHtml(item.title)}</div>
-          <span class="source-badge">${escapeHtml(item.sourceName || 'Saved')}</span>
+          <div class="vli-badges">
+            <span class="${fMeta.className}">${escapeHtml(fMeta.text)}</span>
+            <span class="source-badge">${escapeHtml(item.sourceName || 'Saved')}</span>
+          </div>
         </div>
         <div class="vli-actions">
           <button class="btn-primary btn-mini" data-action="play-vault-item" data-id="${escapeHtml(item.id)}">
@@ -903,8 +1611,8 @@ async function renderVaultList() {
           </button>
         </div>
       </div>
-    `
-    )
+    `;
+    })
     .join('');
 }
 
@@ -935,16 +1643,51 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderSourcesList();
   await renderVaultList();
 
-  // Sync settings toggles
+  // Sync settings controls
   const nsfwToggle = document.getElementById('allowNsfwToggle');
   const autoPlayToggle = document.getElementById('autoPlayToggle');
+  const formatModeSelect = document.getElementById('formatModeSelect');
+  const autoConvertToggle = document.getElementById('autoConvertToggle');
+
   if (nsfwToggle) nsfwToggle.checked = Boolean(settings.allowNsfw);
   if (autoPlayToggle) autoPlayToggle.checked = Boolean(settings.autoPlay);
+  if (formatModeSelect) formatModeSelect.value = settings.formatMode || 'all';
+  if (autoConvertToggle) autoConvertToggle.checked = settings.autoConvert !== false;
 
   // Register Service Worker for PWA
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
+
+  // Auto-convert on playback error if a non-native format fails to decode directly on iPhone Safari
+  const mainVideoEl = document.getElementById('mainVideo');
+  mainVideoEl?.addEventListener('error', async () => {
+    const current = videoQueue[currentIndex];
+    if (!current || mainVideoEl.dataset.autoConvertAttempted === 'true') return;
+    mainVideoEl.dataset.autoConvertAttempted = 'true';
+
+    // If a pre-transcoded derivative URL exists and wasn't tried yet, switch to it immediately
+    if (current.convertedUrl && mainVideoEl.src !== current.convertedUrl) {
+      mainVideoEl.src = current.convertedUrl;
+      mainVideoEl.load();
+      if (settings.autoPlay) mainVideoEl.play().catch(() => {});
+      return;
+    }
+
+    // Otherwise run on-device auto-conversion if enabled
+    if (settings.autoConvert && !current.convertedBlobUrl) {
+      showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
+      await convertCurrentVideoForPlayer(current);
+    }
+  });
+
+  // Manual / 1-Tap Convert to .MP4 button in Player
+  document.getElementById('convertNowBtn')?.addEventListener('click', async () => {
+    const current = videoQueue[currentIndex];
+    if (current) {
+      await convertCurrentVideoForPlayer(current);
+    }
+  });
 
   // Bottom Navigation Tabs
   document.querySelectorAll('.nav-tab').forEach((btn) => {
@@ -1063,7 +1806,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderSearchResults(combined);
   });
 
-  // TAB 2: Webpage .mp4 Scanner Form
+  // TAB 2: Multi-Format Webpage Video Scanner Form
   document.getElementById('urlScanForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const urlInput = document.getElementById('urlScanInput')?.value?.trim();
@@ -1071,7 +1814,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
-      listEl.innerHTML = `<p class="muted-center">Scanning page for downloadable .mp4 files...</p>`;
+      listEl.innerHTML = `<p class="muted-center">Scanning page for downloadable video files (.mp4, .mov, .webm, .mkv, .ogv, etc.)...</p>`;
     }
 
     try {
@@ -1124,7 +1867,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (type === 'subreddit') {
           sourceInput.placeholder = 'e.g. Unexpected, oddlysatisfying, NatureIsFuckingLit';
         } else {
-          sourceInput.placeholder = 'https://example.com/video.mp4 or feed URL';
+          sourceInput.placeholder = 'https://example.com/video.mov, .webm, .mkv, .mp4 or feed URL';
         }
       }
     });
@@ -1196,7 +1939,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderSourcesList();
   });
 
-  // Settings Toggles
+  // Settings Controls
+  formatModeSelect?.addEventListener('change', () => {
+    settings.formatMode = formatModeSelect.value || 'all';
+    saveSettings();
+    showToast(
+      settings.formatMode === 'all'
+        ? 'Pulling all video formats + auto-convert'
+        : settings.formatMode === 'native'
+        ? 'Pulling iPhone-native formats only'
+        : 'Pulling strict .MP4 only'
+    );
+  });
+
+  autoConvertToggle?.addEventListener('change', () => {
+    settings.autoConvert = autoConvertToggle.checked;
+    saveSettings();
+    updatePlayerUI();
+    showToast(
+      settings.autoConvert
+        ? 'Auto-convert to .MP4 enabled for iPhone'
+        : 'Auto-convert disabled (saving original formats)'
+    );
+  });
+
   nsfwToggle?.addEventListener('change', () => {
     settings.allowNsfw = nsfwToggle.checked;
     saveSettings();
@@ -1210,16 +1976,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('resetSourcesBtn')?.addEventListener('click', () => {
     sources = structuredClone(DEFAULT_SOURCES);
-    settings = { allowNsfw: false, autoPlay: true };
+    settings = {
+      allowNsfw: false,
+      autoPlay: true,
+      formatMode: 'all',
+      autoConvert: true
+    };
     if (nsfwToggle) nsfwToggle.checked = false;
     if (autoPlayToggle) autoPlayToggle.checked = true;
+    if (formatModeSelect) formatModeSelect.value = 'all';
+    if (autoConvertToggle) autoConvertToggle.checked = true;
     videoQueue = [];
     currentIndex = -1;
     seenUrls.clear();
     saveSources();
     saveSettings();
     renderSourcesList();
-    showToast('Reset to default sources & cleared session history');
+    updatePlayerUI();
+    showToast('Reset to default sources & settings');
   });
 
   // TAB 4: Vault Actions
