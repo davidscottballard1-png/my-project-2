@@ -13,6 +13,9 @@ const {
   formatVideoTime,
   updateReelsSeekerUI,
   seekVideoToPercent,
+  toggleReelsFullscreen,
+  animateReelsSlide,
+  getAppState,
   setAppState,
   syncAgeGateUI,
   openAgeGateModal,
@@ -462,7 +465,116 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         '.setting-row > div:first-child must have min-width: 0 so setting descriptions never overlap selects/switches'
       );
     });
+
+    it('should completely hide top header and bottom nav in Fullscreen Reels Mode and animate TikTok-style vertical slide transitions', () => {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+      assert.ok(
+        css.includes('body.reels-mode-active .app-header') &&
+          css.includes('body.reels-mode-active .bottom-nav') &&
+          css.includes('display: none !important;'),
+        'styles.css should hide .app-header and .bottom-nav with display: none !important when reels-mode-active is set'
+      );
+      assert.ok(
+        css.includes('.video-stage.reels-fullscreen {\n  position: fixed !important;\n  inset: 0 !important;'),
+        '.video-stage.reels-fullscreen must use position: fixed !important; inset: 0 !important; to cover the entire screen'
+      );
+
+      const origDoc = globalThis.document;
+      const makeClassList = (initial = []) => {
+        const set = new Set(initial);
+        return {
+          add: (...c) => c.forEach((x) => set.add(x)),
+          remove: (...c) => c.forEach((x) => set.delete(x)),
+          toggle: (c, force) => {
+            const add = typeof force === 'boolean' ? force : !set.has(c);
+            if (add) set.add(c);
+            else set.delete(c);
+            return add;
+          },
+          contains: (c) => set.has(c)
+        };
+      };
+
+      const makeStubEl = () => ({
+        textContent: '',
+        innerHTML: '',
+        value: '',
+        href: '',
+        src: '',
+        disabled: false,
+        controls: true,
+        muted: true,
+        paused: false,
+        currentTime: 0,
+        duration: 60,
+        dataset: {},
+        style: { transition: '', transform: '', opacity: '', setProperty() {} },
+        classList: makeClassList(),
+        load() {},
+        play: () => Promise.resolve(),
+        pause() {},
+        setAttribute() {},
+        removeAttribute() {},
+        addEventListener() {}
+      });
+
+      const elements = {
+        videoStage: makeStubEl(),
+        reelsHudOverlay: makeStubEl(),
+        appHeader: makeStubEl(),
+        bottomNav: makeStubEl(),
+        appContainer: makeStubEl(),
+        mainVideo: makeStubEl()
+      };
+      elements.reelsHudOverlay.classList.add('hidden');
+
+      globalThis.document = {
+        body: { classList: makeClassList(), appendChild() {} },
+        createElement: () => makeStubEl(),
+        getElementById: (id) => {
+          if (!elements[id]) elements[id] = makeStubEl();
+          return elements[id];
+        },
+        querySelector: (sel) => {
+          if (sel === '.bottom-nav') return elements.bottomNav;
+          if (sel === '.app-container') return elements.appContainer;
+          return makeStubEl();
+        },
+        querySelectorAll: () => []
+      };
+
+      try {
+        setAppState({
+          videoQueue: [
+            { id: 'r1', title: 'Reel 1', videoUrl: 'https://example.com/1.mp4', sourceName: 'Test' },
+            { id: 'r2', title: 'Reel 2', videoUrl: 'https://example.com/2.mp4', sourceName: 'Test' }
+          ],
+          currentIndex: 0
+        });
+
+        toggleReelsFullscreen(true);
+        assert.strictEqual(elements.appHeader.classList.contains('hidden'), true, '#appHeader should have .hidden in Fullscreen Reels Mode');
+        assert.strictEqual(elements.bottomNav.classList.contains('hidden'), true, '.bottom-nav should have .hidden in Fullscreen Reels Mode');
+        assert.strictEqual(globalThis.document.body.classList.contains('reels-mode-active'), true, 'body should have .reels-mode-active');
+
+        const slidNext = animateReelsSlide('next');
+        assert.strictEqual(slidNext, true, 'animateReelsSlide("next") should return true');
+        assert.strictEqual(getAppState().currentIndex, 1, 'Queue should advance to index 1');
+
+        const slidPrev = animateReelsSlide('prev');
+        assert.strictEqual(slidPrev, true, 'animateReelsSlide("prev") should return true when going back');
+        assert.strictEqual(getAppState().currentIndex, 0, 'Queue should return to index 0');
+
+        toggleReelsFullscreen(false);
+        assert.strictEqual(elements.appHeader.classList.contains('hidden'), false, '#appHeader should be unhidden when exiting Fullscreen Reels Mode');
+        assert.strictEqual(elements.bottomNav.classList.contains('hidden'), false, '.bottom-nav should be unhidden when exiting Fullscreen Reels Mode');
+        assert.strictEqual(globalThis.document.body.classList.contains('reels-mode-active'), false, 'body should remove .reels-mode-active');
+      } finally {
+        globalThis.document = origDoc;
+      }
+    });
   });
 });
+
 
 

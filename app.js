@@ -3179,8 +3179,15 @@ function toggleReelsFullscreen(forceState) {
     document.body?.classList?.toggle('reels-mode-active', isReelsFullscreen);
     document.querySelector?.('.app-container')?.classList?.toggle('reels-mode-active', isReelsFullscreen);
     document.querySelector?.('.app-main')?.classList?.toggle('reels-mode-active', isReelsFullscreen);
+    document.getElementById('appHeader')?.classList?.toggle('hidden', isReelsFullscreen);
+    document.querySelector?.('.bottom-nav')?.classList?.toggle('hidden', isReelsFullscreen);
     const videoEl = document.getElementById('mainVideo');
     if (videoEl) {
+      if (videoEl.style) {
+        videoEl.style.transition = '';
+        videoEl.style.transform = '';
+        videoEl.style.opacity = '';
+      }
       videoEl.controls = !isReelsFullscreen;
       if (isReelsFullscreen) {
         videoEl.removeAttribute?.('controls');
@@ -3192,10 +3199,51 @@ function toggleReelsFullscreen(forceState) {
   updateReelsSeekerUI();
 
   if (isReelsFullscreen && currentIndex < 0 && videoQueue.length === 0) {
-    pullRandomVideos(1);
+    pullRandomVideos(3);
   } else {
     updatePlayerUI();
   }
+}
+
+function animateReelsSlide(direction = 'next') {
+  const isNext = direction !== 'prev';
+  if (!isNext && currentIndex <= 0) {
+    const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+    if (videoEl?.style) {
+      videoEl.style.transition = 'transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
+      videoEl.style.transform = 'translate3d(0, 0, 0)';
+      videoEl.style.opacity = '1';
+    }
+    showToast('Top of feed — swipe up for next video');
+    return false;
+  }
+
+  if (isNext) {
+    advanceToNextVideo();
+  } else {
+    goToPrevVideo();
+  }
+
+  const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+  if (isReelsFullscreen && videoEl?.style) {
+    const startOffset = isNext ? '82%' : '-82%';
+    videoEl.style.transition = 'none';
+    videoEl.style.transform = `translate3d(0, ${startOffset}, 0)`;
+    videoEl.style.opacity = '0.45';
+    const runSlideIn = () => {
+      if (!videoEl?.style) return;
+      videoEl.style.transition = 'transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
+      videoEl.style.transform = 'translate3d(0, 0, 0)';
+      videoEl.style.opacity = '1';
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => requestAnimationFrame(runSlideIn));
+    } else {
+      const t = setTimeout(runSlideIn, 16);
+      t.unref?.();
+    }
+  }
+  return true;
 }
 
 // ==========================================
@@ -4350,19 +4398,78 @@ if (typeof document !== 'undefined') {
     goToPrevVideo();
   });
 
-  // Swipe Left/Right AND Vertical Swipe Up/Down (in Reels Mode) + Double-Tap to Vault on Video Stage
+  // Swipe Left/Right AND TikTok-Style Vertical Drag/Scroll (in Reels Mode) + Double-Tap to Vault on Video Stage
   const stage = document.getElementById('videoStage');
   let touchStartX = 0;
   let touchStartY = 0;
+  let touchStartTime = 0;
+  let isDraggingReels = false;
   let lastTapTime = 0;
   let singleTapTimer = null;
+  let lastWheelTime = 0;
+
+  const getTouchCoords = (touchList) => {
+    const t = touchList?.[0];
+    if (!t) return { x: 0, y: 0 };
+    return {
+      x: typeof t.clientX === 'number' ? t.clientX : t.screenX || 0,
+      y: typeof t.clientY === 'number' ? t.clientY : t.screenY || 0
+    };
+  };
+
+  const snapBackReelsVideo = () => {
+    if (!mainVideoEl?.style) return;
+    mainVideoEl.style.transition = 'transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
+    mainVideoEl.style.transform = 'translate3d(0, 0, 0)';
+    mainVideoEl.style.opacity = '1';
+  };
 
   stage?.addEventListener(
     'touchstart',
     (e) => {
       if (e.target.closest?.('.reels-seeker-bar, input[type="range"]')) return;
-      touchStartX = e.changedTouches[0].screenX;
-      touchStartY = e.changedTouches[0].screenY;
+      const pt = getTouchCoords(e.changedTouches || e.touches);
+      touchStartX = pt.x;
+      touchStartY = pt.y;
+      touchStartTime = Date.now();
+      isDraggingReels = false;
+      if (isReelsFullscreen && mainVideoEl?.style) {
+        mainVideoEl.style.transition = 'none';
+      }
+    },
+    { passive: true }
+  );
+
+  stage?.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!isReelsFullscreen) return;
+      if (e.target.closest?.('button, .reels-seeker-bar, input[type="range"]')) return;
+      const pt = getTouchCoords(e.changedTouches || e.touches);
+      const dx = pt.x - touchStartX;
+      const dy = pt.y - touchStartY;
+
+      if (Math.abs(dy) > 6 && Math.abs(dy) >= Math.abs(dx)) {
+        isDraggingReels = true;
+        e.preventDefault?.();
+        if (mainVideoEl?.style) {
+          const dampedDy = currentIndex <= 0 && dy > 0 ? dy * 0.28 : dy * 0.85;
+          mainVideoEl.style.transition = 'none';
+          mainVideoEl.style.transform = `translate3d(0, ${Math.round(dampedDy)}px, 0)`;
+          mainVideoEl.style.opacity = String(Math.max(0.45, 1 - Math.abs(dy) / 520));
+        }
+      }
+    },
+    { passive: false }
+  );
+
+  stage?.addEventListener(
+    'touchcancel',
+    () => {
+      if (isDraggingReels) {
+        isDraggingReels = false;
+        snapBackReelsVideo();
+      }
     },
     { passive: true }
   );
@@ -4371,27 +4478,47 @@ if (typeof document !== 'undefined') {
     'touchend',
     async (e) => {
       if (e.target.closest?.('.reels-seeker-bar, input[type="range"]')) return;
-      const dx = e.changedTouches[0].screenX - touchStartX;
-      const dy = e.changedTouches[0].screenY - touchStartY;
+      const pt = getTouchCoords(e.changedTouches || e.touches);
+      const dx = pt.x - touchStartX;
+      const dy = pt.y - touchStartY;
+      const elapsed = Math.max(1, Date.now() - touchStartTime);
+      const vy = dy / elapsed;
+
+      // Vertical Swipe in Fullscreen Reels Mode (Swipe Up = Next, Swipe Down = Prev)
+      if (isReelsFullscreen && Math.abs(dy) > Math.abs(dx)) {
+        const crossedThreshold = Math.abs(dy) > 45 || (Math.abs(dy) > 20 && Math.abs(vy) > 0.35);
+        if (crossedThreshold) {
+          isDraggingReels = false;
+          if (dy < 0) {
+            animateReelsSlide('next');
+          } else {
+            animateReelsSlide('prev');
+          }
+          return;
+        }
+        if (isDraggingReels) {
+          isDraggingReels = false;
+          snapBackReelsVideo();
+          return;
+        }
+      }
 
       // Horizontal Swipe (Left = Next, Right = Prev)
       if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy)) {
+        isDraggingReels = false;
         if (dx < 0) {
-          advanceToNextVideo();
+          if (isReelsFullscreen) animateReelsSlide('next');
+          else advanceToNextVideo();
         } else {
-          goToPrevVideo();
+          if (isReelsFullscreen) animateReelsSlide('prev');
+          else goToPrevVideo();
         }
         return;
       }
 
-      // Vertical Swipe in Fullscreen Reels Mode (Swipe Up = Next, Swipe Down = Prev)
-      if (isReelsFullscreen && Math.abs(dy) > 65 && Math.abs(dy) > Math.abs(dx)) {
-        if (dy < 0) {
-          advanceToNextVideo();
-        } else {
-          goToPrevVideo();
-        }
-        return;
+      if (isDraggingReels) {
+        isDraggingReels = false;
+        snapBackReelsVideo();
       }
 
       // Double-tap on video stage to save to Offline Vault (or single-tap in Reels mode to Play/Pause)
@@ -4423,6 +4550,39 @@ if (typeof document !== 'undefined') {
     },
     { passive: true }
   );
+
+  // Trackpad / Mouse Wheel Vertical Scroll in Fullscreen Reels Mode
+  stage?.addEventListener(
+    'wheel',
+    (e) => {
+      if (!isReelsFullscreen) return;
+      if (Math.abs(e.deltaY) < 25) return;
+      e.preventDefault?.();
+      const now = Date.now();
+      if (now - lastWheelTime < 420) return;
+      lastWheelTime = now;
+      if (e.deltaY > 0) {
+        animateReelsSlide('next');
+      } else {
+        animateReelsSlide('prev');
+      }
+    },
+    { passive: false }
+  );
+
+  // Keyboard Up / Down / Escape Navigation in Fullscreen Reels Mode
+  document.addEventListener?.('keydown', (e) => {
+    if (!isReelsFullscreen) return;
+    if (e.key === 'ArrowDown' || e.key === 'PageDown') {
+      e.preventDefault?.();
+      animateReelsSlide('next');
+    } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+      e.preventDefault?.();
+      animateReelsSlide('prev');
+    } else if (e.key === 'Escape') {
+      toggleReelsFullscreen(false);
+    }
+  });
 
   // Batch Pull 5 Random Videos
   document.getElementById('batchPullBtn')?.addEventListener('click', () => {
@@ -5039,6 +5199,7 @@ if (typeof module !== 'undefined' && module.exports) {
     advanceToNextVideo,
     goToPrevVideo,
     toggleReelsFullscreen,
+    animateReelsSlide,
     extractSmartVideoTags,
     buildMoreLikeThisQuery,
     pullMoreLikeThis,
