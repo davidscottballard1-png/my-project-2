@@ -3200,9 +3200,9 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     foundUrls.add(m[0]);
   }
 
-  // 2. Relative video src/href/data-src/content/file attributes & JSON player keys
+  // 2. Relative video src/href/data-src/content/file attributes & JSON tube player keys (KVS, SpankBang, PornOne, Streamable)
   const relRegex = new RegExp(
-    `(?:src|href|data-src|data-video|content|video_url|mp4_url|hls_url|contentUrl|file|__fileurl)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
+    `(?:src|href|data-src|data-video|content|video_url|video_alt_url|video_alt_url2|video_alt_url3|mp4_url|hls_url|stream_url|quality_1080p|quality_720p|quality_480p|quality_360p|quality_240p|contentUrl|file|__fileurl)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
     'gi'
   );
   while ((m = relRegex.exec(decodedText)) !== null) {
@@ -3218,6 +3218,15 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   const setterRegex = /setVideo(?:UrlHigh|UrlLow|HLS)\(\s*["'](https?:\/\/[^"']+)["']\s*\)/gi;
   while ((m = setterRegex.exec(decodedText)) !== null) {
     foundUrls.add(m[1]);
+  }
+
+  // 4. OpenGraph & Twitter Player stream meta tags (<meta property="og:video" content="...">)
+  const ogVideoRegex =
+    /<meta[^>]+(?:property|name)=["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["'][^>]+content=["'](https?:\/\/[^"']+)["']/gi;
+  while ((m = ogVideoRegex.exec(decodedText)) !== null) {
+    if (DIRECT_VIDEO_URL_REGEX.test(m[1]) || /\.(?:mp4|m3u8|webm|mov)(\b|$)/i.test(m[1])) {
+      foundUrls.add(m[1]);
+    }
   }
 
   // Sort full streams ahead of tiny hover-preview clips if both exist on a page
@@ -3390,6 +3399,217 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   return results;
 }
 
+// Helper: Extract candidate external video/tube pages from search engine HTML (e.g. DuckDuckGo HTML/Lite)
+function extractCandidateWebPagesFromSearchHtml(rawHtml) {
+  if (!rawHtml || typeof rawHtml !== 'string') return [];
+
+  const found = [];
+  const seen = new Set();
+
+  const isAllowedCandidateUrl = (u) => {
+    try {
+      const parsed = new URL(u);
+      if (!/^https?:$/i.test(parsed.protocol)) return false;
+      const host = parsed.hostname.toLowerCase();
+      // Exclude search engine internal domains, walled gardens without direct MP4s, and ad networks
+      if (
+        /(?:duckduckgo\.com|google\.com|bing\.com|yahoo\.com|yandex\.|youtube\.com|youtu\.be|netflix\.com|hulu\.com|disneyplus\.com|facebook\.com|instagram\.com|tiktok\.com|pinterest\.com|linkedin\.com|amazon\.com|doubleclick|googlesyndication|exoclick|juicyads|trafficjunky)/i.test(
+          host
+        )
+      ) {
+        return false;
+      }
+      if (/\.(?:css|js|png|jpe?g|svg|ico|woff2?|ttf|xml|json|pdf)(\?|$)/i.test(parsed.pathname)) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const addCandidate = (rawUrl) => {
+    const clean = String(rawUrl || '')
+      .replace(/&amp;/g, '&')
+      .trim();
+    if (!clean || seen.has(clean)) return;
+    if (isAllowedCandidateUrl(clean)) {
+      seen.add(clean);
+      found.push(clean);
+    }
+  };
+
+  // 1. DuckDuckGo uddg= encoded destination links
+  const uddgRegex = /[?&]uddg=([^&"'>\s]+)/gi;
+  let m;
+  while ((m = uddgRegex.exec(rawHtml)) !== null) {
+    try {
+      addCandidate(decodeURIComponent(m[1]));
+    } catch {}
+  }
+
+  // 2. Direct external href="https://..." links in search result anchors
+  const hrefRegex = /href=["'](https?:\/\/[^"'<>#\s]+)["']/gi;
+  while ((m = hrefRegex.exec(rawHtml)) !== null) {
+    addCandidate(m[1]);
+  }
+
+  // Prioritize direct video files and recognizable tube/video watch pages first
+  const videoWatchPriority = found.filter(
+    (u) =>
+      DIRECT_VIDEO_URL_REGEX.test(u) ||
+      /(?:\/video|\/watch|\/videos\/|\/v\/|\/embed\/|viewkey=|redgifs\.com|eporner\.com|fulltaboo\.tv|pornone\.com|spankbang\.com|xhamster\.com|xvideos\.com|streamable\.com|imgur\.com|catbox\.moe|dailymotion\.com|vimeo\.com|archive\.org)/i.test(
+        u
+      )
+  );
+  const others = found.filter((u) => !videoWatchPriority.includes(u));
+  return [...videoWatchPriority, ...others];
+}
+
+// 10. Open-Web & Public Video Sites Discovery Crawler (Discovers & scans sites across the web not in Sources)
+async function searchOpenWebVideos(keyword, limit = 6) {
+  const cleanKw = String(keyword || '').trim();
+  if (!cleanKw) return [];
+
+  const results = [];
+  const seenUrlsInWeb = new Set();
+  const addResult = (item) => {
+    if (item?.videoUrl && !seenUrlsInWeb.has(item.videoUrl)) {
+      seenUrlsInWeb.add(item.videoUrl);
+      results.push(item);
+    }
+  };
+
+  const tasks = [];
+
+  // A. DuckDuckGo Open-Web Video & Tube Search Crawler (SafeSearch Off kp=-2 when 18+ On, Strict kp=1 when Safe)
+  tasks.push(
+    (async () => {
+      try {
+        const kp = settings.allowNsfw ? '-2' : '1';
+        const webQuery =
+          settings.allowNsfw && settings.nsfwMode === 'strict'
+            ? `${cleanKw} video (mp4 OR tube OR watch)`
+            : `${cleanKw} video (mp4 OR watch)`;
+        const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(webQuery)}&kp=${kp}`;
+        const searchHtml = await fetchWithCorsFallback(ddgUrl, true);
+        const candidates = extractCandidateWebPagesFromSearchHtml(searchHtml).slice(0, 4);
+
+        const settled = await Promise.allSettled(
+          candidates.map(async (pageUrl) => {
+            let hostLabel = 'Open Web';
+            try {
+              hostLabel = `Web (${new URL(pageUrl).hostname.replace(/^www\./i, '')})`;
+            } catch {}
+            const scanned = await scanUrlForVideos(pageUrl, hostLabel, true);
+            for (const item of scanned.slice(0, 2)) {
+              if (settings.allowNsfw && settings.nsfwMode === 'strict') {
+                item.isNsfw = true;
+              }
+              addResult(item);
+            }
+          })
+        );
+        return settled;
+      } catch {
+        return null;
+      }
+    })()
+  );
+
+  // B. Open-Web External Video Host Discovery (Streamable, Imgur, Catbox, RedGIFs, Eporner & Direct .MP4/.WEBM hosts)
+  tasks.push(
+    (async () => {
+      try {
+        const nsfwFlag = settings.allowNsfw ? '1' : '0';
+        const hostFilter = settings.allowNsfw
+          ? '(site:streamable.com OR site:imgur.com OR site:catbox.moe OR site:redgifs.com OR site:eporner.com OR url:.mp4 OR url:.webm)'
+          : '(site:streamable.com OR site:imgur.com OR site:catbox.moe OR url:.mp4 OR url:.webm)';
+        const extUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+          `${cleanKw} ${hostFilter}`
+        )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=25&raw_json=1`;
+        const json = await fetchWithCorsFallback(extUrl, false);
+        const directItems = extractRedditVideosFromListing(json, `Open Web (${cleanKw})`, true);
+        directItems.forEach(addResult);
+
+        // Also crawl up to 2 external video watch pages (e.g. streamable.com/abc or external tube pages) linked in results
+        const children = json?.data?.children || [];
+        const externalPages = [];
+        for (const child of children) {
+          const post = child?.data;
+          if (!post) continue;
+          if (post.over_18 && !settings.allowNsfw) continue;
+          const dest = post.url_overridden_by_dest || post.url;
+          if (
+            typeof dest === 'string' &&
+            /^https?:\/\//i.test(dest) &&
+            !DIRECT_VIDEO_URL_REGEX.test(dest) &&
+            !/(?:reddit\.com|redd\.it|redgifs\.com|youtube\.com|youtu\.be)/i.test(dest) &&
+            externalPages.length < 2
+          ) {
+            externalPages.push({ url: dest, title: post.title, over18: Boolean(post.over_18) });
+          }
+        }
+
+        await Promise.allSettled(
+          externalPages.map(async (entry) => {
+            let hostLabel = 'Open Web';
+            try {
+              hostLabel = `Web (${new URL(entry.url).hostname.replace(/^www\./i, '')})`;
+            } catch {}
+            const scanned = await scanUrlForVideos(entry.url, hostLabel, false);
+            for (const item of scanned.slice(0, 2)) {
+              if (entry.title && (!item.title || /^Video #/i.test(item.title))) {
+                item.title = entry.title;
+              }
+              if (entry.over18) item.isNsfw = true;
+              addResult(item);
+            }
+          })
+        );
+      } catch {}
+    })()
+  );
+
+  // C. Crawl Custom / Preset Website URLs via Site Search (?s=keyword) even if not currently active in Sources
+  tasks.push(
+    (async () => {
+      try {
+        const allUrlSources = [...sources, ...ADULT_PRESET_SOURCES].filter((s) => {
+          if (!s || s.type !== 'url' || !s.value) return false;
+          if (s.isNsfw && !settings.allowNsfw) return false;
+          return true;
+        });
+        const uniqueOrigins = [];
+        const seenOrigins = new Set();
+        for (const s of allUrlSources) {
+          try {
+            const u = new URL(s.value);
+            if (!seenOrigins.has(u.origin)) {
+              seenOrigins.add(u.origin);
+              uniqueOrigins.push({ origin: u.origin, host: u.hostname.replace(/^www\./i, ''), isNsfw: Boolean(s.isNsfw) });
+            }
+          } catch {}
+        }
+
+        await Promise.allSettled(
+          uniqueOrigins.slice(0, 2).map(async (site) => {
+            const siteSearchUrl = `${site.origin}/?s=${encodeURIComponent(cleanKw)}`;
+            const items = await scanUrlForVideos(siteSearchUrl, `${site.host} (${cleanKw})`, true);
+            for (const item of items.slice(0, 2)) {
+              if (site.isNsfw) item.isNsfw = true;
+              addResult(item);
+            }
+          })
+        );
+      } catch {}
+    })()
+  );
+
+  await Promise.allSettled(tasks);
+  return results.slice(0, limit);
+}
+
 // Filter & sort tube results by duration ('all' | 'short' | 'medium' | 'long') and quality ('all' | 'hd')
 function filterAndSortTubeResults(
   items,
@@ -3415,7 +3635,7 @@ function filterAndSortTubeResults(
   });
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, FullTaboo.tv, Multi-Sub 18+ & Tube Feeds)
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, FullTaboo.tv, PornOne, Open Tube Discovery & Multi-Sub 18+)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
@@ -3455,7 +3675,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
     );
   }
 
-  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + FullTaboo.tv + Multi-Sub 18+)
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs & Public Tube Crawlers
   if (settings.allowNsfw) {
     // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
     tasks.push(
@@ -3544,6 +3764,20 @@ async function searchFreeTubeSites(keyword, limit = 6) {
         }
       })()
     );
+
+    // 6. PornOne & Open Tube Sites Search Crawler (Discovers streams across public tube sites)
+    tasks.push(
+      (async () => {
+        try {
+          const poSearchUrl = `https://pornone.com/search?q=${encodeURIComponent(keyword)}`;
+          const poItems = await scanUrlForVideos(poSearchUrl, `PornOne Tube (${keyword})`, true);
+          for (const item of poItems.slice(0, 3)) {
+            item.isNsfw = true;
+            results.push(item);
+          }
+        } catch {}
+      })()
+    );
   }
 
   await Promise.allSettled(tasks);
@@ -3590,7 +3824,7 @@ async function pullFromSource(source) {
     return items;
   }
 
-  // Default: 'keyword' -> race open engines in parallel (or 18+-focused engines when Strict 18+ Mode is active)
+  // Default: 'keyword' -> race open engines + open web & tube crawlers in parallel
   const combined = [];
   const cacheRecord = { items: combined, timestamp: Date.now() };
   sourcePoolCache.set(cacheKey, cacheRecord);
@@ -3600,6 +3834,7 @@ async function pullFromSource(source) {
     ? [
         searchRedgifsVideos(source.value, 5),
         searchFreeTubeSites(source.value, 5),
+        searchOpenWebVideos(source.value, 5),
         searchRedditVideosByKeyword(source.value),
         searchInternetArchive(source.value, 5),
         searchPeerTubeVideos(source.value, 4),
@@ -3615,6 +3850,7 @@ async function pullFromSource(source) {
         searchPeerTubeVideos(source.value, 4),
         searchFediverseVideos(source.value),
         searchFreeTubeSites(source.value, 4),
+        searchOpenWebVideos(source.value, 5),
         ...(settings.allowNsfw ? [searchRedgifsVideos(source.value, 5)] : [])
       ];
 
@@ -3637,7 +3873,7 @@ async function pullFromSource(source) {
             combined.push(...items);
             cacheRecord.timestamp = Date.now();
             // Give fast/medium engines a 750ms window after first result (or 350ms once >=3 videos arrive)
-            // so a single marginal result never cuts off Reddit, Archive.org, or RedGIFs keyword hits
+            // so a single marginal result never cuts off Reddit, Archive.org, Open Web, or RedGIFs keyword hits
             if (!resolved) {
               if (combined.length >= 3) {
                 if (graceTimer) clearTimeout(graceTimer);
@@ -5273,11 +5509,12 @@ if (typeof document !== 'undefined') {
     const useFediverse = document.getElementById('engFediverse')?.checked;
     const useNasa = document.getElementById('engNasa')?.checked;
     const useTubeSites = document.getElementById('engTubeSites')?.checked;
+    const useOpenWeb = document.getElementById('engOpenWeb')?.checked;
     const useRedgifs = document.getElementById('engRedgifs')?.checked;
 
     const listEl = document.getElementById('searchResultsList');
     if (listEl) {
-      listEl.innerHTML = `<p class="muted-center">Searching selected open video networks for "${escapeHtml(query)}"...</p>`;
+      listEl.innerHTML = `<p class="muted-center">Searching open video networks, tube sites &amp; public web for "${escapeHtml(query)}"...</p>`;
     }
 
     const tasks = [];
@@ -5292,6 +5529,7 @@ if (typeof document !== 'undefined') {
       if (useFediverse) tasks.push(searchFediverseVideos(query));
       if (useNasa) tasks.push(searchNasaVideos(query, 6));
       if (useTubeSites) tasks.push(searchFreeTubeSites(query, 6));
+      if (useOpenWeb || useTubeSites) tasks.push(searchOpenWebVideos(query, 6));
       if (useRedgifs && settings.allowNsfw) tasks.push(searchRedgifsVideos(query, 6));
     }
 
@@ -5910,6 +6148,8 @@ if (typeof module !== 'undefined' && module.exports) {
     searchPeerTubeVideos,
     searchFediverseVideos,
     extractVideoUrlsFromHtml,
+    extractCandidateWebPagesFromSearchHtml,
+    searchOpenWebVideos,
     searchFreeTubeSites,
     pullFromSource,
     parseM3u8Manifest,

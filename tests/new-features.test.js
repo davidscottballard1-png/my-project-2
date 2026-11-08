@@ -10,6 +10,8 @@ const {
   searchRedgifsVideos,
   searchWikimediaVideos,
   extractVideoUrlsFromHtml,
+  extractCandidateWebPagesFromSearchHtml,
+  searchOpenWebVideos,
   searchFreeTubeSites,
   searchInternetArchive,
   handleVideoPlaybackError,
@@ -1033,5 +1035,106 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         settings.tubeDurationFilter = origDuration;
       }
     });
+
+    it('extractCandidateWebPagesFromSearchHtml & searchOpenWebVideos discover and crawl public sites and tube pages across the open web', async () => {
+      const sampleSearchHtml = `
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent('https://publictube.example.org/videos/12345/sample-clip')}&rut=abc">Sample Tube Page</a>
+        <a class="result__a" href="https://cdn.publicvideos.example.com/media/direct-clip.mp4">Direct MP4</a>
+        <a class="result__a" href="https://www.youtube.com/watch?v=ignored">Ignored Walled Garden</a>
+      `;
+      const extracted = extractCandidateWebPagesFromSearchHtml(sampleSearchHtml);
+      assert.ok(Array.isArray(extracted));
+      assert.ok(
+        extracted.includes('https://cdn.publicvideos.example.com/media/direct-clip.mp4'),
+        'Should include direct video URLs'
+      );
+      assert.ok(
+        extracted.includes('https://publictube.example.org/videos/12345/sample-clip'),
+        'Should decode uddg= redirect URLs and keep public tube watch pages'
+      );
+      assert.ok(
+        !extracted.some((u) => u.includes('youtube.com')),
+        'Should filter out non-direct walled gardens'
+      );
+
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origFormatMode = settings.formatMode;
+      try {
+        settings.allowNsfw = true;
+        settings.formatMode = 'any';
+
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          if (u.includes('html.duckduckgo.com')) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => sampleSearchHtml,
+              json: async () => ({}),
+            };
+          }
+          if (u.includes('publictube.example.org/videos/12345/sample-clip')) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => `
+                <html>
+                  <head>
+                    <title>Discovered Tube Clip - PublicTube</title>
+                    <meta property="og:image" content="https://publictube.example.org/thumbs/12345.jpg" />
+                  </head>
+                  <body>
+                    <script>
+                      var playerConfig = {
+                        "quality_720p": "https://cdn.publictube.example.org/streams/12345_720p.mp4"
+                      };
+                    </script>
+                  </body>
+                </html>
+              `,
+            };
+          }
+          if (u.includes('reddit.com/search.json')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                data: {
+                  children: [
+                    {
+                      data: {
+                        title: 'External Host Clip',
+                        subreddit: 'videos',
+                        url_overridden_by_dest: 'https://files.catbox.moe/openweb123.mp4',
+                        thumbnail: 'https://thumbs.example.org/catbox.jpg',
+                      },
+                    },
+                  ],
+                },
+              }),
+            };
+          }
+          return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+        };
+
+        const hits = await searchOpenWebVideos('sample clip', 6);
+        assert.ok(hits.length >= 2, `Expected at least 2 open-web videos, got ${hits.length}`);
+        const urls = hits.map((h) => h.videoUrl);
+        assert.ok(
+          urls.includes('https://cdn.publicvideos.example.com/media/direct-clip.mp4'),
+          'Should include direct video link from search results'
+        );
+        assert.ok(
+          urls.includes('https://cdn.publictube.example.org/streams/12345_720p.mp4'),
+          'Should crawl discovered public tube watch page and extract quality_720p stream URL'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.formatMode = origFormatMode;
+      }
+    });
   });
 });
+
