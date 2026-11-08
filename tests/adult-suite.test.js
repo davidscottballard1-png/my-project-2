@@ -37,6 +37,8 @@ const {
   findDirectoryEntry,
   toggleDirectorySource,
   enableAllDirectorySources,
+  disableAllDirectorySources,
+  enableDirectoryCategory,
   toggleAdultDirectory,
   renderAdultDirectory,
   clearVaultDB,
@@ -541,12 +543,16 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
   });
 
   describe('5. Expandable 18+ Subreddit & Niche Directory', () => {
-    it('should expand/collapse the directory and toggle individual or all 18+ directory sources', () => {
+    it('should expand/collapse the directory and toggle individual, category, or all 18+ directory sources', () => {
       const { elements } = setupTestEnv();
       settings.allowNsfw = true;
       setAppState({ sources: structuredClone(DEFAULT_SOURCES), isAdultDirectoryExpanded: false });
 
-      assert.ok(ADULT_DIRECTORY_CATALOG.length >= 3);
+      assert.ok(ADULT_PRESET_SOURCES.length >= 10);
+      assert.strictEqual(ADULT_DIRECTORY_CATALOG.length, 5);
+      const totalItems = ADULT_DIRECTORY_CATALOG.reduce((sum, g) => sum + (g.items?.length || 0), 0);
+      assert.ok(totalItems >= 30);
+
       const entry = findDirectoryEntry('dir-sub-realgirls');
       assert.ok(entry);
       assert.strictEqual(entry.value, 'RealGirls');
@@ -567,11 +573,24 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       const toggledOff = toggleDirectorySource('dir-sub-realgirls');
       assert.strictEqual(toggledOff.enabled, false);
 
+      // Enable a single category
+      const catCount = enableDirectoryCategory('🎬 RedGIFs HD & Loop Niches');
+      assert.strictEqual(catCount, 8);
+
       // Enable all directory sources at once
       const enabledCount = enableAllDirectorySources();
       assert.ok(enabledCount > 0);
       renderAdultDirectory();
       assert.ok(elements.get('adultDirectoryList').innerHTML.includes('✓ Active'));
+
+      // Filter directory by query
+      renderAdultDirectory('Mega-Mix');
+      assert.ok(elements.get('adultDirectoryList').innerHTML.includes('Reddit 18+ Mega-Mix'));
+      assert.ok(!elements.get('adultDirectoryList').innerHTML.includes('r/RealGirls'));
+
+      // Disable all directory sources
+      const disabledCount = disableAllDirectorySources();
+      assert.strictEqual(disabledCount, totalItems);
     });
   });
 

@@ -118,10 +118,55 @@ const ADULT_PRESET_SOURCES = [
     isNsfw: true
   },
   {
+    id: 'src-nsfw-sub-realgirls',
+    type: 'subreddit',
+    value: 'RealGirls',
+    label: '🔞 r/RealGirls Verified',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-sub-amateur',
+    type: 'subreddit',
+    value: 'Amateur',
+    label: '🔞 r/Amateur Community',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-sub-sensual',
+    type: 'subreddit',
+    value: 'sensual',
+    label: '🔞 r/sensual Romantic',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
     id: 'src-nsfw-tube-hd',
     type: 'keyword',
     value: 'amateur hd',
     label: '🔞 Free Tube HD Picks',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-romantic',
+    type: 'keyword',
+    value: 'romantic sensual hd',
+    label: '🔞 Romantic & Couples HD',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-cosplay',
+    type: 'keyword',
+    value: 'redgifs cosplay',
+    label: '🔞 Cosplay & Alt 18+',
     enabled: true,
     builtIn: true,
     isNsfw: true
@@ -149,7 +194,22 @@ const ADULT_DIRECTORY_CATALOG = [
       { id: 'dir-sub-realgirls', type: 'subreddit', value: 'RealGirls', label: 'r/RealGirls — Verified', isNsfw: true },
       { id: 'dir-sub-amateur', type: 'subreddit', value: 'Amateur', label: 'r/Amateur — Homemade', isNsfw: true },
       { id: 'dir-sub-gonewild', type: 'subreddit', value: 'gonewild', label: 'r/gonewild — Community', isNsfw: true },
-      { id: 'dir-sub-sensual', type: 'subreddit', value: 'sensual', label: 'r/sensual — Romantic 18+', isNsfw: true }
+      { id: 'dir-sub-sensual', type: 'subreddit', value: 'sensual', label: 'r/sensual — Romantic 18+', isNsfw: true },
+      { id: 'dir-sub-couplesgw', type: 'subreddit', value: 'couplesgonewild', label: 'r/couplesgonewild — Couples', isNsfw: true },
+      { id: 'dir-sub-gwcouples', type: 'subreddit', value: 'GWCouples', label: 'r/GWCouples — Real Partners', isNsfw: true },
+      { id: 'dir-sub-nsfwcosplay', type: 'subreddit', value: 'nsfwcosplay', label: 'r/nsfwcosplay — Cosplay 18+', isNsfw: true },
+      { id: 'dir-sub-altgonewild', type: 'subreddit', value: 'altgonewild', label: 'r/altgonewild — Goth & Alt', isNsfw: true }
+    ]
+  },
+  {
+    category: '💎 Niche & Aesthetic 18+ Communities',
+    items: [
+      { id: 'dir-sub-fitgirls', type: 'subreddit', value: 'FitNakedGirls', label: 'r/FitNakedGirls — Athletic & Fit', isNsfw: true },
+      { id: 'dir-sub-thick', type: 'subreddit', value: 'thick', label: 'r/thick — Curvy Aesthetic', isNsfw: true },
+      { id: 'dir-sub-petite', type: 'subreddit', value: 'PetiteGoneWild', label: 'r/PetiteGoneWild — Petite 18+', isNsfw: true },
+      { id: 'dir-sub-palegirls', type: 'subreddit', value: 'palegirls', label: 'r/palegirls — Pale Aesthetic', isNsfw: true },
+      { id: 'dir-sub-redheads', type: 'subreddit', value: 'redheads', label: 'r/redheads — Redhead 18+', isNsfw: true },
+      { id: 'dir-sub-latinas', type: 'subreddit', value: 'latinas', label: 'r/latinas — Latina 18+', isNsfw: true }
     ]
   },
   {
@@ -158,7 +218,11 @@ const ADULT_DIRECTORY_CATALOG = [
       { id: 'dir-rg-trending', type: 'keyword', value: 'redgifs trending', label: 'RedGIFs Trending HD', isNsfw: true },
       { id: 'dir-rg-amateur', type: 'keyword', value: 'redgifs amateur hd', label: 'RedGIFs Amateur Clips', isNsfw: true },
       { id: 'dir-rg-solo', type: 'keyword', value: 'redgifs solo tease', label: 'RedGIFs Solo & Tease', isNsfw: true },
-      { id: 'dir-rg-cosplay', type: 'keyword', value: 'redgifs cosplay', label: 'RedGIFs Cosplay 18+', isNsfw: true }
+      { id: 'dir-rg-cosplay', type: 'keyword', value: 'redgifs cosplay', label: 'RedGIFs Cosplay 18+', isNsfw: true },
+      { id: 'dir-rg-couples', type: 'keyword', value: 'redgifs romantic couple', label: 'RedGIFs Romantic Couples', isNsfw: true },
+      { id: 'dir-rg-fitness', type: 'keyword', value: 'redgifs fitness gym', label: 'RedGIFs Fitness & Gym', isNsfw: true },
+      { id: 'dir-rg-glamour', type: 'keyword', value: 'redgifs glamour boudoir', label: 'RedGIFs Glamour & Boudoir', isNsfw: true },
+      { id: 'dir-rg-dance', type: 'keyword', value: 'redgifs dance loop', label: 'RedGIFs Dance & Reels', isNsfw: true }
     ]
   },
   {
@@ -167,7 +231,19 @@ const ADULT_DIRECTORY_CATALOG = [
       { id: 'dir-tube-romantic', type: 'keyword', value: 'romantic sensual hd', label: 'Romantic & Couples HD', isNsfw: true },
       { id: 'dir-tube-amateur', type: 'keyword', value: 'amateur homemade hd', label: 'Full-Length Amateur HD', isNsfw: true },
       { id: 'dir-tube-vintage', type: 'keyword', value: 'vintage erotica classic', label: 'Vintage & Classic Erotica', isNsfw: true },
-      { id: 'dir-tube-massage', type: 'keyword', value: 'sensual massage hd', label: 'Sensual Massage HD', isNsfw: true }
+      { id: 'dir-tube-massage', type: 'keyword', value: 'sensual massage hd', label: 'Sensual Massage HD', isNsfw: true },
+      { id: 'dir-tube-glamour', type: 'keyword', value: 'glamour boudoir hd', label: 'Glamour & Boudoir HD', isNsfw: true },
+      { id: 'dir-tube-midnight', type: 'keyword', value: 'midnight cult cinema 18+', label: 'Midnight & Cult Classics', isNsfw: true }
+    ]
+  },
+  {
+    category: '🌐 Multi-Feed, Federated & Open 18+ Networks',
+    items: [
+      { id: 'dir-fed-multireddit', type: 'subreddit', value: 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual', label: 'Reddit 18+ Mega-Mix (6-in-1)', isNsfw: true },
+      { id: 'dir-fed-peertube', type: 'keyword', value: 'peertube nsfw adult', label: 'PeerTube Federated 18+', isNsfw: true },
+      { id: 'dir-fed-lemmy', type: 'keyword', value: 'lemmy fediverse nsfw', label: 'Lemmy & Mastodon 18+', isNsfw: true },
+      { id: 'dir-fed-archive', type: 'keyword', value: 'classic burlesque cabaret', label: 'Archive Burlesque & Cinema', isNsfw: true },
+      { id: 'dir-fed-animated', type: 'keyword', value: 'anime 3d art loop 18+', label: 'Animated & 3D Art 18+', isNsfw: true }
     ]
   }
 ];
@@ -1308,6 +1384,67 @@ function enableAllDirectorySources() {
   return addedOrEnabled;
 }
 
+function disableAllDirectorySources() {
+  let disabledCount = 0;
+  for (const group of ADULT_DIRECTORY_CATALOG) {
+    for (const entry of group.items || []) {
+      const existing = findMatchingSourceForDirectoryEntry(entry);
+      if (existing && existing.enabled) {
+        existing.enabled = false;
+        disabledCount++;
+      }
+    }
+  }
+  if (disabledCount > 0) {
+    saveSources();
+  }
+  if (typeof document !== 'undefined') {
+    if (document.getElementById('sourcesList')) renderSourcesList();
+    if (document.getElementById('adultDirectoryList')) renderAdultDirectory();
+  }
+  return disabledCount;
+}
+
+function enableDirectoryCategory(categoryName) {
+  if (!categoryName) return 0;
+  const targetCat = String(categoryName).trim().toLowerCase();
+  const group = ADULT_DIRECTORY_CATALOG.find(
+    (g) => String(g.category || '').trim().toLowerCase() === targetCat
+  );
+  if (!group) return 0;
+
+  let addedOrEnabled = 0;
+  for (const entry of group.items || []) {
+    const existing = findMatchingSourceForDirectoryEntry(entry);
+    if (existing) {
+      if (!existing.enabled) {
+        existing.enabled = true;
+        addedOrEnabled++;
+      }
+      existing.isNsfw = true;
+    } else {
+      sources.push({
+        id: entry.id,
+        type: entry.type,
+        value: entry.value,
+        label: entry.label,
+        enabled: true,
+        builtIn: false,
+        isNsfw: true
+      });
+      addedOrEnabled++;
+    }
+  }
+  if (addedOrEnabled > 0) {
+    saveSources();
+  }
+  if (typeof document !== 'undefined') {
+    if (document.getElementById('sourcesList')) renderSourcesList();
+    if (document.getElementById('adultDirectoryList')) renderAdultDirectory();
+  }
+  return addedOrEnabled;
+}
+
 function toggleAdultDirectory(forceExpand) {
   isAdultDirectoryExpanded =
     typeof forceExpand === 'boolean' ? forceExpand : !isAdultDirectoryExpanded;
@@ -1326,13 +1463,29 @@ function toggleAdultDirectory(forceExpand) {
   return isAdultDirectoryExpanded;
 }
 
-function renderAdultDirectory() {
+function renderAdultDirectory(filterOverride) {
   if (typeof document === 'undefined') return;
   const listEl = document.getElementById('adultDirectoryList');
   if (!listEl) return;
 
-  listEl.innerHTML = ADULT_DIRECTORY_CATALOG.map((group) => {
-    const cardsHtml = (group.items || [])
+  const searchInputEl = document.getElementById('adultDirectorySearchInput');
+  const rawQuery =
+    typeof filterOverride === 'string'
+      ? filterOverride
+      : String(searchInputEl?.value || '').trim();
+  const cleanQuery = rawQuery.toLowerCase();
+
+  const renderedGroups = ADULT_DIRECTORY_CATALOG.map((group) => {
+    const categoryMatches = cleanQuery && String(group.category || '').toLowerCase().includes(cleanQuery);
+    const matchingItems = (group.items || []).filter((entry) => {
+      if (!cleanQuery || categoryMatches) return true;
+      const hay = `${entry.label || ''} ${entry.value || ''} ${entry.id || ''}`.toLowerCase();
+      return hay.includes(cleanQuery);
+    });
+
+    if (matchingItems.length === 0) return '';
+
+    const cardsHtml = matchingItems
       .map((entry) => {
         const matched = findMatchingSourceForDirectoryEntry(entry);
         const isActive = Boolean(matched && matched.enabled);
@@ -1370,11 +1523,26 @@ function renderAdultDirectory() {
 
     return `
       <div class="directory-category">
-        <div class="directory-category-title">${escapeHtml(group.category)}</div>
+        <div class="directory-category-header">
+          <div class="directory-category-title">${escapeHtml(group.category)}</div>
+          <button
+            type="button"
+            class="btn-text btn-dir-cat-enable"
+            data-action="enable-dir-category"
+            data-category="${escapeHtml(group.category)}"
+          >
+            + Enable All (${matchingItems.length})
+          </button>
+        </div>
         <div class="directory-grid">${cardsHtml}</div>
       </div>
     `;
-  }).join('');
+  }).filter(Boolean);
+
+  listEl.innerHTML =
+    renderedGroups.length > 0
+      ? renderedGroups.join('')
+      : `<p class="muted-center">No 18+ directory sources match "${escapeHtml(rawQuery)}".</p>`;
 }
 
 // Return the active sources filtered by Safe Mode vs Mixed vs Strict 18+ Only Mode
@@ -2632,6 +2800,52 @@ async function searchFediverseVideos(keyword) {
     })()
   ];
 
+  // Dedicated 18+ Fediverse community search when 18+ mode is enabled
+  if (settings.allowNsfw) {
+    tasks.push(
+      (async () => {
+        const nsfwLemmyUrl = `https://lemmynsfw.com/api/v3/search?q=${encodeURIComponent(
+          keyword
+        )}&type_=Posts&sort=TopAll&limit=20`;
+        const res = await fetchWithTimeout(nsfwLemmyUrl, 4000);
+        if (!res.ok) return;
+        const data = await res.json();
+        const posts = Array.isArray(data?.posts) ? data.posts : [];
+
+        for (const entry of posts) {
+          const post = entry?.post;
+          if (!post) continue;
+          let candidateUrl = post.url || post.embed_video_url;
+          if (!candidateUrl || typeof candidateUrl !== 'string') continue;
+
+          if (/redgifs\.com/i.test(candidateUrl)) {
+            const rgId = extractRedgifsId(candidateUrl);
+            if (rgId) {
+              candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
+            }
+          }
+
+          if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
+            const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
+            if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
+            results.push({
+              id: `lemmynsfw-${post.id}`,
+              title: post.name || 'Fediverse 18+ Video Post',
+              videoUrl: normalized.videoUrl,
+              originalUrl: normalized.originalUrl,
+              convertedUrl: normalized.convertedUrl,
+              format: normalized.format,
+              isAutoConverted: normalized.isAutoConverted,
+              isNsfw: true,
+              sourceName: `Lemmy 18+ (${entry?.community?.name || 'nsfw'})`,
+              pageUrl: post.ap_id || candidateUrl
+            });
+          }
+        }
+      })()
+    );
+  }
+
   await Promise.allSettled(tasks);
   return results;
 }
@@ -2729,7 +2943,7 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
 
   // 2. Relative video src/href/data-src/content/file attributes & JSON player keys
   const relRegex = new RegExp(
-    `(?:src|href|data-src|data-video|content|video_url|mp4_url|hls_url|contentUrl|file)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
+    `(?:src|href|data-src|data-video|content|video_url|mp4_url|hls_url|contentUrl|file|__fileurl)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
     'gi'
   );
   while ((m = relRegex.exec(decodedText)) !== null) {
@@ -2739,6 +2953,12 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     } catch {
       // ignore invalid relative URL
     }
+  }
+
+  // 3. Explicit HTML5 tube player setter calls (e.g. setVideoUrlHigh, setVideoUrlLow, setVideoHLS)
+  const setterRegex = /setVideo(?:UrlHigh|UrlLow|HLS)\(\s*["'](https?:\/\/[^"']+)["']\s*\)/gi;
+  while ((m = setterRegex.exec(decodedText)) !== null) {
+    foundUrls.add(m[1]);
   }
 
   // Sort full streams ahead of tiny hover-preview clips if both exist on a page
@@ -2866,7 +3086,7 @@ function filterAndSortTubeResults(
   });
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, 18+ Tube Feeds)
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, Multi-Sub 18+ & Tube Feeds)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
@@ -2906,7 +3126,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
     );
   }
 
-  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + 18+ Tube Feeds)
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + Multi-Sub 18+ + Tube Feeds)
   if (settings.allowNsfw) {
     // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
     tasks.push(
@@ -2967,6 +3187,19 @@ async function searchFreeTubeSites(keyword, limit = 6) {
         )}&type=link&sort=hot&include_over_18=1&limit=25&raw_json=1`;
         const json = await fetchWithCorsFallback(nsfwTubeUrl, false);
         const extracted = extractRedditVideosFromListing(json, `18+ Tube (${keyword})`);
+        results.push(...extracted.slice(0, limit));
+      })()
+    );
+
+    // 4. Curated Multi-Subreddit 18+ Video Network (6-in-1 Verified 18+ Communities)
+    tasks.push(
+      (async () => {
+        const multiSub = 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual+nsfwcosplay';
+        const multiUrl = `https://www.reddit.com/r/${multiSub}/search.json?q=${encodeURIComponent(
+          keyword
+        )}&restrict_sr=1&sort=hot&include_over_18=1&limit=20&raw_json=1`;
+        const json = await fetchWithCorsFallback(multiUrl, false);
+        const extracted = extractRedditVideosFromListing(json, `18+ Multi-Sub (${keyword})`);
         results.push(...extracted.slice(0, limit));
       })()
     );
@@ -4764,9 +4997,35 @@ if (typeof document !== 'undefined') {
     );
   });
 
+  document.getElementById('disableAllDirectoryBtn')?.addEventListener('click', () => {
+    const count = disableAllDirectorySources();
+    showToast(
+      count > 0
+        ? `Disabled ${count} 18+ directory sources`
+        : 'All 18+ directory sources are already disabled'
+    );
+  });
+
+  document.getElementById('adultDirectorySearchInput')?.addEventListener('input', (e) => {
+    renderAdultDirectory(e.target.value || '');
+  });
+
   document.getElementById('adultDirectoryList')?.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
+
+    if (btn.dataset.action === 'enable-dir-category') {
+      const cat = btn.dataset.category;
+      if (!cat) return;
+      const count = enableDirectoryCategory(cat);
+      showToast(
+        count > 0
+          ? `🔞 Enabled ${count} source(s) in "${cat}"!`
+          : `All sources in "${cat}" are already active!`
+      );
+      return;
+    }
+
     const dirId = btn.dataset.dirId;
     if (!dirId) return;
 
@@ -5211,6 +5470,8 @@ if (typeof module !== 'undefined' && module.exports) {
     findDirectoryEntry,
     toggleDirectorySource,
     enableAllDirectorySources,
+    disableAllDirectorySources,
+    enableDirectoryCategory,
     toggleAdultDirectory,
     renderAdultDirectory,
     switchTab,

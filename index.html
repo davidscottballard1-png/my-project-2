@@ -80,7 +80,11 @@
           <button type="button" class="nsfw-chip" data-nsfw-query="trending nsfw">🔥 Trending 18+</button>
           <button type="button" class="nsfw-chip" data-nsfw-query="amateur hd">📹 Amateur HD</button>
           <button type="button" class="nsfw-chip" data-nsfw-query="romantic sensual">💋 Romantic</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="couples romantic">👩‍❤️‍👨 Couples</button>
           <button type="button" class="nsfw-chip" data-nsfw-query="solo tease">🍑 Solo</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="redgifs cosplay">✨ Cosplay</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="redgifs fitness">💪 Fitness</button>
+          <button type="button" class="nsfw-chip" data-nsfw-query="sensual massage hd">💆‍♀️ Massage</button>
           <button type="button" class="nsfw-chip" data-nsfw-query="vintage erotica">🎞️ Vintage 18+</button>
           <button type="button" class="nsfw-chip" data-nsfw-query="short loop">⚡ Short Clips</button>
         </div>
@@ -278,7 +282,11 @@
               <button type="button" class="nsfw-chip" data-search-chip="trending 18+">🔥 Trending 18+</button>
               <button type="button" class="nsfw-chip" data-search-chip="amateur">📹 Amateur</button>
               <button type="button" class="nsfw-chip" data-search-chip="romantic">💋 Romantic</button>
+              <button type="button" class="nsfw-chip" data-search-chip="couples">👩‍❤️‍👨 Couples</button>
               <button type="button" class="nsfw-chip" data-search-chip="cosplay">✨ Cosplay</button>
+              <button type="button" class="nsfw-chip" data-search-chip="fitness gym">💪 Fitness</button>
+              <button type="button" class="nsfw-chip" data-search-chip="sensual massage">💆‍♀️ Massage</button>
+              <button type="button" class="nsfw-chip" data-search-chip="glamour boudoir">💎 Glamour</button>
               <button type="button" class="nsfw-chip" data-search-chip="vintage erotica">🎞️ Vintage 18+</button>
             </div>
             <div class="engine-checks">
@@ -433,13 +441,26 @@
             </button>
           </div>
           <p class="section-desc">
-            Browse curated 18+ subreddits, RedGIFs HD loop niches, and full-length tube categories. Tap any niche to toggle it in your active sources or pull clips immediately.
+            Browse 35+ curated 18+ subreddits, RedGIFs HD loop niches, full-length tube categories, and federated 18+ networks. Tap any niche to toggle it in your active sources or pull clips immediately.
           </p>
           <div id="adultDirectoryBody" class="adult-directory-body hidden">
             <div class="directory-toolbar">
-              <button id="enableAllDirectoryBtn" type="button" class="btn-outline-full">
-                🔞 Enable All 18+ Directory Sources
-              </button>
+              <input
+                type="search"
+                id="adultDirectorySearchInput"
+                class="directory-search-input"
+                placeholder="Filter 18+ subreddits, niches, or categories..."
+                autocomplete="off"
+                aria-label="Filter 18+ Directory Sources"
+              />
+              <div class="directory-toolbar-actions">
+                <button id="enableAllDirectoryBtn" type="button" class="btn-outline-full">
+                  🔞 Enable All 18+ Directory Sources
+                </button>
+                <button id="disableAllDirectoryBtn" type="button" class="btn-secondary btn-compact">
+                  Disable All
+                </button>
+              </div>
             </div>
             <div id="adultDirectoryList" class="adult-directory-list"></div>
           </div>

@@ -1531,6 +1531,32 @@ input:checked + .slider:before {
   margin-top: 4px;
 }
 
+.directory-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.directory-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.directory-toolbar-actions .btn-outline-full {
+  flex: 1;
+}
+
+.directory-search-input {
+  width: 100%;
+  background: var(--bg-main);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font-size: 0.85rem;
+}
+
 .adult-directory-list {
   display: flex;
   flex-direction: column;
@@ -1547,11 +1573,23 @@ input:checked + .slider:before {
   gap: 8px;
 }
 
+.directory-category-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .directory-category-title {
   font-size: 0.82rem;
   font-weight: 700;
   color: #fda4af;
   letter-spacing: 0.01em;
+}
+
+.btn-dir-cat-enable {
+  font-size: 0.72rem;
+  color: #fda4af;
 }
 
 .directory-grid {
