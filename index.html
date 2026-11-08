@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   <meta name="apple-mobile-web-app-title" content="ReelVault" />
   <meta name="theme-color" content="#090d16" />
   <title>ReelVault — Random Video Puller &amp; Downloader</title>
@@ -105,31 +105,53 @@
                 <span id="reelsHudBadge" class="source-badge">Reels Mode</span>
                 <button type="button" id="exitReelsModeBtn" class="reels-exit-btn">✕ Exit Fullscreen</button>
               </div>
-              <div class="reels-hud-bottom">
-                <div class="reels-hud-caption">
-                  <h4 id="reelsHudTitle">Swipe Up for Next Video</h4>
-                  <p id="reelsHudHint">Swipe ⬆️ Next • Swipe ⬇️ Prev • Double-tap to Vault</p>
+              <div class="reels-hud-footer">
+                <div class="reels-hud-bottom">
+                  <div class="reels-hud-caption">
+                    <h4 id="reelsHudTitle">Swipe Up for Next Video</h4>
+                    <p id="reelsHudHint">Swipe ⬆️ Next • Swipe ⬇️ Prev • Double-tap to Vault</p>
+                  </div>
+                  <div class="reels-hud-rail">
+                    <button type="button" id="reelsNextBtn" class="reels-rail-btn" title="Next Video">
+                      <span>🎲</span>
+                      <small>Next</small>
+                    </button>
+                    <button type="button" id="reelsSkip15Btn" class="reels-rail-btn" title="Quick Skip +15s">
+                      <span>⏩</span>
+                      <small>+15s</small>
+                    </button>
+                    <button type="button" id="reelsMoreLikeBtn" class="reels-rail-btn" title="More Like This">
+                      <span>🔥</span>
+                      <small>Similar</small>
+                    </button>
+                    <button type="button" id="reelsSavePhoneBtn" class="reels-rail-btn" title="Save to iPhone">
+                      <span>📲</span>
+                      <small>Save</small>
+                    </button>
+                    <button type="button" id="reelsVaultBtn" class="reels-rail-btn" title="Save to Offline Vault">
+                      <span>📥</span>
+                      <small>Vault</small>
+                    </button>
+                  </div>
                 </div>
-                <div class="reels-hud-rail">
-                  <button type="button" id="reelsNextBtn" class="reels-rail-btn" title="Next Video">
-                    <span>🎲</span>
-                    <small>Next</small>
+                <div id="reelsSeekerBar" class="reels-seeker-bar" aria-label="Fullscreen Video Seeker">
+                  <button type="button" id="reelsPlayPauseBtn" class="reels-seek-btn" title="Play / Pause" aria-label="Play or Pause">
+                    ⏸
                   </button>
-                  <button type="button" id="reelsSkip15Btn" class="reels-rail-btn" title="Quick Skip +15s">
-                    <span>⏩</span>
-                    <small>+15s</small>
-                  </button>
-                  <button type="button" id="reelsMoreLikeBtn" class="reels-rail-btn" title="More Like This">
-                    <span>🔥</span>
-                    <small>Similar</small>
-                  </button>
-                  <button type="button" id="reelsSavePhoneBtn" class="reels-rail-btn" title="Save to iPhone">
-                    <span>📲</span>
-                    <small>Save</small>
-                  </button>
-                  <button type="button" id="reelsVaultBtn" class="reels-rail-btn" title="Save to Offline Vault">
-                    <span>📥</span>
-                    <small>Vault</small>
+                  <span id="reelsCurrentTime" class="reels-time-label">0:00</span>
+                  <input
+                    type="range"
+                    id="reelsSeekSlider"
+                    class="reels-seek-slider"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                    value="0"
+                    aria-label="Seek Video Position"
+                  />
+                  <span id="reelsDuration" class="reels-time-label">0:00</span>
+                  <button type="button" id="reelsMuteBtn" class="reels-seek-btn" title="Mute / Unmute" aria-label="Mute or Unmute">
+                    🔊
                   </button>
                 </div>
               </div>

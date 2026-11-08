@@ -1,5 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
 const {
   STORAGE_KEYS,
   settings,
@@ -8,6 +10,10 @@ const {
   searchFreeTubeSites,
   parseM3u8Manifest,
   downloadAndAssembleM3u8Stream,
+  formatVideoTime,
+  updateReelsSeekerUI,
+  seekVideoToPercent,
+  setAppState,
   syncAgeGateUI,
   openAgeGateModal,
   closeAgeGateModal,
@@ -347,6 +353,92 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         globalThis.fetch = origFetch;
         settings.allowNsfw = origAllowNsfw;
       }
+    });
+  });
+
+  describe('Fullscreen Reels Video Seeker & Non-Overlapping Unblurred UI Layout', () => {
+    it('should format video timestamps accurately across seconds, minutes, hours, and edge inputs', () => {
+      assert.strictEqual(formatVideoTime(0), '0:00');
+      assert.strictEqual(formatVideoTime(9), '0:09');
+      assert.strictEqual(formatVideoTime(78.9), '1:18');
+      assert.strictEqual(formatVideoTime(272), '4:32');
+      assert.strictEqual(formatVideoTime(3665), '1:01:05');
+      assert.strictEqual(formatVideoTime(-5), '0:00');
+      assert.strictEqual(formatVideoTime(NaN), '0:00');
+      assert.strictEqual(formatVideoTime(null), '0:00');
+    });
+
+    it('should sync Fullscreen Reels seeker slider, timestamps, and play/mute buttons and seek video by percent', () => {
+      const origDoc = globalThis.document;
+      const styleProps = {};
+      const elements = {
+        mainVideo: {
+          currentTime: 45,
+          duration: 180,
+          paused: false,
+          muted: true
+        },
+        reelsSeekSlider: {
+          value: '0',
+          style: {
+            setProperty: (k, v) => {
+              styleProps[k] = v;
+            }
+          }
+        },
+        reelsCurrentTime: { textContent: '0:00' },
+        reelsDuration: { textContent: '0:00' },
+        reelsPlayPauseBtn: { textContent: '▶', setAttribute() {} },
+        reelsMuteBtn: { textContent: '🔊', setAttribute() {} }
+      };
+
+      globalThis.document = {
+        getElementById: (id) => elements[id] || null
+      };
+
+      try {
+        setAppState({
+          videoQueue: [{ id: 'v1', title: 'Test Reel', videoUrl: 'https://example.com/v1.mp4' }],
+          currentIndex: 0
+        });
+
+        updateReelsSeekerUI();
+        assert.strictEqual(elements.reelsCurrentTime.textContent, '0:45');
+        assert.strictEqual(elements.reelsDuration.textContent, '3:00');
+        assert.strictEqual(elements.reelsSeekSlider.value, '25');
+        assert.strictEqual(styleProps['--seek-pct'], '25.0%');
+        assert.strictEqual(elements.reelsPlayPauseBtn.textContent, '⏸');
+        assert.strictEqual(elements.reelsMuteBtn.textContent, '🔇');
+
+        const targetSec = seekVideoToPercent(50);
+        assert.strictEqual(targetSec, 90);
+        assert.strictEqual(elements.mainVideo.currentTime, 90);
+        assert.strictEqual(elements.reelsCurrentTime.textContent, '1:30');
+        assert.strictEqual(elements.reelsSeekSlider.value, '50');
+        assert.strictEqual(styleProps['--seek-pct'], '50.0%');
+      } finally {
+        globalThis.document = origDoc;
+      }
+    });
+
+    it('should ensure top header is not blurred, bottom bar does not cover video, and fullscreen seeker exists in DOM', () => {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+      const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+
+      assert.ok(html.includes('id="reelsSeekerBar"'), 'index.html should contain #reelsSeekerBar');
+      assert.ok(html.includes('id="reelsSeekSlider"'), 'index.html should contain #reelsSeekSlider');
+      assert.ok(
+        html.includes('name="apple-mobile-web-app-status-bar-style" content="black"'),
+        'Status bar style should be black so iOS does not apply translucent blur over top header'
+      );
+      assert.ok(
+        !css.includes('backdrop-filter: blur('),
+        'styles.css should not apply backdrop-filter blur to top header, bottom bar, or HUD'
+      );
+      assert.ok(
+        css.includes('.bottom-nav {\n  position: relative;\n  flex-shrink: 0;'),
+        '.bottom-nav should be a non-overlapping flex item so it never covers the video'
+      );
     });
   });
 });

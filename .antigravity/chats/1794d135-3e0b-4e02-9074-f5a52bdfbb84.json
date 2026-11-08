@@ -16,6 +16,30 @@
       "created_at": "2026-11-08T03:38:34.591Z",
       "sender": "ios",
       "is_cancelled": false
+    },
+    {
+      "id": "723fd23c-9635-4e8f-988b-e4394b76986c",
+      "role": "user",
+      "content": "Ok so the UI could use some work. Look at this. Can the top not be blurred and the bottom bar not cover the video? Also can the videos that are playing in full screen scroll can they have the video seeker still?",
+      "status": "cancelled",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T04:50:25.692Z",
+      "sender": "ios",
+      "is_cancelled": true
+    },
+    {
+      "id": "4fc602f6-2d73-433c-99a9-ce0745857354",
+      "role": "user",
+      "content": "I attached an image: .antigravity/uploads/photo-1794113438-1.jpg.\n\nOk so the UI could use some work. Look at this. Can the top not be blurred and the bottom bar not cover the video? Also can the videos that are playing in full screen scroll can they have the video seeker still?",
+      "status": "pending",
+      "model": "gemini-4-argon-high",
+      "client_type": "gemini-bridge",
+      "parent_message_id": null,
+      "created_at": "2026-11-08T04:50:41.829Z",
+      "sender": "ios",
+      "is_cancelled": false
     }
   ]
 }
