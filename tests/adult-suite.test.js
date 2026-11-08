@@ -548,10 +548,16 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       settings.allowNsfw = true;
       setAppState({ sources: structuredClone(DEFAULT_SOURCES), isAdultDirectoryExpanded: false });
 
-      assert.ok(ADULT_PRESET_SOURCES.length >= 10);
+      assert.ok(ADULT_PRESET_SOURCES.length >= 11);
+      assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-fulltaboo' && s.value === 'https://fulltaboo.tv/'));
       assert.strictEqual(ADULT_DIRECTORY_CATALOG.length, 5);
       const totalItems = ADULT_DIRECTORY_CATALOG.reduce((sum, g) => sum + (g.items?.length || 0), 0);
-      assert.ok(totalItems >= 30);
+      assert.ok(totalItems >= 31);
+
+      const ftEntry = findDirectoryEntry('dir-tube-fulltaboo');
+      assert.ok(ftEntry);
+      assert.strictEqual(ftEntry.type, 'url');
+      assert.strictEqual(ftEntry.value, 'https://fulltaboo.tv/');
 
       const entry = findDirectoryEntry('dir-sub-realgirls');
       assert.ok(entry);
@@ -562,6 +568,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(expanded, true);
       assert.strictEqual(elements.get('adultDirectoryBody').classList.contains('hidden'), false);
       assert.ok(elements.get('adultDirectoryList').innerHTML.includes('r/RealGirls'));
+      assert.ok(elements.get('adultDirectoryList').innerHTML.includes('FullTaboo.tv'));
 
       // 1-tap toggle adds and enables the source
       const addedSrc = toggleDirectorySource('dir-sub-realgirls');

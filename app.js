@@ -179,6 +179,15 @@ const ADULT_PRESET_SOURCES = [
     enabled: true,
     builtIn: true,
     isNsfw: true
+  },
+  {
+    id: 'src-nsfw-fulltaboo',
+    type: 'url',
+    value: 'https://fulltaboo.tv/',
+    label: '🔞 FullTaboo.tv Full-Length',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
   }
 ];
 
@@ -228,6 +237,7 @@ const ADULT_DIRECTORY_CATALOG = [
   {
     category: '📺 Full-Length 18+ Tube & Archive',
     items: [
+      { id: 'dir-tube-fulltaboo', type: 'url', value: 'https://fulltaboo.tv/', label: 'FullTaboo.tv — Full-Length Tube', isNsfw: true },
       { id: 'dir-tube-romantic', type: 'keyword', value: 'romantic sensual hd', label: 'Romantic & Couples HD', isNsfw: true },
       { id: 'dir-tube-amateur', type: 'keyword', value: 'amateur homemade hd', label: 'Full-Length Amateur HD', isNsfw: true },
       { id: 'dir-tube-vintage', type: 'keyword', value: 'vintage erotica classic', label: 'Vintage & Classic Erotica', isNsfw: true },
@@ -1490,7 +1500,11 @@ function renderAdultDirectory(filterOverride) {
         const matched = findMatchingSourceForDirectoryEntry(entry);
         const isActive = Boolean(matched && matched.enabled);
         const subText =
-          entry.type === 'subreddit' ? `Subreddit: r/${entry.value}` : `Niche: ${entry.value}`;
+          entry.type === 'subreddit'
+            ? `Subreddit: r/${entry.value}`
+            : entry.type === 'url'
+            ? `Site: ${entry.value}`
+            : `Niche: ${entry.value}`;
         return `
           <div class="directory-card ${isActive ? 'active' : ''}">
             <div class="directory-card-info">
@@ -3030,22 +3044,92 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     idx++;
   }
 
-  // Two-Hop Tube Listing Crawler: if this was a tube search/category page with watch-page links, crawl up to 3 watch pages
+  // If this watch page embeds its player inside an <iframe> and yielded no direct video URLs yet, scan the iframe src
+  if (results.length === 0 && typeof rawText === 'string') {
+    const iframeLinks = [];
+    const iframeRegex = /<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+    let im;
+    while ((im = iframeRegex.exec(rawText)) !== null && iframeLinks.length < 2) {
+      try {
+        const frameUrl = new URL(im[1].replace(/&amp;/g, '&'), trimmed).href;
+        if (
+          /^https?:\/\//i.test(frameUrl) &&
+          frameUrl !== trimmed &&
+          !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver|facebook|twitter)/i.test(frameUrl) &&
+          !iframeLinks.includes(frameUrl)
+        ) {
+          iframeLinks.push(frameUrl);
+        }
+      } catch {
+        // ignore invalid iframe URL
+      }
+    }
+
+    if (iframeLinks.length > 0) {
+      const frameSettled = await Promise.allSettled(
+        iframeLinks.map((fUrl) => scanUrlForVideos(fUrl, customLabel, false))
+      );
+      for (const s of frameSettled) {
+        if (s.status === 'fulfilled' && Array.isArray(s.value)) {
+          for (const item of s.value.slice(0, 2)) {
+            if (pageTitle && (!item.title || /^Video #/i.test(item.title))) {
+              item.title = pageTitle;
+            }
+            item.pageUrl = trimmed;
+            results.push(item);
+          }
+        }
+      }
+    }
+  }
+
+  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 3 watch pages
   if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string') {
-    const watchLinks = [];
+    const candidateLinks = [];
     const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
     let lm;
-    while ((lm = linkRegex.exec(rawText)) !== null && watchLinks.length < 3) {
+    while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 8) {
       try {
         const fullLink = new URL(lm[1].replace(/&amp;/g, '&'), trimmed).href;
-        if (fullLink !== trimmed && !watchLinks.includes(fullLink)) {
-          watchLinks.push(fullLink);
+        if (fullLink !== trimmed && !candidateLinks.includes(fullLink)) {
+          candidateLinks.push(fullLink);
         }
       } catch {
         // ignore invalid subpage URL
       }
     }
 
+    // Also support WordPress / Tube post-slug watch pages on the same host (e.g. https://fulltaboo.tv/post-title-slug/)
+    if (candidateLinks.length < 3) {
+      let baseHost = '';
+      try {
+        baseHost = new URL(trimmed).host;
+      } catch {}
+      const slugRegex = /href=["']([^"'#?]+)["']/gi;
+      let sm;
+      while ((sm = slugRegex.exec(rawText)) !== null && candidateLinks.length < 10) {
+        try {
+          const parsed = new URL(sm[1].replace(/&amp;/g, '&'), trimmed);
+          if (baseHost && parsed.host !== baseHost) continue;
+          const pathClean = parsed.pathname.replace(/^\/+|\/+$/g, '');
+          // Match single-segment hyphenated post slugs while excluding navigation/taxonomy paths
+          if (
+            /^[a-z0-9]+-[a-z0-9-]{4,}$/i.test(pathClean) &&
+            !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|page|wp-[a-z0-9-]+|feed|about|contact|privacy|terms|dmca|login|register)/i.test(
+              pathClean
+            ) &&
+            parsed.href !== trimmed &&
+            !candidateLinks.includes(parsed.href)
+          ) {
+            candidateLinks.push(parsed.href);
+          }
+        } catch {
+          // ignore invalid link
+        }
+      }
+    }
+
+    const watchLinks = candidateLinks.slice(0, 3);
     if (watchLinks.length > 0) {
       const subSettled = await Promise.allSettled(
         watchLinks.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
@@ -3086,7 +3170,7 @@ function filterAndSortTubeResults(
   });
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, Multi-Sub 18+ & Tube Feeds)
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion, Eporner Public API v2, RedGIFs API v2, FullTaboo.tv, Multi-Sub 18+ & Tube Feeds)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
@@ -3126,7 +3210,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
     );
   }
 
-  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + Multi-Sub 18+ + Tube Feeds)
+  // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs (Eporner API v2 + RedGIFs v2 + FullTaboo.tv + Multi-Sub 18+)
   if (settings.allowNsfw) {
     // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
     tasks.push(
@@ -3203,6 +3287,18 @@ async function searchFreeTubeSites(keyword, limit = 6) {
         results.push(...extracted.slice(0, limit));
       })()
     );
+
+    // 5. FullTaboo.tv Full-Length 18+ Tube Search Crawler
+    tasks.push(
+      (async () => {
+        const ftSearchUrl = `https://fulltaboo.tv/?s=${encodeURIComponent(keyword)}`;
+        const ftItems = await scanUrlForVideos(ftSearchUrl, `FullTaboo.tv (${keyword})`, true);
+        for (const item of ftItems) {
+          item.isNsfw = true;
+          results.push(item);
+        }
+      })()
+    );
   }
 
   await Promise.allSettled(tasks);
@@ -3236,7 +3332,16 @@ async function pullFromSource(source) {
     return items;
   }
   if (source.type === 'url') {
-    return await scanUrlForVideos(source.value, source.label || 'Custom URL');
+    const items = await scanUrlForVideos(source.value, source.label || 'Custom URL');
+    if (source.isNsfw) {
+      items.forEach((item) => {
+        item.isNsfw = true;
+      });
+    }
+    if (items.length > 0) {
+      sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
+    }
+    return items;
   }
 
   // Default: 'keyword' -> race open engines in parallel (or 18+-focused engines when Strict 18+ Mode is active)
@@ -5057,6 +5162,27 @@ if (typeof document !== 'undefined') {
           }
         } catch {
           await pullRandomVideos(1, entry.value);
+        } finally {
+          setPlayerLoading(false);
+        }
+      } else if (entry.type === 'url') {
+        setPlayerLoading(true, `Scanning ${entry.label}...`);
+        try {
+          const items = await scanUrlForVideos(entry.value, entry.label || 'FullTaboo.tv');
+          if (items.length > 0) {
+            items.forEach((i) => {
+              i.isNsfw = true;
+            });
+            const pick = items[Math.floor(Math.random() * items.length)];
+            videoQueue.push(pick);
+            currentIndex = videoQueue.length - 1;
+            updatePlayerUI();
+            showToast(`🔞 Loaded clip from ${entry.label}!`);
+          } else {
+            await pullRandomVideos(1, entry.label);
+          }
+        } catch {
+          await pullRandomVideos(1, entry.label);
         } finally {
           setPlayerLoading(false);
         }
