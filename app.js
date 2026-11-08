@@ -32,6 +32,9 @@ const VIDEO_FORMAT_CATALOG = {
 
 const ALL_VIDEO_EXTENSIONS = Object.keys(VIDEO_FORMAT_CATALOG);
 const VIDEO_EXT_REGEX_PATTERN = ALL_VIDEO_EXTENSIONS.join('|');
+const VIDEO_EXT_END_REGEX = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i');
+const DIRECT_VIDEO_URL_REGEX = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i');
+const GIFV_REPLACE_REGEX = /\.gifv([?#].*)?$/i;
 
 const DEFAULT_SOURCES = [
   {
@@ -157,7 +160,7 @@ function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
     return fallback;
   }
   const clean = urlOrName.trim().split('?')[0].split('#')[0].toLowerCase();
-  const match = clean.match(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'));
+  const match = clean.match(VIDEO_EXT_END_REGEX);
   if (match && match[1]) {
     const ext = match[1].toLowerCase();
     if (VIDEO_FORMAT_CATALOG[ext]) {
@@ -190,7 +193,7 @@ function normalizeAndAutoRewriteVideoUrl(rawUrl) {
 
   // Auto-convert .gifv (Imgur / web GIF-video wrappers) directly into .mp4
   if (fmtInfo.ext === 'gifv') {
-    const mp4Url = cleaned.replace(/\.gifv([?#].*)?$/i, '.mp4$1');
+    const mp4Url = cleaned.replace(GIFV_REPLACE_REGEX, '.mp4$1');
     return {
       videoUrl: mp4Url,
       originalUrl: cleaned,
@@ -273,8 +276,10 @@ async function loadFfmpegConverter(onStatus) {
 
   ffmpegLoadingPromise = (async () => {
     if (onStatus) onStatus('Loading auto-converter engine...');
-    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js');
-    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js');
+    await Promise.all([
+      loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js'),
+      loadScriptOnce('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/dist/umd/index.js')
+    ]);
 
     const FFmpegWasm = window.FFmpegWASM?.FFmpeg;
     const toBlobURL = window.FFmpegUtil?.toBlobURL;
@@ -284,12 +289,11 @@ async function loadFfmpegConverter(onStatus) {
 
     const ffmpeg = new FFmpegWasm();
     const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
-    const workerURL = await toBlobURL(
-      'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js',
-      'text/javascript'
-    );
-    const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
-    const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+    const [workerURL, coreURL, wasmURL] = await Promise.all([
+      toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js', 'text/javascript'),
+      toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm')
+    ]);
 
     await ffmpeg.load({ coreURL, wasmURL, classWorkerURL: workerURL });
     ffmpegInstance = ffmpeg;
@@ -668,9 +672,15 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
 const DB_NAME = 'ReelVaultDB';
 const DB_VERSION = 1;
 const VAULT_STORE = 'vault_videos';
+let cachedDbPromise = null;
+let lastIndexedDbRef = null;
 
 function openVaultDB() {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise && lastIndexedDbRef === indexedDB) {
+    return cachedDbPromise;
+  }
+  lastIndexedDbRef = indexedDB;
+  cachedDbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
@@ -679,8 +689,12 @@ function openVaultDB() {
       }
     };
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onerror = () => {
+      cachedDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedDbPromise;
 }
 
 async function getAllVaultVideos() {
@@ -850,28 +864,56 @@ function updateHeaderSummary() {
   }
 }
 
-// Fetch helper with CORS proxy fallback for Reddit / third-party pages
+// Fast fetch helper with timeout
+async function fetchWithTimeout(url, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Fetch helper with parallel CORS proxy race for Reddit / third-party pages
 async function fetchWithCorsFallback(url, asText = false) {
-  const attempts = [
-    url,
+  try {
+    const directRes = await fetchWithTimeout(url, 3500);
+    if (directRes.ok) {
+      return asText ? await directRes.text() : await directRes.json();
+    }
+  } catch {
+    // Direct fetch blocked by CORS or timed out; race CORS proxies in parallel
+  }
+
+  const proxies = [
     `https://corsproxy.io/?${encodeURIComponent(url)}`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
   ];
 
-  let lastErr = null;
-  for (const candidate of attempts) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8500);
-      const res = await fetch(candidate, { signal: controller.signal });
-      clearTimeout(timer);
-      if (!res.ok) continue;
-      return asText ? await res.text() : await res.json();
-    } catch (err) {
-      lastErr = err;
-    }
+  const controllers = proxies.map(() => new AbortController());
+  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 4500);
+  timer.unref?.();
+
+  try {
+    return await Promise.any(
+      proxies.map(async (candidate, idx) => {
+        const res = await fetch(candidate, { signal: controllers[idx].signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const payload = asText ? await res.text() : await res.json();
+        // Cancel the slower proxy once the winner finishes
+        controllers.forEach((c, i) => {
+          if (i !== idx) c.abort();
+        });
+        return payload;
+      })
+    );
+  } catch {
+    throw new Error('Network request failed');
+  } finally {
+    clearTimeout(timer);
   }
-  throw lastErr || new Error('Network request failed');
 }
 
 // ==========================================
@@ -886,30 +928,30 @@ function encodeArchiveFilePath(fileName) {
 }
 
 // 1. Internet Archive Engine (Supports all 19 video extensions + auto-derivative pairing)
-async function searchInternetArchive(keyword, limit = 10, extraQueryFilter = '') {
+async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') {
   const safeQuery = keyword.replace(/["()]/g, ' ').trim();
   const nsfwFilter = settings.allowNsfw ? '' : ' AND NOT collection:(adult)';
   const collectionClause = extraQueryFilter ? ` AND ${extraQueryFilter}` : '';
   const q = `(${safeQuery}) AND mediatype:(movies)${collectionClause}${nsfwFilter}`;
-  const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&fl[]=identifier,title&sort[]=downloads+desc&rows=30&page=1&output=json`;
+  const searchUrl = `https://archive.org/advancedsearch.php?q=${encodeURIComponent(q)}&fl[]=identifier,title&sort[]=downloads+desc&rows=25&page=1&output=json`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  const res = await fetch(searchUrl, { signal: controller.signal });
-  clearTimeout(timer);
+  const res = await fetchWithTimeout(searchUrl, 4500);
   if (!res.ok) return [];
 
   const data = await res.json();
   const docs = data?.response?.docs || [];
   if (!docs.length) return [];
 
-  const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
+  const shuffled = [...docs].sort(() => Math.random() - 0.5).slice(0, Math.min(3, limit));
   const results = [];
 
   await Promise.all(
     shuffled.map(async (doc) => {
       try {
-        const metaRes = await fetch(`https://archive.org/metadata/${encodeURIComponent(doc.identifier)}`);
+        const metaRes = await fetchWithTimeout(
+          `https://archive.org/metadata/${encodeURIComponent(doc.identifier)}`,
+          3500
+        );
         if (!metaRes.ok) return;
         const meta = await metaRes.json();
         const files = meta?.files || [];
@@ -917,8 +959,7 @@ async function searchInternetArchive(keyword, limit = 10, extraQueryFilter = '')
         const videoFiles = files
           .filter((f) => {
             if (!f?.name || f.name.toLowerCase().includes('.ia.mp4')) return false;
-            const clean = f.name.toLowerCase();
-            const m = clean.match(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'));
+            const m = f.name.toLowerCase().match(VIDEO_EXT_END_REGEX);
             if (!m) return false;
             return isFormatAllowedBySettings(m[1]);
           })
@@ -977,21 +1018,18 @@ async function searchInternetArchive(keyword, limit = 10, extraQueryFilter = '')
 }
 
 // 2. Prelinger Retro Archives Engine (Vintage commercials, retro cartoons, ephemeral films)
-async function searchPrelingerArchives(keyword, limit = 6) {
+async function searchPrelingerArchives(keyword, limit = 4) {
   return await searchInternetArchive(keyword, limit, 'collection:(prelinger)');
 }
 
 // 3. Wikimedia Commons Video Search Engine (Pulls .webm, .ogv, .ogg, .mpeg, .mpg, .mov, .mp4 + server derivatives)
-async function searchWikimediaVideos(keyword, limit = 10) {
+async function searchWikimediaVideos(keyword, limit = 8) {
   const query = `${keyword} filetype:video`;
   const apiUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
     query
   )}&gsrnamespace=6&gsrlimit=${limit}&prop=videoinfo&viprop=url|mime|size|derivatives&format=json&origin=*`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7500);
-  const res = await fetch(apiUrl, { signal: controller.signal });
-  clearTimeout(timer);
+  const res = await fetchWithTimeout(apiUrl, 4000);
   if (!res.ok) return [];
 
   const data = await res.json();
@@ -1019,7 +1057,7 @@ async function searchWikimediaVideos(keyword, limit = 10) {
 
     const cleanTitle = (page.title || 'Wikimedia Video')
       .replace(/^File:/i, '')
-      .replace(new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i'), '')
+      .replace(VIDEO_EXT_END_REGEX, '')
       .replace(/_/g, ' ');
 
     results.push({
@@ -1062,10 +1100,7 @@ function extractRedditVideosFromListing(json, sourceLabel) {
       null;
 
     if (!rawVideoUrl && typeof mediaPost.url === 'string') {
-      const directMatch = mediaPost.url.match(
-        new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i')
-      );
-      if (directMatch) {
+      if (DIRECT_VIDEO_URL_REGEX.test(mediaPost.url)) {
         rawVideoUrl = mediaPost.url;
       }
     }
@@ -1099,7 +1134,7 @@ async function fetchSubredditVideos(subreddit) {
   const cleanSub = subreddit.replace(/^\/?r\//i, '').trim();
   const sorts = ['hot', 'top', 'new'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
-  const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=45&raw_json=1`;
+  const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&raw_json=1`;
 
   const json = await fetchWithCorsFallback(url, false);
   return extractRedditVideosFromListing(json, `r/${cleanSub}`);
@@ -1111,30 +1146,27 @@ async function searchRedditVideosByKeyword(keyword) {
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
   const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(
     keyword
-  )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=45&raw_json=1`;
+  )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
 
   const json = await fetchWithCorsFallback(url, false);
   return extractRedditVideosFromListing(json, `Reddit (${keyword})`);
 }
 
 // 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
-async function searchPeerTubeVideos(keyword, limit = 6) {
+async function searchPeerTubeVideos(keyword, limit = 4) {
   const nsfwParam = settings.allowNsfw ? 'both' : 'false';
   const searchUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
     keyword
-  )}&count=16&nsfw=${nsfwParam}&sort=-match`;
+  )}&count=12&nsfw=${nsfwParam}&sort=-match`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7500);
-  const res = await fetch(searchUrl, { signal: controller.signal });
-  clearTimeout(timer);
+  const res = await fetchWithTimeout(searchUrl, 4000);
   if (!res.ok) return [];
 
   const json = await res.json();
   const data = Array.isArray(json?.data) ? json.data : [];
   if (!data.length) return [];
 
-  const picked = [...data].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
+  const picked = [...data].sort(() => Math.random() - 0.5).slice(0, Math.min(3, limit));
   const results = [];
 
   await Promise.all(
@@ -1144,12 +1176,10 @@ async function searchPeerTubeVideos(keyword, limit = 6) {
         const uuid = item?.uuid || item?.shortUUID;
         if (!host || !uuid) return;
 
-        const detailCtrl = new AbortController();
-        const detailTimer = setTimeout(() => detailCtrl.abort(), 6000);
-        const detailRes = await fetch(`https://${host}/api/v1/videos/${encodeURIComponent(uuid)}`, {
-          signal: detailCtrl.signal
-        });
-        clearTimeout(detailTimer);
+        const detailRes = await fetchWithTimeout(
+          `https://${host}/api/v1/videos/${encodeURIComponent(uuid)}`,
+          3500
+        );
         if (!detailRes.ok) return;
 
         const detail = await detailRes.json();
@@ -1197,11 +1227,8 @@ async function searchFediverseVideos(keyword) {
     // Mastodon Public Tag Timeline
     (async () => {
       if (!cleanTag) return;
-      const mastoUrl = `https://mastodon.social/api/v1/timelines/tag/${encodeURIComponent(cleanTag)}?limit=25`;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
-      const res = await fetch(mastoUrl, { signal: controller.signal });
-      clearTimeout(timer);
+      const mastoUrl = `https://mastodon.social/api/v1/timelines/tag/${encodeURIComponent(cleanTag)}?limit=20`;
+      const res = await fetchWithTimeout(mastoUrl, 4000);
       if (!res.ok) return;
       const statuses = await res.json();
       if (!Array.isArray(statuses)) return;
@@ -1235,11 +1262,8 @@ async function searchFediverseVideos(keyword) {
     (async () => {
       const lemmyUrl = `https://lemmy.world/api/v3/search?q=${encodeURIComponent(
         keyword
-      )}&type_=Posts&sort=TopAll&limit=25`;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
-      const res = await fetch(lemmyUrl, { signal: controller.signal });
-      clearTimeout(timer);
+      )}&type_=Posts&sort=TopAll&limit=20`;
+      const res = await fetchWithTimeout(lemmyUrl, 4000);
       if (!res.ok) return;
       const data = await res.json();
       const posts = Array.isArray(data?.posts) ? data.posts : [];
@@ -1251,7 +1275,7 @@ async function searchFediverseVideos(keyword) {
         const candidateUrl = post.url || post.embed_video_url;
         if (!candidateUrl || typeof candidateUrl !== 'string') continue;
 
-        if (new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i').test(candidateUrl)) {
+        if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
           const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
           if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
           results.push({
@@ -1275,19 +1299,16 @@ async function searchFediverseVideos(keyword) {
 }
 
 // 7. NASA Image & Video Library API (Direct .mp4 / .mov / .m4v / .m3u8 space & science footage)
-async function searchNasaVideos(keyword, limit = 6) {
+async function searchNasaVideos(keyword, limit = 4) {
   const apiUrl = `https://images-api.nasa.gov/search?q=${encodeURIComponent(keyword)}&media_type=video`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7500);
-  const res = await fetch(apiUrl, { signal: controller.signal });
-  clearTimeout(timer);
+  const res = await fetchWithTimeout(apiUrl, 4000);
   if (!res.ok) return [];
 
   const json = await res.json();
   const items = Array.isArray(json?.collection?.items) ? json.collection.items : [];
   if (!items.length) return [];
 
-  const shuffled = [...items].sort(() => Math.random() - 0.5).slice(0, Math.min(5, limit));
+  const shuffled = [...items].sort(() => Math.random() - 0.5).slice(0, Math.min(3, limit));
   const results = [];
 
   await Promise.all(
@@ -1297,7 +1318,7 @@ async function searchNasaVideos(keyword, limit = 6) {
         const manifestUrl = item?.href;
         if (!meta || !manifestUrl) return;
 
-        const mRes = await fetch(manifestUrl);
+        const mRes = await fetchWithTimeout(manifestUrl, 3000);
         if (!mRes.ok) return;
         const assetList = await mRes.json();
         if (!Array.isArray(assetList)) return;
@@ -1305,7 +1326,7 @@ async function searchNasaVideos(keyword, limit = 6) {
         const videoAssets = assetList.filter(
           (u) =>
             typeof u === 'string' &&
-            new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})$`, 'i').test(u) &&
+            VIDEO_EXT_END_REGEX.test(u) &&
             isFormatAllowedBySettings(detectVideoFormat(u).ext)
         );
         if (!videoAssets.length) return;
@@ -1348,8 +1369,7 @@ async function searchNasaVideos(keyword, limit = 6) {
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   const trimmed = targetUrl.trim();
 
-  const directRegex = new RegExp(`\\.(${VIDEO_EXT_REGEX_PATTERN})([?#].*)?$`, 'i');
-  if (directRegex.test(trimmed)) {
+  if (DIRECT_VIDEO_URL_REGEX.test(trimmed)) {
     const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
     const fileName = trimmed.split('/').pop().split('?')[0].split('#')[0] || 'Direct Video';
     return [
@@ -1424,32 +1444,86 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner') {
   return results;
 }
 
-// Pull videos from a single source object across open video networks
+// In-memory source pool cache (3-minute TTL) for instant 0ms subsequent pulls
+const sourcePoolCache = new Map();
+const SOURCE_CACHE_TTL_MS = 180_000;
+
+function getSourceCacheKey(source) {
+  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}`;
+}
+
+// Pull videos from a single source object with fast-first resolution & background pool caching
 async function pullFromSource(source) {
+  const cacheKey = getSourceCacheKey(source);
+  const cached = sourcePoolCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < SOURCE_CACHE_TTL_MS) {
+    const unseen = cached.items.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+    if (unseen.length >= 2) {
+      return unseen;
+    }
+  }
+
   if (source.type === 'subreddit') {
-    return await fetchSubredditVideos(source.value);
+    const items = await fetchSubredditVideos(source.value);
+    if (items.length > 0) {
+      sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
+    }
+    return items;
   }
   if (source.type === 'url') {
     return await scanUrlForVideos(source.value, source.label || 'Custom URL');
   }
-  // Default: 'keyword' -> query Archive.org, Prelinger, Wikimedia, Reddit, PeerTube, Fediverse & NASA in parallel
-  const settled = await Promise.allSettled([
-    searchInternetArchive(source.value, 5),
-    searchPrelingerArchives(source.value, 4),
-    searchRedditVideosByKeyword(source.value),
-    searchWikimediaVideos(source.value, 6),
-    searchPeerTubeVideos(source.value, 4),
-    searchFediverseVideos(source.value),
-    searchNasaVideos(source.value, 4)
-  ]);
 
+  // Default: 'keyword' -> race all 7 engines in parallel and resolve as soon as fast engines respond
   const combined = [];
-  for (const res of settled) {
-    if (res.status === 'fulfilled' && Array.isArray(res.value)) {
-      combined.push(...res.value);
+  const cacheRecord = { items: combined, timestamp: Date.now() };
+  sourcePoolCache.set(cacheKey, cacheRecord);
+
+  const enginePromises = [
+    searchWikimediaVideos(source.value, 5),
+    searchNasaVideos(source.value, 3),
+    searchRedditVideosByKeyword(source.value),
+    searchInternetArchive(source.value, 3),
+    searchPrelingerArchives(source.value, 2),
+    searchPeerTubeVideos(source.value, 3),
+    searchFediverseVideos(source.value)
+  ];
+
+  return new Promise((resolve) => {
+    let remaining = enginePromises.length;
+    let resolved = false;
+    let graceTimer = null;
+
+    const finish = () => {
+      if (resolved) return;
+      resolved = true;
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve([...combined]);
+    };
+
+    for (const p of enginePromises) {
+      Promise.resolve(p)
+        .then((items) => {
+          if (Array.isArray(items) && items.length > 0) {
+            combined.push(...items);
+            cacheRecord.timestamp = Date.now();
+            // As soon as the fastest engine yields videos, give a short 350ms grace window
+            // for other fast engines, then resolve immediately without waiting for slow APIs
+            if (!resolved && !graceTimer) {
+              graceTimer = setTimeout(finish, 350);
+              graceTimer.unref?.();
+            }
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          remaining--;
+          if (remaining === 0) {
+            finish();
+          }
+        });
     }
-  }
-  return combined;
+  });
 }
 
 // ==========================================
