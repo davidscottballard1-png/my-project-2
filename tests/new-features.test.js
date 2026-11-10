@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   STORAGE_KEYS,
+  DEFAULT_SOURCES,
+  ADULT_PRESET_SOURCES,
   settings,
   extractRedditVideosFromListing,
   fetchSubredditVideos,
@@ -31,6 +33,8 @@ const {
   seekVideoToPercent,
   toggleReelsFullscreen,
   animateReelsSlide,
+  getEffectiveActiveSources,
+  syncQueueAfterSourceChange,
   getAppState,
   setAppState,
   syncAgeGateUI,
@@ -1260,7 +1264,7 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
           return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
         };
 
-        // 1. Pulling from RedGIFs preset must NOT call SepiaSearch / PeerTube
+        // 1. Pulling from RedGIFs preset must ONLY query RedGIFs (no SepiaSearch / PeerTube or unrelated i.redd.it bleed)
         const rgResults = await pullFromSource({
           id: 'src-nsfw-redgifs',
           type: 'keyword',
@@ -1277,13 +1281,13 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
           'RedGIFs preset should return RedGIFs HD stream (including order=best fallback for trending)'
         );
         assert.ok(
-          rgResults.some((item) => item.videoUrl === 'https://i.redd.it/reddit_clip.mp4'),
-          'pullFromSource should wait for and interleave the second engine instead of cutting off after the first engine'
+          !rgResults.some((item) => item.videoUrl === 'https://i.redd.it/reddit_clip.mp4'),
+          'Dedicated RedGIFs preset must not bleed non-RedGIFs Reddit clips when isolated'
         );
 
-        // 2. Pulling from general keyword when PeerTube is not enabled must NOT call SepiaSearch / PeerTube
+        // 2. Pulling from general keyword when PeerTube is not enabled must interleave engines without PeerTube
         queriedUrls.length = 0;
-        await pullFromSource({
+        const kwResults = await pullFromSource({
           id: 'custom-kw-1',
           type: 'keyword',
           value: 'amateur clips',
@@ -1293,6 +1297,11 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         assert.ok(
           !queriedUrls.some((u) => u.includes('sepiasearch.org')),
           'General keyword source must not query PeerTube when PeerTube is not enabled'
+        );
+        assert.ok(
+          kwResults.some((item) => item.videoUrl === 'https://thumbs4.redgifs.com/RgBest1.mp4') &&
+            kwResults.some((item) => item.videoUrl === 'https://i.redd.it/reddit_clip.mp4'),
+          'General multi-engine keyword source should wait for and interleave multiple engines'
         );
 
         // 3. Pulling explicitly from a PeerTube source SHOULD query SepiaSearch / PeerTube
@@ -1398,7 +1407,7 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       }
     });
 
-    it('should reliably pull 18+ videos when Lemmy, PeerTube, and Vintage are disabled and Reddit/RedGIFs block CORS', async () => {
+    it('should reliably pull 18+ videos via enabled Free Tube sources when Reddit/RedGIFs block CORS without masquerading fake labels on isolated non-tube fetchers', async () => {
       const origFetch = globalThis.fetch;
       const origAllowNsfw = settings.allowNsfw;
       const origPrebuffer = settings.prebuffer;
@@ -1469,24 +1478,592 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       };
 
       try {
+        // Non-tube fetchers should NOT disguise Eporner videos under fake source badges when blocked
         const subItems = await fetchSubredditVideos('RealGirls');
-        assert.ok(subItems.length > 0, 'Subreddit pull should fall back to direct gvideo MP4 streams when Reddit blocks CORS');
-        assert.strictEqual(subItems[0].videoUrl, 'https://gvideo.eporner.com/epDirect101/epDirect101.mp4');
+        assert.strictEqual(subItems.length, 0, 'Subreddit pull must not masquerade Eporner streams as r/RealGirls');
 
         const rgItems = await searchRedgifsVideos('redgifs cosplay', 4);
-        assert.ok(rgItems.length > 0, 'RedGIFs pull should fall back to direct gvideo MP4 streams when RedGIFs/Reddit block CORS');
+        assert.strictEqual(rgItems.length, 0, 'RedGIFs pull must not masquerade Eporner streams as RedGIFs');
 
         const ftItems = await scanUrlForVideos('https://fulltaboo.tv/', 'FullTaboo.tv', true);
-        assert.ok(ftItems.length > 0, 'FullTaboo.tv URL scan should fall back to direct gvideo MP4 streams when proxy fails');
+        assert.strictEqual(ftItems.length, 0, 'FullTaboo.tv scan must not masquerade Eporner streams as FullTaboo.tv');
 
+        // Enabled Free Tube sources ('src-nsfw-tube-hd', 'src-nsfw-romantic') still populate videoQueue cleanly
         await pullRandomVideos(1);
         const stateAfter = getAppState();
-        assert.strictEqual(stateAfter.videoQueue.length, 1, 'Shuffle Random should populate videoQueue even when Reddit/RedGIFs/Proxies fail');
+        assert.strictEqual(stateAfter.videoQueue.length, 1, 'Shuffle Random should populate videoQueue via enabled Free Tube sources');
         assert.strictEqual(stateAfter.videoQueue[0].videoUrl.startsWith('https://gvideo.eporner.com/'), true);
+        assert.ok(
+          ['src-nsfw-tube-hd', 'src-nsfw-romantic'].includes(stateAfter.videoQueue[0].originSourceId),
+          'Queued Free Tube clip must carry the originSourceId of the enabled Free Tube source'
+        );
         assert.strictEqual(
           calledUrls.some((u) => u.includes('sepiasearch.org') || u.includes('lemmy') || u.includes('archive.org')),
           false,
           'Should never call PeerTube, Lemmy, or Archive.org when those sources are disabled'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.prebuffer = origPrebuffer;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should pull and randomize independently from EVERY single Safe preset source (1-by-1 in isolation) with zero cross-source bleed', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origPrebuffer = settings.prebuffer;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+
+      settings.allowNsfw = false;
+      settings.prebuffer = false;
+      globalThis.document = {
+        getElementById: (id) => (id === 'engPeerTube' ? { checked: false } : null)
+      };
+
+      try {
+        for (const targetPreset of DEFAULT_SOURCES) {
+          const isolatedSources = structuredClone(DEFAULT_SOURCES).map((s) => ({
+            ...s,
+            enabled: s.id === targetPreset.id
+          }));
+          setAppState({ sources: isolatedSources, videoQueue: [], currentIndex: -1 });
+
+          const active = getEffectiveActiveSources();
+          assert.strictEqual(active.length, 1, `Expected only ${targetPreset.id} active`);
+          assert.strictEqual(active[0].id, targetPreset.id);
+
+          const hitUrls = [];
+          globalThis.fetch = async (url) => {
+            const u = String(url);
+            hitUrls.push(u);
+
+            if (u.includes('images-api.nasa.gov/search')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  collection: {
+                    items: [1, 2, 3, 4].map((n) => ({
+                      data: [{ nasa_id: `nasa-${n}`, title: `NASA Clip ${n}` }],
+                      href: `https://images-assets.nasa.gov/video/nasa-${n}/collection.json`
+                    }))
+                  }
+                })
+              };
+            }
+            const nasaAssetMatch = u.match(/images-assets\.nasa\.gov\/video\/(nasa-\d+)\/collection\.json/);
+            if (nasaAssetMatch) {
+              const nid = nasaAssetMatch[1];
+              return {
+                ok: true,
+                json: async () => [`https://images-assets.nasa.gov/video/${nid}/${nid}~mobile.mp4`]
+              };
+            }
+            if (u.includes('archive.org/advancedsearch.php')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  response: {
+                    docs: [1, 2, 3, 4].map((n) => ({
+                      identifier: `ia-${targetPreset.id}-${n}`,
+                      title: `Archive Clip ${n}`
+                    }))
+                  }
+                })
+              };
+            }
+            const iaMetaMatch = u.match(/archive\.org\/metadata\/([^/?#]+)/);
+            if (iaMetaMatch) {
+              const ident = decodeURIComponent(iaMetaMatch[1]);
+              return {
+                ok: true,
+                json: async () => ({
+                  files: [{ name: `${ident}.mp4`, size: '5000000', format: 'h.264' }]
+                })
+              };
+            }
+            if (u.includes('commons.wikimedia.org/w/api.php')) {
+              const pages = {};
+              for (let n = 1; n <= 4; n++) {
+                pages[String(100 + n)] = {
+                  pageid: 100 + n,
+                  title: `File:Wiki_${targetPreset.id}_${n}.mp4`,
+                  videoinfo: [{ url: `https://upload.wikimedia.org/wiki/${targetPreset.id}-${n}.mp4`, mime: 'video/mp4' }]
+                };
+              }
+              return { ok: true, json: async () => ({ query: { pages } }) };
+            }
+            if (u.includes('api.dailymotion.com/videos')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  list: [1, 2, 3].map((n) => ({
+                    id: `dm${n}`,
+                    title: `DM ${n}`,
+                    stream_h264_url: `https://proxy.dailymotion.com/${targetPreset.id}-${n}.mp4`
+                  }))
+                })
+              };
+            }
+            const subMatch = u.match(/reddit\.com\/r\/([^/?#]+)\//i);
+            if (subMatch) {
+              const subName = decodeURIComponent(subMatch[1]);
+              return {
+                ok: true,
+                json: async () => ({
+                  data: {
+                    children: [1, 2, 3, 4].map((n) => ({
+                      data: {
+                        id: `${subName}-${n}`,
+                        title: `r/${subName} clip ${n}`,
+                        subreddit: subName,
+                        over_18: false,
+                        url_overridden_by_dest: `https://cdn.redditmedia.example/${subName}-${n}.mp4`
+                      }
+                    }))
+                  }
+                })
+              };
+            }
+            if (u.includes('reddit.com/search.json')) {
+              return { ok: true, json: async () => ({ data: { children: [] } }) };
+            }
+            return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+          };
+
+          // Pull 3 sequential random videos from this single active Safe source
+          await pullRandomVideos(1);
+          await pullRandomVideos(1);
+          await pullRandomVideos(1);
+
+          const queue = getAppState().videoQueue;
+          assert.strictEqual(queue.length, 3, `Single source ${targetPreset.id} should populate 3 videos across 3 pulls`);
+          for (const item of queue) {
+            assert.strictEqual(
+              item.originSourceId,
+              targetPreset.id,
+              `Every queued item must originate from ${targetPreset.id}`
+            );
+          }
+
+          const uniqueUrls = new Set(queue.map((q) => q.videoUrl));
+          assert.strictEqual(
+            uniqueUrls.size,
+            3,
+            `Repeated pulls on single source ${targetPreset.id} should randomize across distinct clips without repeating`
+          );
+
+          // Verify strict network isolation per preset type
+          assert.ok(!hitUrls.some((u) => u.includes('sepiasearch.org')), `${targetPreset.id} must never touch PeerTube`);
+          assert.ok(!hitUrls.some((u) => u.includes('eporner.com') || u.includes('redgifs.com') || u.includes('fulltaboo.tv')), `${targetPreset.id} must never touch 18+ hosts`);
+          if (targetPreset.type === 'subreddit') {
+            assert.ok(
+              hitUrls.every((u) => u.toLowerCase().includes(`/r/${targetPreset.value.toLowerCase()}/`)),
+              `Subreddit source ${targetPreset.id} must ONLY query r/${targetPreset.value}`
+            );
+          } else if (targetPreset.id === 'src-kw-space') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('nasa.gov')),
+              'NASA Space preset must ONLY query NASA APIs when isolated'
+            );
+          } else if (targetPreset.id === 'src-kw-vintage') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('archive.org')),
+              'Prelinger & Vintage preset must ONLY query Internet Archive / Prelinger when isolated'
+            );
+          } else {
+            assert.ok(
+              !hitUrls.some((u) => u.includes('nasa.gov') || u.includes('lemmy.world') || u.includes('mastodon.social')),
+              `General topic preset ${targetPreset.id} must not query unchecked NASA or Fediverse presets`
+            );
+          }
+        }
+      } finally {
+        globalThis.document = prevDoc;
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.prebuffer = origPrebuffer;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should pull and randomize independently from EVERY single 18+ preset source (all 11 presets + PeerTube & Lemmy, 1-by-1 in isolation) with zero cross-source bleed', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origPrebuffer = settings.prebuffer;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+
+      settings.allowNsfw = true;
+      settings.prebuffer = false;
+      globalThis.document = {
+        getElementById: (id) => (id === 'engPeerTube' ? { checked: false } : null)
+      };
+
+      const allAdultToTest = [
+        ...structuredClone(ADULT_PRESET_SOURCES),
+        { id: 'dir-fed-peertube', type: 'keyword', value: 'peertube nsfw adult', label: 'PeerTube Federated 18+', enabled: true, isNsfw: true },
+        { id: 'dir-fed-lemmy', type: 'keyword', value: 'lemmy fediverse nsfw', label: 'Lemmy & Mastodon 18+', enabled: true, isNsfw: true }
+      ];
+
+      try {
+        for (const targetPreset of allAdultToTest) {
+          const isolatedSources = structuredClone(allAdultToTest).map((s) => ({
+            ...s,
+            enabled: s.id === targetPreset.id
+          }));
+          setAppState({ sources: isolatedSources, videoQueue: [], currentIndex: -1 });
+
+          const active = getEffectiveActiveSources();
+          assert.strictEqual(active.length, 1, `Expected only ${targetPreset.id} active`);
+          assert.strictEqual(active[0].id, targetPreset.id);
+
+          const hitUrls = [];
+          globalThis.fetch = async (url) => {
+            const u = String(url);
+            hitUrls.push(u);
+
+            if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+              return { ok: true, json: async () => ({ token: 'tok' }) };
+            }
+            if (u.includes('api.redgifs.com/v2/gifs/search')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  gifs: [1, 2, 3, 4, 5].map((n) => ({
+                    id: `rg-${targetPreset.id}-${n}`,
+                    duration: 20 + n,
+                    tags: ['HD'],
+                    urls: { hd: `https://thumbs4.redgifs.com/${targetPreset.id}_${n}.mp4` }
+                  }))
+                })
+              };
+            }
+            const subMatch = u.match(/reddit\.com\/r\/([^/?#]+)\//i);
+            if (subMatch) {
+              const subName = decodeURIComponent(subMatch[1]);
+              return {
+                ok: true,
+                json: async () => ({
+                  data: {
+                    children: [1, 2, 3, 4, 5].map((n) => ({
+                      data: {
+                        id: `${subName}-${n}`,
+                        title: `18+ r/${subName} clip ${n}`,
+                        subreddit: subName,
+                        over_18: true,
+                        url_overridden_by_dest: `https://cdn.redditmedia.example/${subName}-${n}.mp4`
+                      }
+                    }))
+                  }
+                })
+              };
+            }
+            if (u.includes('eporner.com/api/v2/video/search')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  videos: [1, 2, 3, 4, 5].map((n) => ({
+                    id: `ep${n}`,
+                    title: `Tube Clip ${n}`,
+                    length_sec: 180 + n,
+                    hd: true,
+                    url: `https://www.eporner.com/video-ep${n}/`,
+                    embed: `https://www.eporner.com/embed/ep${n}/`
+                  }))
+                })
+              };
+            }
+            const epEmbedMatch = u.match(/eporner\.com\/embed\/(ep\d+)/);
+            if (epEmbedMatch) {
+              const eid = epEmbedMatch[1];
+              return {
+                ok: true,
+                text: async () => `<script>var s = "https://cdn.eporner.com/${eid}_720p.mp4";</script>`
+              };
+            }
+            if (u.includes('archive.org/advancedsearch.php')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  response: {
+                    docs: [1, 2, 3, 4].map((n) => ({
+                      identifier: `vintage-18-${n}`,
+                      title: `Vintage Film ${n}`
+                    }))
+                  }
+                })
+              };
+            }
+            const iaMetaMatch = u.match(/archive\.org\/metadata\/([^/?#]+)/);
+            if (iaMetaMatch) {
+              const ident = decodeURIComponent(iaMetaMatch[1]);
+              return {
+                ok: true,
+                json: async () => ({
+                  files: [{ name: `${ident}.mp4`, size: '8000000', format: 'h.264' }]
+                })
+              };
+            }
+            if (u === 'https://fulltaboo.tv/') {
+              // Provide 8 distinct watch slugs so crawling randomizes beyond just the top 3 links
+              const links = [1, 2, 3, 4, 5, 6, 7, 8]
+                .map((n) => `<a href="https://fulltaboo.tv/full-scene-episode-${n}/">Episode ${n}</a>`)
+                .join('\n');
+              return { ok: true, text: async () => `<html><body>${links}</body></html>` };
+            }
+            const ftWatchMatch = u.match(/fulltaboo\.tv\/full-scene-episode-(\d+)\//);
+            if (ftWatchMatch) {
+              const epNum = ftWatchMatch[1];
+              return {
+                ok: true,
+                text: async () =>
+                  `<html><title>Episode ${epNum}</title><body><video src="https://cdn.fulltaboo.example/ep-${epNum}.mp4"></video></body></html>`
+              };
+            }
+            if (u.includes('sepiasearch.org')) {
+              return {
+                ok: true,
+                json: async () => ({
+                  data: [1, 2, 3, 4].map((n) => ({
+                    uuid: `pt-nsfw-${n}`,
+                    name: `PT 18+ ${n}`,
+                    nsfw: true,
+                    account: { host: 'pt.example.org' }
+                  }))
+                })
+              };
+            }
+            const ptDetailMatch = u.match(/pt\.example\.org\/api\/v1\/videos\/(pt-nsfw-\d+)/);
+            if (ptDetailMatch) {
+              const pid = ptDetailMatch[1];
+              return {
+                ok: true,
+                json: async () => ({
+                  name: pid,
+                  nsfw: true,
+                  files: [{ fileDownloadUrl: `https://pt.example.org/static/${pid}.mp4`, size: 4000000 }]
+                })
+              };
+            }
+            if (u.includes('lemmynsfw.com') || u.includes('lemmy.world')) {
+              const hostTag = u.includes('lemmynsfw.com') ? 'nsfw' : 'world';
+              return {
+                ok: true,
+                json: async () => ({
+                  posts: [1, 2, 3, 4].map((n) => ({
+                    post: {
+                      id: `${hostTag}-${n}`,
+                      name: `Lemmy 18+ ${n}`,
+                      nsfw: true,
+                      url: `https://cdn.lemmy.example/${hostTag}-${n}.mp4`
+                    },
+                    community: { name: 'adult', nsfw: true }
+                  }))
+                })
+              };
+            }
+            return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+          };
+
+          await pullRandomVideos(1);
+          await pullRandomVideos(1);
+          await pullRandomVideos(1);
+
+          const queue = getAppState().videoQueue;
+          assert.strictEqual(queue.length, 3, `Single 18+ source ${targetPreset.id} should queue 3 videos across 3 pulls`);
+          for (const item of queue) {
+            assert.strictEqual(item.originSourceId, targetPreset.id, `Item must carry originSourceId=${targetPreset.id}`);
+            assert.strictEqual(item.isNsfw, true, `18+ source ${targetPreset.id} items must be marked isNsfw`);
+          }
+          assert.strictEqual(
+            new Set(queue.map((q) => q.videoUrl)).size,
+            3,
+            `Single 18+ source ${targetPreset.id} should randomize across distinct videos without immediate repeats`
+          );
+
+          // Strict per-source isolation checks
+          if (targetPreset.type === 'subreddit') {
+            assert.ok(
+              hitUrls.every((u) => u.toLowerCase().includes(`/r/${targetPreset.value.toLowerCase()}/`)),
+              `18+ subreddit ${targetPreset.id} must ONLY query r/${targetPreset.value}`
+            );
+          } else if (targetPreset.id === 'src-nsfw-redgifs' || targetPreset.id === 'src-nsfw-cosplay') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('api.redgifs.com')),
+              `${targetPreset.id} must ONLY query RedGIFs when RedGIFs responds`
+            );
+          } else if (targetPreset.id === 'src-nsfw-tube-hd' || targetPreset.id === 'src-nsfw-romantic') {
+            assert.ok(
+              !hitUrls.some(
+                (u) =>
+                  u.includes('fulltaboo.tv') ||
+                  u.includes('reddit.com') ||
+                  u.includes('redgifs.com') ||
+                  u.includes('archive.org') ||
+                  u.includes('sepiasearch.org') ||
+                  u.includes('lemmy')
+              ),
+              `Free Tube preset ${targetPreset.id} must not bleed into unchecked FullTaboo, Reddit, RedGIFs, Archive, PeerTube, or Lemmy`
+            );
+          } else if (targetPreset.id === 'src-nsfw-vintage') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('archive.org')),
+              'Vintage 18+ Archive preset must ONLY query archive.org'
+            );
+          } else if (targetPreset.id === 'src-nsfw-fulltaboo') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('fulltaboo.tv')),
+              'FullTaboo.tv preset must ONLY crawl fulltaboo.tv'
+            );
+          } else if (targetPreset.id === 'dir-fed-peertube') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('sepiasearch.org') || u.includes('pt.example.org')),
+              'PeerTube 18+ preset must ONLY query PeerTube'
+            );
+          } else if (targetPreset.id === 'dir-fed-lemmy') {
+            assert.ok(
+              hitUrls.every((u) => u.includes('lemmy') || u.includes('mastodon.social')),
+              'Lemmy & Mastodon 18+ preset must ONLY query Fediverse endpoints'
+            );
+          }
+        }
+      } finally {
+        globalThis.document = prevDoc;
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.prebuffer = origPrebuffer;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should immediately purge prebuffered queue items from unchecked sources when narrowing down to 1 active source', () => {
+      const origAllowNsfw = settings.allowNsfw;
+      const origState = getAppState();
+
+      try {
+        settings.allowNsfw = false;
+        const s1 = { id: 's1', type: 'subreddit', value: 'Unexpected', label: 'r/Unexpected', enabled: true, isNsfw: false };
+        const s2 = { id: 's2', type: 'subreddit', value: 'oddlysatisfying', label: 'r/oddlysatisfying', enabled: true, isNsfw: false };
+        const s3 = { id: 's3', type: 'keyword', value: 'nasa space launch', label: 'NASA', enabled: true, isNsfw: false };
+
+        setAppState({
+          sources: [s1, s2, s3],
+          videoQueue: [
+            { id: 'playing-now', videoUrl: 'https://ex.com/now.mp4', originSourceId: 's2' },
+            { id: 'queued-s2', videoUrl: 'https://ex.com/s2.mp4', originSourceId: 's2' },
+            { id: 'queued-s3', videoUrl: 'https://ex.com/s3.mp4', originSourceId: 's3' },
+            { id: 'queued-s1', videoUrl: 'https://ex.com/s1.mp4', originSourceId: 's1' },
+            { id: 'queued-vault', videoUrl: 'https://ex.com/vault.mp4', fromVault: true }
+          ],
+          currentIndex: 0
+        });
+
+        // Uncheck s2 and s3 so ONLY s1 remains checked
+        s2.enabled = false;
+        s3.enabled = false;
+        syncQueueAfterSourceChange();
+
+        const remaining = getAppState().videoQueue;
+        assert.deepStrictEqual(
+          remaining.map((v) => v.id),
+          ['playing-now', 'queued-s1', 'queued-vault'],
+          'Should preserve active video, active-source upcoming items, and Vault items while purging unchecked-source upcoming items'
+        );
+      } finally {
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should continuously refill and randomize in runContinuousPullCycle when only 1 source is checked (including multireddits)', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origPrebuffer = settings.prebuffer;
+      const origState = getAppState();
+
+      try {
+        settings.allowNsfw = true;
+        settings.prebuffer = true;
+        const singleMulti = {
+          id: 'dir-fed-multireddit',
+          type: 'subreddit',
+          value: 'nsfw+NSFW_GIF+RealGirls',
+          label: 'Reddit 18+ Mega-Mix',
+          enabled: true,
+          isNsfw: true
+        };
+        const disabledOther = {
+          id: 'src-nsfw-redgifs',
+          type: 'keyword',
+          value: 'redgifs',
+          label: 'RedGIFs',
+          enabled: false,
+          isNsfw: true
+        };
+
+        setAppState({ sources: [singleMulti, disabledOther], videoQueue: [], currentIndex: -1 });
+
+        const hitUrls = [];
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          hitUrls.push(u);
+          if (u.includes('/r/nsfw+NSFW_GIF+RealGirls/')) {
+            return {
+              ok: true,
+              json: async () => ({
+                data: {
+                  children: [1, 2, 3, 4, 5].map((n) => ({
+                    data: {
+                      id: `multi-${n}`,
+                      title: `Multi Clip ${n}`,
+                      subreddit: 'nsfw',
+                      over_18: true,
+                      url_overridden_by_dest: `https://cdn.redditmedia.example/multi-${n}.mp4`
+                    }
+                  }))
+                }
+              })
+            };
+          }
+          return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+        };
+
+        const added1 = await runContinuousPullCycle();
+        assert.strictEqual(added1, 4, 'First continuous background cycle should top up 4 clips from the single active source');
+
+        // Advance to clip index 3 and run another cycle — should recycle unseen/non-playing clips cleanly without stalling
+        const midQueue = getAppState().videoQueue;
+        setAppState({ videoQueue: midQueue, currentIndex: 3 });
+        const added2 = await runContinuousPullCycle();
+        assert.ok(added2 >= 1, 'Continuous background puller should keep supplying clips from the single source');
+
+        const finalQueue = getAppState().videoQueue;
+        assert.ok(
+          finalQueue.every((v) => v.originSourceId === 'dir-fed-multireddit'),
+          'Every continuously pulled video must come strictly from the single checked source'
+        );
+        assert.ok(
+          hitUrls.every((u) => u.includes('/r/nsfw+NSFW_GIF+RealGirls/')),
+          'Multireddit + separator must be preserved and zero unchecked sources queried'
         );
       } finally {
         globalThis.fetch = origFetch;

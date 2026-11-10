@@ -1867,18 +1867,34 @@ function revokeVideoItemBlobUrls(items) {
   }
 }
 
+function shuffleArray(items) {
+  const copy = Array.isArray(items) ? [...items] : [];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
 let modeGeneration = 0;
+let sourceSelectionGeneration = 0;
 
 function syncQueueAfterSourceChange() {
+  sourceSelectionGeneration++;
+  continuousSourceCursor = 0;
   sourcePoolCache.clear();
   const ptEnabled = isPeerTubeExplicitlyEnabled();
   const active = getEffectiveActiveSources();
+  const activeIds = new Set(active.map((s) => s?.id).filter(Boolean));
 
   if (!ptEnabled && videoQueue.some((item) => isPeerTubeVideoItem(item))) {
     const currentItem = videoQueue[currentIndex];
     const wasPlayingPt = isPeerTubeVideoItem(currentItem);
     const removedPt = videoQueue.filter((item) => isPeerTubeVideoItem(item));
     videoQueue = videoQueue.filter((item) => !isPeerTubeVideoItem(item));
+    for (const item of removedPt) {
+      if (item?.videoUrl) seenUrls.delete(item.videoUrl);
+    }
     revokeVideoItemBlobUrls(removedPt);
     if (videoQueue.length === 0) {
       currentIndex = -1;
@@ -1903,10 +1919,42 @@ function syncQueueAfterSourceChange() {
 
   if (active.length === 0) {
     stopContinuousBackgroundPuller();
-    if (currentIndex >= 0 && videoQueue.length > currentIndex + 1) {
-      const trimmed = videoQueue.slice(currentIndex + 1);
-      videoQueue = videoQueue.slice(0, currentIndex + 1);
-      revokeVideoItemBlobUrls(trimmed);
+  }
+
+  const keepCutoff = currentIndex >= 0 ? currentIndex : -1;
+  if (videoQueue.length > keepCutoff + 1) {
+    const preservedHead = keepCutoff >= 0 ? videoQueue.slice(0, keepCutoff + 1) : [];
+    const upcoming = videoQueue.slice(keepCutoff + 1);
+    const keptUpcoming = [];
+    const removedUpcoming = [];
+
+    for (const item of upcoming) {
+      if (item?.fromVault) {
+        keptUpcoming.push(item);
+      } else if (active.length > 0 && item?.originSourceId && activeIds.has(item.originSourceId)) {
+        keptUpcoming.push(item);
+      } else {
+        removedUpcoming.push(item);
+      }
+    }
+
+    if (removedUpcoming.length > 0) {
+      videoQueue = [...preservedHead, ...keptUpcoming];
+      for (const item of removedUpcoming) {
+        if (item?.videoUrl) seenUrls.delete(item.videoUrl);
+      }
+      revokeVideoItemBlobUrls(removedUpcoming);
+
+      if (prebufferVideoEl) {
+        const nextRemaining = videoQueue[currentIndex + 1];
+        const nextUrl = nextRemaining ? getEffectivePlaybackUrl(nextRemaining) : '';
+        if (!nextUrl || prebufferVideoEl.src !== nextUrl) {
+          try {
+            prebufferVideoEl.src = '';
+          } catch {}
+        }
+      }
+
       if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
         updatePlayerUI();
       }
@@ -3444,26 +3492,12 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       const redditSort = isTrendingDefault ? 'hot' : 'relevance';
       const rgRedditUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
         redditQuery
-      )}&type=link&sort=${redditSort}&include_over_18=1&limit=20&raw_json=1`;
+      )}&type=link&sort=${redditSort}&include_over_18=1&limit=25&raw_json=1`;
       const json = await fetchWithCorsFallback(rgRedditUrl, false);
-      const fallbackItems = extractRedditVideosFromListing(json, `RedGIFs (${cleanKw})`, true);
-      results.push(...fallbackItems.slice(0, limit));
-    } catch {
-      // ignore fallback error
-    }
-  }
-
-  // 4. Native-CORS fallback when both api.redgifs.com and www.reddit.com are blocked by browser CORS
-  if (results.length === 0) {
-    try {
-      const epFallback = await fetchDirectEpornerVideos(
-        cleanKw,
-        limit,
-        `RedGIFs (${cleanKw})`,
-        'shortest',
-        false
+      const fallbackItems = extractRedditVideosFromListing(json, `RedGIFs (${cleanKw})`, true).filter(
+        (item) => /redgifs\.com/i.test(`${item?.videoUrl || ''} ${item?.originalUrl || ''}`)
       );
-      results.push(...epFallback.slice(0, limit));
+      results.push(...fallbackItems.slice(0, limit));
     } catch {
       // ignore fallback error
     }
@@ -3590,25 +3624,31 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
 
 async function fetchSubredditVideos(subreddit) {
   const cleanSub = subreddit.replace(/^\/?r\//i, '').trim();
+  const encodedSubPath = cleanSub
+    .split('+')
+    .map((part) => encodeURIComponent(part.trim()))
+    .filter(Boolean)
+    .join('+');
   const nsfwFlag = settings.allowNsfw ? '1' : '0';
   const sorts = ['hot', 'top', 'new'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
-  const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`;
+  const endpoints = [
+    `https://www.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`,
+    `https://old.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`
+  ];
 
-  try {
-    const json = await fetchWithCorsFallback(url, false);
-    const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
-    if (extracted.length > 0) return extracted;
-    const sfwOrAll = extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
-    if (sfwOrAll.length > 0) return sfwOrAll;
-  } catch {
-    // Fall through to native-CORS fallback when Reddit blocks CORS/proxies
+  for (const url of endpoints) {
+    try {
+      const json = await fetchWithCorsFallback(url, false);
+      const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
+      if (extracted.length > 0) return extracted;
+      const sfwOrAll = extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
+      if (sfwOrAll.length > 0) return sfwOrAll;
+    } catch {
+      // Try alternate Reddit mirror
+    }
   }
 
-  if (settings.allowNsfw) {
-    const nicheQuery = getSubredditNicheQuery(cleanSub);
-    return await fetchDirectEpornerVideos(nicheQuery, 6, `r/${cleanSub}`, null, false);
-  }
   return [];
 }
 
@@ -3688,14 +3728,6 @@ async function searchRedditVideosByKeyword(keyword) {
   }
 
   await Promise.allSettled(tasks);
-
-  if (results.length === 0 && settings.allowNsfw) {
-    try {
-      const epFallback = await fetchDirectEpornerVideos(rawKw, 6, `Reddit (${rawKw})`, null, false);
-      addUnique(epFallback);
-    } catch {}
-  }
-
   return results;
 }
 
@@ -4196,12 +4228,12 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     }
   }
 
-  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 3 watch pages
+  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 4 randomized watch pages
   if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string' && rawText.length > 0) {
     const candidateLinks = [];
     const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
     let lm;
-    while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 8) {
+    while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 24) {
       try {
         const fullLink = new URL(lm[1].replace(/&amp;/g, '&'), trimmed).href;
         if (fullLink !== trimmed && !candidateLinks.includes(fullLink)) {
@@ -4213,14 +4245,14 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     }
 
     // Also support WordPress / Tube post-slug watch pages on the same host (e.g. https://fulltaboo.tv/post-title-slug/)
-    if (candidateLinks.length < 3) {
+    if (candidateLinks.length < 24) {
       let baseHost = '';
       try {
         baseHost = new URL(trimmed).host;
       } catch {}
       const slugRegex = /href=["']([^"'#?]+)["']/gi;
       let sm;
-      while ((sm = slugRegex.exec(rawText)) !== null && candidateLinks.length < 10) {
+      while ((sm = slugRegex.exec(rawText)) !== null && candidateLinks.length < 24) {
         try {
           const parsed = new URL(sm[1].replace(/&amp;/g, '&'), trimmed);
           if (baseHost && parsed.host !== baseHost) continue;
@@ -4242,7 +4274,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       }
     }
 
-    const watchLinks = candidateLinks.slice(0, 3);
+    const watchLinks = shuffleArray(candidateLinks).slice(0, 4);
     if (watchLinks.length > 0) {
       const subSettled = await Promise.allSettled(
         watchLinks.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
@@ -4253,25 +4285,6 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
         }
       }
     }
-  }
-
-  // Native-CORS fallback for 18+ tube URLs (e.g. FullTaboo.tv, PornOne) when HTML proxy scraping is blocked
-  if (allowSubpageCrawl && results.length === 0 && settings.allowNsfw) {
-    try {
-      const parsed = new URL(trimmed);
-      const qParam = parsed.searchParams.get('s') || parsed.searchParams.get('q') || '';
-      const isFullTaboo = /fulltaboo/i.test(parsed.hostname);
-      const fallbackQuery = qParam.trim() || (isFullTaboo ? 'taboo full' : 'popular hd');
-      const fallbackOrder = isFullTaboo ? 'longest' : null;
-      const fallbackItems = await fetchDirectEpornerVideos(
-        fallbackQuery,
-        5,
-        customLabel || parsed.hostname,
-        fallbackOrder,
-        false
-      );
-      results.push(...fallbackItems);
-    } catch {}
   }
 
   if (markScannedNsfw) {
@@ -4352,7 +4365,7 @@ function extractCandidateWebPagesFromSearchHtml(rawHtml) {
   return [...videoWatchPriority, ...others];
 }
 
-// 10. Open-Web & Public Video Sites Discovery Crawler (Discovers & scans sites across the web not in Sources)
+// 10. Open-Web & Public Video Sites Discovery Crawler (Discovers & scans sites across the web)
 async function searchOpenWebVideos(keyword, limit = 6) {
   const cleanKw = String(keyword || '').trim();
   if (!cleanKw) return [];
@@ -4457,18 +4470,16 @@ async function searchOpenWebVideos(keyword, limit = 6) {
     })()
   );
 
-  // C. Crawl Custom / Preset Website URLs via Site Search (?s=keyword) even if not currently active in Sources
+  // C. Crawl ONLY currently enabled Custom / Preset Website URL sources via Site Search (?s=keyword)
   tasks.push(
     (async () => {
       try {
-        const allUrlSources = [...sources, ...ADULT_PRESET_SOURCES].filter((s) => {
-          if (!s || s.type !== 'url' || !s.value) return false;
-          if (s.isNsfw && !settings.allowNsfw) return false;
-          return true;
-        });
+        const enabledUrlSources = getEffectiveActiveSources().filter(
+          (s) => s && s.enabled && s.type === 'url' && s.value
+        );
         const uniqueOrigins = [];
         const seenOrigins = new Set();
-        for (const s of allUrlSources) {
+        for (const s of enabledUrlSources) {
           try {
             const u = new URL(s.value);
             if (!seenOrigins.has(u.origin)) {
@@ -4521,7 +4532,7 @@ function filterAndSortTubeResults(
   });
 }
 
-// 9. Automatic Free Tube Sites Search Engine (Dailymotion in Safe Mode; Eporner API v2, RedGIFs API v2, FullTaboo.tv, PornOne, Open Tube Discovery & Multi-Sub 18+ in 18+ Mode)
+// 9. Automatic Free Tube Sites Search Engine (Dailymotion in Safe Mode; Eporner API v2 & PornOne in 18+ Mode, plus FullTaboo.tv when enabled)
 async function searchFreeTubeSites(keyword, limit = 6) {
   const results = [];
   const tasks = [];
@@ -4576,52 +4587,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
       })()
     );
 
-    // 2. RedGIFs API v2 HD Short Tube Clips
-    tasks.push(
-      (async () => {
-        const rgItems = await searchRedgifsVideos(keyword, 4);
-        results.push(...rgItems);
-      })()
-    );
-
-    // 3. Direct 18+ Tube Stream Search (RedGIFs / v.redd.it NSFW video streams)
-    tasks.push(
-      (async () => {
-        const nsfwTubeUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-          `${keyword} nsfw:yes`
-        )}&type=link&sort=hot&include_over_18=1&limit=25&raw_json=1`;
-        const json = await fetchWithCorsFallback(nsfwTubeUrl, false);
-        const extracted = extractRedditVideosFromListing(json, `18+ Tube (${keyword})`);
-        results.push(...extracted.slice(0, limit));
-      })()
-    );
-
-    // 4. Curated Multi-Subreddit 18+ Video Network (6-in-1 Verified 18+ Communities)
-    tasks.push(
-      (async () => {
-        const multiSub = 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual+nsfwcosplay';
-        const multiUrl = `https://www.reddit.com/r/${multiSub}/search.json?q=${encodeURIComponent(
-          keyword
-        )}&restrict_sr=1&sort=hot&include_over_18=1&limit=20&raw_json=1`;
-        const json = await fetchWithCorsFallback(multiUrl, false);
-        const extracted = extractRedditVideosFromListing(json, `18+ Multi-Sub (${keyword})`);
-        results.push(...extracted.slice(0, limit));
-      })()
-    );
-
-    // 5. FullTaboo.tv Full-Length 18+ Tube Search Crawler
-    tasks.push(
-      (async () => {
-        const ftSearchUrl = `https://fulltaboo.tv/?s=${encodeURIComponent(keyword)}`;
-        const ftItems = await scanUrlForVideos(ftSearchUrl, `FullTaboo.tv (${keyword})`, true);
-        for (const item of ftItems) {
-          item.isNsfw = true;
-          results.push(item);
-        }
-      })()
-    );
-
-    // 6. PornOne & Open Tube Sites Search Crawler (Discovers streams across public tube sites)
+    // 2. PornOne & Open Tube Sites Search Crawler (Discovers streams across public tube sites)
     tasks.push(
       (async () => {
         try {
@@ -4634,6 +4600,23 @@ async function searchFreeTubeSites(keyword, limit = 6) {
         } catch {}
       })()
     );
+
+    // 3. FullTaboo.tv Full-Length 18+ Tube Search Crawler (only when FullTaboo URL source is active)
+    const fullTabooActive = getEffectiveActiveSources().some(
+      (s) => s && s.enabled && s.type === 'url' && /fulltaboo\.tv/i.test(String(s.value || ''))
+    );
+    if (fullTabooActive) {
+      tasks.push(
+        (async () => {
+          const ftSearchUrl = `https://fulltaboo.tv/?s=${encodeURIComponent(keyword)}`;
+          const ftItems = await scanUrlForVideos(ftSearchUrl, `FullTaboo.tv (${keyword})`, true);
+          for (const item of ftItems) {
+            item.isNsfw = true;
+            results.push(item);
+          }
+        })()
+      );
+    }
   }
 
   await Promise.allSettled(tasks);
@@ -4649,6 +4632,12 @@ function isPeerTubeSource(src) {
   if (!src || typeof src !== 'object') return false;
   const hay = `${src.id || ''} ${src.value || ''} ${src.label || ''} ${src.engine || ''}`;
   return /\bpeertube\b/i.test(hay);
+}
+
+function isFreeTubePresetSource(src) {
+  if (!src || typeof src !== 'object' || src.type === 'subreddit' || src.type === 'url') return false;
+  const hay = `${src.id || ''} ${src.label || ''} ${src.engine || ''}`.toLowerCase();
+  return /^dir-tube-|^src-nsfw-tube-hd|^src-nsfw-romantic|\bfree tube\b/.test(hay);
 }
 
 function isPeerTubeExplicitlyEnabled(targetSource = null) {
@@ -4671,7 +4660,7 @@ function isPeerTubeExplicitlyEnabled(targetSource = null) {
 }
 
 // Route dedicated presets (RedGIFs, NASA, Prelinger, Vintage/Archive, Fediverse, Free Tube, PeerTube)
-// to their actual target networks, and only include PeerTube on general keywords when explicitly enabled
+// strictly to their own target networks without bleeding into unchecked sources
 function buildKeywordEnginePromises(source, isStrictNsfw) {
   const rawVal = String(source?.value || '').trim();
   const hay = `${source?.id || ''} ${rawVal} ${source?.label || ''} ${source?.engine || ''}`.toLowerCase();
@@ -4680,57 +4669,49 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
   // 1. Dedicated PeerTube source
   if (isPeerTubeSource(source)) {
     const ptQuery = rawVal.replace(/\bpeertube\b/gi, '').trim() || (isStrictNsfw ? 'nsfw' : 'video');
-    return [searchPeerTubeVideos(ptQuery, 6)];
+    return [searchPeerTubeVideos(ptQuery, 8)];
   }
 
   // 2. Dedicated RedGIFs preset or niche source
-  if (/^dir-rg-|^src-nsfw-redgifs|\bredgifs\b/.test(hay)) {
-    return [
-      searchRedgifsVideos(rawVal, 6),
-      searchRedditVideosByKeyword(rawVal)
-    ];
+  if (/^dir-rg-|^src-nsfw-redgifs|^src-nsfw-cosplay|\bredgifs\b/.test(hay)) {
+    return [searchRedgifsVideos(rawVal, 10)];
   }
 
   // 3. Dedicated NASA Space & Science preset (Safe Mode)
   if (!isStrictNsfw && (/^src-kw-space|\bnasa\b/.test(hay))) {
-    return [
-      searchNasaVideos(rawVal, 5),
-      searchInternetArchive(rawVal, 4),
-      searchWikimediaVideos(rawVal, 4)
-    ];
+    return [searchNasaVideos(rawVal, 8)];
   }
 
   // 4. Dedicated Prelinger & Vintage Cartoons preset (Safe Mode)
   if (!isStrictNsfw && (/^src-kw-vintage|\bprelinger\b/.test(hay))) {
     return [
-      searchPrelingerArchives(rawVal, 5),
-      searchInternetArchive(rawVal, 5)
+      searchPrelingerArchives(rawVal, 6),
+      searchInternetArchive(rawVal, 6)
     ];
   }
 
   // 5. Dedicated Lemmy & Mastodon Fediverse preset
   if (/^dir-fed-lemmy|\b(?:lemmy|fediverse|mastodon)\b/.test(hay)) {
-    return [
-      searchFediverseVideos(rawVal),
-      searchRedditVideosByKeyword(rawVal)
-    ];
+    return [searchFediverseVideos(rawVal)];
   }
 
-  // 6. Dedicated Free Tube / Full-Length Tube / Vintage 18+ Archive presets
-  if (/^dir-tube-|^src-nsfw-tube-hd|^src-nsfw-romantic|^src-nsfw-vintage|^dir-fed-archive/.test(hay)) {
-    const tubePromises = [
-      searchFreeTubeSites(rawVal, 6),
-      searchOpenWebVideos(rawVal, 5),
-      searchRedgifsVideos(rawVal, 5),
-      searchRedditVideosByKeyword(rawVal)
-    ];
-    if (/\b(?:vintage|archive|burlesque|classic)\b/.test(hay)) {
-      tubePromises.push(searchInternetArchive(rawVal, 4));
+  // 6. Dedicated Vintage 18+ Archive / Burlesque Archive presets
+  if (/^src-nsfw-vintage|^dir-fed-archive/.test(hay)) {
+    return [searchInternetArchive(rawVal, 8)];
+  }
+
+  // 7. Dedicated Free Tube / Full-Length Tube 18+ presets
+  if (/^dir-tube-|^src-nsfw-tube-hd|^src-nsfw-romantic/.test(hay)) {
+    if (source?.id === 'dir-tube-vintage') {
+      return [
+        searchFreeTubeSites(rawVal, 8),
+        searchInternetArchive(rawVal, 6)
+      ];
     }
-    return tubePromises;
+    return [searchFreeTubeSites(rawVal, 8)];
   }
 
-  // 7. General keyword source or custom keyword search
+  // 8. General keyword source or custom keyword search
   if (isStrictNsfw) {
     const nsfwEngines = [
       searchRedgifsVideos(rawVal, 5),
@@ -4745,13 +4726,10 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
   }
 
   const safeEngines = [
-    searchWikimediaVideos(rawVal, 5),
-    searchNasaVideos(rawVal, 3),
+    searchWikimediaVideos(rawVal, 6),
+    searchInternetArchive(rawVal, 6),
     searchRedditVideosByKeyword(rawVal),
-    searchInternetArchive(rawVal, 5),
-    searchPrelingerArchives(rawVal, 2),
-    searchFediverseVideos(rawVal),
-    searchFreeTubeSites(rawVal, 4),
+    searchFreeTubeSites(rawVal, 5),
     searchOpenWebVideos(rawVal, 5)
   ];
   if (peerTubeAllowed) {
@@ -4786,8 +4764,13 @@ function interleaveVideoBuckets(buckets) {
   return combined;
 }
 
-// Pull videos from a single source object, waiting until all target engines finish pulling
+// Pull videos from a single source object, randomize within the source pool, and tag originSourceId
 async function pullFromSource(source) {
+  const stampAndShuffle = (list) =>
+    shuffleArray(list).map((item) =>
+      source?.id ? { ...item, originSourceId: source.id } : { ...item }
+    );
+
   const cacheKey = getSourceCacheKey(source);
   const cached = sourcePoolCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SOURCE_CACHE_TTL_MS) {
@@ -4795,7 +4778,7 @@ async function pullFromSource(source) {
       cached.items.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl))
     );
     if (unseen.length >= 2) {
-      return unseen;
+      return stampAndShuffle(unseen);
     }
   }
 
@@ -4804,7 +4787,7 @@ async function pullFromSource(source) {
     if (items.length > 0) {
       sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
     }
-    return items;
+    return stampAndShuffle(items);
   }
   if (source.type === 'url' || /^https?:\/\//i.test(String(source.value || '').trim())) {
     const items = await scanUrlForVideos(source.value, source.label || 'Custom URL');
@@ -4816,7 +4799,7 @@ async function pullFromSource(source) {
     if (items.length > 0) {
       sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
     }
-    return items;
+    return stampAndShuffle(items);
   }
 
   // Default: 'keyword' -> wait until all target engines finish pulling and interleave results
@@ -4846,7 +4829,7 @@ async function pullFromSource(source) {
   if (combined.length > 0) {
     sourcePoolCache.set(cacheKey, { items: combined, timestamp: Date.now() });
   }
-  return combined;
+  return stampAndShuffle(combined);
 }
 
 // ==========================================
@@ -4915,6 +4898,7 @@ async function runContinuousPullCycle() {
   continuousPullPromise = (async () => {
     let addedCount = 0;
     const pullGen = modeGeneration;
+    const pullSourceGen = sourceSelectionGeneration;
     const pullAllowNsfw = Boolean(settings.allowNsfw);
     try {
       const batchSize = Math.min(2, effectiveSources.length);
@@ -4929,7 +4913,11 @@ async function runContinuousPullCycle() {
         batchSources.map((src) => pullFromSource(src))
       );
 
-      if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+      if (
+        pullGen !== modeGeneration ||
+        pullSourceGen !== sourceSelectionGeneration ||
+        Boolean(settings.allowNsfw) !== pullAllowNsfw
+      ) {
         return 0;
       }
 
@@ -4941,8 +4929,17 @@ async function runContinuousPullCycle() {
       }
 
       const interleaved = interleaveVideoBuckets(buckets);
-      const fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
-      const picks = fresh.slice(0, 4);
+      let fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+      if (fresh.length === 0 && interleaved.length > 1 && effectiveSources.length === 1) {
+        const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
+        for (const item of interleaved) {
+          if (item?.videoUrl && item.videoUrl !== currentPlayingUrl) {
+            seenUrls.delete(item.videoUrl);
+          }
+        }
+        fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+      }
+      const picks = shuffleArray(fresh).slice(0, 4);
       for (const p of picks) {
         seenUrls.add(p.videoUrl);
         videoQueue.push(p);
@@ -5602,6 +5599,7 @@ async function handleVideoPlaybackError() {
 
 async function pullRandomVideos(count = 1, customKeyword = null) {
   const pullGen = modeGeneration;
+  const pullSourceGen = sourceSelectionGeneration;
   const pullAllowNsfw = Boolean(settings.allowNsfw);
 
   if (typeof document !== 'undefined') {
@@ -5644,7 +5642,11 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       let waveCount = 0;
 
       while (inspectedCount < totalActive && waveCount < 3) {
-        if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+        if (
+          pullGen !== modeGeneration ||
+          pullSourceGen !== sourceSelectionGeneration ||
+          Boolean(settings.allowNsfw) !== pullAllowNsfw
+        ) {
           return;
         }
         const batchSize = Math.min(MAX_FOREGROUND_SOURCE_BATCH, totalActive - inspectedCount);
@@ -5657,12 +5659,16 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         inspectedCount += batchSize;
         waveCount++;
 
-        const shuffledWave = [...waveSources].sort(() => Math.random() - 0.5);
+        const shuffledWave = shuffleArray(waveSources);
         const results = await Promise.allSettled(
           shuffledWave.map((src) => pullFromSource(src))
         );
 
-        if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+        if (
+          pullGen !== modeGeneration ||
+          pullSourceGen !== sourceSelectionGeneration ||
+          Boolean(settings.allowNsfw) !== pullAllowNsfw
+        ) {
           return;
         }
 
@@ -5682,21 +5688,44 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       pool = interleaveVideoBuckets(sourceBuckets);
 
       if (pool.length === 0 && pullAllowNsfw) {
-        try {
-          const fallbackSeed = activeSources[0]?.value || 'popular hd';
-          pool = await fetchDirectEpornerVideos(fallbackSeed, 6, activeSources[0]?.label || '18+ HD Feed', null, false);
-        } catch {}
+        const activeTubeSource = activeSources.find((s) => isFreeTubePresetSource(s));
+        if (activeTubeSource) {
+          try {
+            const fallbackSeed = activeTubeSource.value || 'popular hd';
+            const fbItems = await fetchDirectEpornerVideos(
+              fallbackSeed,
+              6,
+              activeTubeSource.label || 'Free Tube 18+',
+              null,
+              false
+            );
+            pool = fbItems.map((item) =>
+              activeTubeSource.id ? { ...item, originSourceId: activeTubeSource.id } : item
+            );
+          } catch {}
+        }
       }
     }
 
-    if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+    if (
+      pullGen !== modeGeneration ||
+      (!customKeyword && pullSourceGen !== sourceSelectionGeneration) ||
+      Boolean(settings.allowNsfw) !== pullAllowNsfw
+    ) {
       return;
     }
 
     let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
     if (fresh.length === 0 && pool.length > 0) {
+      const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
       seenUrls.clear();
-      fresh = pool;
+      if (currentPlayingUrl && pool.length > 1) {
+        seenUrls.add(currentPlayingUrl);
+        fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+      }
+      if (fresh.length === 0) {
+        fresh = pool;
+      }
     }
 
     if (fresh.length === 0) {
@@ -5712,7 +5741,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       fresh = [...FALLBACK_VIDEOS];
     }
 
-    const selected = fresh.sort(() => Math.random() - 0.5).slice(0, count);
+    const selected = shuffleArray(fresh).slice(0, count);
     for (const item of selected) {
       seenUrls.add(item.videoUrl);
       videoQueue.push(item);
@@ -7625,6 +7654,9 @@ if (typeof module !== 'undefined' && module.exports) {
     updateHeaderSummary,
     unlockAdultPresetSources,
     getEffectiveActiveSources,
+    syncQueueAfterSourceChange,
+    shuffleArray,
+    isFreeTubePresetSource,
     setNsfwPin,
     clearNsfwPin,
     verifyMasterAppPasscode,
@@ -7660,6 +7692,9 @@ if (typeof module !== 'undefined' && module.exports) {
     setAppState: (patch = {}) => {
       if (Array.isArray(patch.sources)) {
         sources = patch.sources;
+        sourceSelectionGeneration++;
+        continuousSourceCursor = 0;
+        sourcePoolCache.clear();
         if (!Array.isArray(patch.deletedSourceIds)) {
           settings.deletedSourceIds = [];
         }
@@ -7672,8 +7707,11 @@ if (typeof module !== 'undefined' && module.exports) {
         revokeVideoItemBlobUrls(videoQueue.filter((item) => !nextSet.has(item)));
         videoQueue = patch.videoQueue;
         consecutiveErrorSkips = 0;
-        if (patch.videoQueue.length === 0 && !patch.playbackPositions) {
-          playbackPositions = {};
+        if (patch.videoQueue.length === 0) {
+          seenUrls.clear();
+          if (!patch.playbackPositions) {
+            playbackPositions = {};
+          }
         }
       }
       if (typeof patch.currentIndex === 'number') currentIndex = patch.currentIndex;
