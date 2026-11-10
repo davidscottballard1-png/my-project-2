@@ -1,6 +1,7 @@
 const { describe, it, afterEach } = require('node:test');
 const assert = require('node:assert');
 const {
+  STORAGE_KEYS,
   DEFAULT_SOURCES,
   ADULT_PRESET_SOURCES,
   ADULT_DIRECTORY_CATALOG,
@@ -25,6 +26,7 @@ const {
   buildExportFilename,
   setAdultContentEnabled,
   renderSourcesList,
+  renderSearchResults,
   renderVaultList,
   saveVideoToVaultDB,
   toggleVaultFavorite,
@@ -41,8 +43,18 @@ const {
   enableDirectoryCategory,
   toggleAdultDirectory,
   renderAdultDirectory,
+  getAllVaultVideos,
+  deleteVaultVideoDB,
   clearVaultDB,
+  scanUrlForVideos,
+  getSourceCacheKey,
+  updateHeaderSummary,
+  revokeVideoItemBlobUrls,
   updatePlayerUI,
+  obtainIphoneReadyVideoBlob,
+  saveAndCacheVideoToVault,
+  rehydrateQueueOfflineBlobsFromVault,
+  loadState,
   getAppState,
   setAppState
 } = require('../app.js');
@@ -766,4 +778,707 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(elements.get('mainVideo').playbackRate, 1);
     });
   });
+
+  describe('8. Audit Bug Fixes & Edge-Case Regressions', () => {
+    it('should report effective active source count in header summary across Safe and 18+ mode transitions', () => {
+      const { elements } = setupTestEnv();
+      setAppState({ sources: structuredClone(DEFAULT_SOURCES) });
+      settings.allowNsfw = false;
+      updateHeaderSummary();
+      assert.ok(
+        elements.get('activeSourceSummary').textContent.startsWith(`${DEFAULT_SOURCES.length} sources`),
+        'Safe mode should show 6 active safe sources'
+      );
+
+      setAdultContentEnabled(true);
+      const nsfwEffective = getEffectiveActiveSources().length;
+      assert.ok(
+        elements.get('activeSourceSummary').textContent.startsWith(`${nsfwEffective} sources`),
+        '18+ mode should show only effective 18+ sources'
+      );
+
+      setAdultContentEnabled(false);
+      const safeEffective = getEffectiveActiveSources().length;
+      assert.strictEqual(safeEffective, DEFAULT_SOURCES.length);
+      assert.ok(
+        elements.get('activeSourceSummary').textContent.startsWith(`${safeEffective} sources`),
+        'Returning to Safe mode should show 6 active safe sources, not 6 + 11'
+      );
+    });
+
+    it('should preserve cached offlineBlob and deduplicate by videoUrl when toggling Favorite in Player', async () => {
+      setupTestEnv();
+      settings.prebuffer = false;
+
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        clear: () => {
+          records.clear();
+          const req = { onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      const fakeBlob = new Blob([new Uint8Array(1024 * 512)], { type: 'video/mp4' });
+      const clipWithoutId = {
+        title: 'Offline Dedup Test',
+        videoUrl: 'https://ex.com/offline-dedup.mp4',
+        format: 'mp4',
+        isNsfw: false
+      };
+
+      setAppState({ videoQueue: [clipWithoutId], currentIndex: 0 });
+      await saveVideoToVaultDB(clipWithoutId, { blob: fakeBlob, ext: 'mp4', mime: 'video/mp4' });
+      assert.ok(clipWithoutId.id, 'saveVideoToVaultDB should sync generated id onto videoItem');
+
+      // Now toggle Favorite in Player without passing offlineData
+      await toggleCurrentVideoFavorite();
+      const allItems = await getAllVaultVideos();
+      assert.strictEqual(allItems.length, 1, 'Should not create duplicate Vault records');
+      assert.strictEqual(allItems[0].isFavorite, true);
+      assert.strictEqual(allItems[0].hasOfflineBlob, true, 'Should preserve hasOfflineBlob when toggling favorite');
+      assert.strictEqual(allItems[0].offlineSize, 1024 * 512, 'Should preserve offlineSize when toggling favorite');
+      assert.ok(allItems[0].offlineBlob instanceof Blob, 'Should preserve offlineBlob when toggling favorite');
+
+      await clearVaultDB();
+    });
+
+    it('should keep fallback video paused and muted on triggerPanicSafeMode even when autoPlay is enabled', () => {
+      const { elements } = setupTestEnv();
+      const mainVideo = elements.get('mainVideo');
+      mainVideo.play = function () {
+        this.paused = false;
+        return Promise.resolve();
+      };
+      settings.autoPlay = true;
+      settings.allowNsfw = true;
+      setAppState({
+        videoQueue: [{ id: 'nsfw-1', title: '18+ Clip', videoUrl: 'https://ex.com/nsfw.mp4', isNsfw: true }],
+        currentIndex: 0
+      });
+
+      triggerPanicSafeMode();
+
+      assert.strictEqual(mainVideo.muted, true, 'Panic fallback video must be muted');
+      assert.strictEqual(mainVideo.paused, true, 'Panic fallback video must remain paused');
+    });
+
+    it('should not restore a safe video into 18+ Only Mode on restorePlaybackState', () => {
+      setupTestEnv();
+      settings.allowNsfw = false;
+      settings.resumePlayback = true;
+      setAppState({
+        videoQueue: [{ id: 'safe-1', title: 'Safe Clip', videoUrl: 'https://ex.com/safe.mp4', isNsfw: false }],
+        currentIndex: 0
+      });
+      savePlaybackState(12);
+
+      // Switch to 18+ mode and attempt restorePlaybackState
+      settings.allowNsfw = true;
+      setAppState({ videoQueue: [], currentIndex: -1 });
+      const restored = restorePlaybackState();
+      assert.strictEqual(restored, false, 'Safe video should not be restored when allowNsfw is true');
+      assert.strictEqual(getAppState().videoQueue.length, 0);
+    });
+
+    it('should revoke object URLs when revokeVideoItemBlobUrls is called on removed queue items', () => {
+      const origRevoke = URL.revokeObjectURL;
+      const revoked = [];
+      URL.revokeObjectURL = (u) => revoked.push(u);
+      try {
+        const item = {
+          id: 'blob-item-1',
+          videoUrl: 'https://ex.com/v.mp4',
+          convertedBlobUrl: 'blob:https://ex.com/conv-1',
+          offlineObjectUrl: 'blob:https://ex.com/off-1'
+        };
+        revokeVideoItemBlobUrls([item]);
+        assert.deepStrictEqual(revoked, ['blob:https://ex.com/conv-1', 'blob:https://ex.com/off-1']);
+        assert.strictEqual(item.convertedBlobUrl, undefined);
+        assert.strictEqual(item.offlineObjectUrl, undefined);
+      } finally {
+        URL.revokeObjectURL = origRevoke;
+      }
+    });
+
+    it('should safely decode malformed percent-encoding and enforce formatMode on direct URLs in scanUrlForVideos', async () => {
+      setupTestEnv();
+      settings.formatMode = 'all';
+      const malformedDirect = await scanUrlForVideos('https://example.com/clip_100%_raw.mp4');
+      assert.strictEqual(malformedDirect.length, 1);
+      assert.strictEqual(malformedDirect[0].title, 'clip_100%_raw.mp4');
+
+      settings.formatMode = 'mp4';
+      const filteredWebm = await scanUrlForVideos('https://example.com/sample.webm');
+      assert.strictEqual(filteredWebm.length, 0, 'Direct .webm URL should be filtered when formatMode is mp4');
+    });
+
+    it('should include tubeDurationFilter and tubeQualityFilter in getSourceCacheKey', () => {
+      setupTestEnv();
+      const src = { id: 's1', type: 'keyword', value: 'test', enabled: true, isNsfw: false };
+      settings.tubeDurationFilter = 'all';
+      settings.tubeQualityFilter = 'all';
+      const keyAll = getSourceCacheKey(src);
+
+      settings.tubeDurationFilter = 'long';
+      settings.tubeQualityFilter = 'hd';
+      const keyLongHd = getSourceCacheKey(src);
+      assert.notStrictEqual(keyAll, keyLongHd);
+    });
+
+    it('should reset isFavorite on active videoQueue items when deleted or cleared from Vault', async () => {
+      setupTestEnv();
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        delete: (id) => {
+          records.delete(id);
+          const req = { onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        clear: () => {
+          records.clear();
+          const req = { onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      const item = {
+        id: 'vault-del-sync-1',
+        title: 'Sync Test',
+        videoUrl: 'https://ex.com/sync.mp4',
+        isNsfw: false
+      };
+      setAppState({ videoQueue: [item], currentIndex: 0 });
+      await toggleCurrentVideoFavorite();
+      assert.strictEqual(getAppState().videoQueue[0].isFavorite, true);
+
+      await deleteVaultVideoDB(item.id);
+      assert.strictEqual(getAppState().videoQueue[0].isFavorite, false);
+    });
+
+    it('should preserve the active video and timestamp when currentIndex >= 25 in savePlaybackState / restorePlaybackState', () => {
+      setupTestEnv();
+      settings.allowNsfw = false;
+      settings.resumePlayback = true;
+      const queue = Array.from({ length: 28 }, (_, i) => ({
+        id: `q-item-${i}`,
+        title: `Video ${i}`,
+        videoUrl: `https://ex.com/v${i}.mp4`,
+        isNsfw: false
+      }));
+      setAppState({ videoQueue: queue, currentIndex: 26 });
+      savePlaybackState(37.5);
+
+      setAppState({ videoQueue: [], currentIndex: -1 });
+      const restored = restorePlaybackState();
+      assert.strictEqual(restored, true);
+      const state = getAppState();
+      assert.strictEqual(state.videoQueue[state.currentIndex].id, 'q-item-26');
+      assert.strictEqual(state.videoQueue[state.currentIndex].resumeTime, 37.5);
+    });
+  });
+
+  describe('9. Chromium Live-Audit Regressions (Container Extensions, HLS Export, Safe-Mode Vault Filter, Offline Blob Rehydration & Cache Feedback)', () => {
+    it('should preserve true container extension (.mkv) instead of mislabeling raw bytes as .mp4 when transcode is unavailable', async () => {
+      setupTestEnv();
+      const origFetch = globalThis.fetch;
+      try {
+        const mkvMagic = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88]);
+        globalThis.fetch = async () => new Response(mkvMagic, { status: 200 });
+
+        const res = await obtainIphoneReadyVideoBlob(
+          {
+            id: 'mkv-raw-1',
+            title: 'Sample Matroska',
+            videoUrl: 'https://ex.com/clip.mkv',
+            format: 'mkv'
+          },
+          true
+        );
+
+        assert.strictEqual(res.wasConverted, false);
+        assert.strictEqual(res.ext, 'mkv');
+        assert.strictEqual(res.mime, 'video/x-matroska');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('should export stitched HLS .m3u8 fMP4 and MPEG-TS streams as .mp4 / .ts instead of .m3u8 on fallback', async () => {
+      setupTestEnv();
+      const origFetch = globalThis.fetch;
+      try {
+        const segBytes = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
+        globalThis.fetch = async (url) => {
+          const s = String(url);
+          if (s.endsWith('fmp4.m3u8')) {
+            return new Response('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\nseg0.m4s\n', {
+              status: 200
+            });
+          }
+          if (s.endsWith('ts.m3u8')) {
+            return new Response('#EXTM3U\n#EXTINF:2.0,\nseg0.ts\n', { status: 200 });
+          }
+          return new Response(segBytes, { status: 200 });
+        };
+
+        const fmp4Res = await obtainIphoneReadyVideoBlob(
+          {
+            id: 'hls-fmp4-1',
+            title: 'HLS fMP4',
+            videoUrl: 'https://ex.com/fmp4.m3u8',
+            format: 'm3u8'
+          },
+          false
+        );
+        assert.strictEqual(fmp4Res.ext, 'mp4');
+        assert.strictEqual(fmp4Res.mime, 'video/mp4');
+
+        const tsRes = await obtainIphoneReadyVideoBlob(
+          {
+            id: 'hls-ts-1',
+            title: 'HLS TS',
+            videoUrl: 'https://ex.com/ts.m3u8',
+            format: 'm3u8'
+          },
+          false
+        );
+        assert.strictEqual(tsRes.ext, 'ts');
+        assert.strictEqual(tsRes.mime, 'video/mp2t');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('should reset vaultFilter from nsfw / nsfw_favorites to all when switching to Safe Mode or loading Safe Mode state', async () => {
+      const { elements, storage } = setupTestEnv();
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      settings.allowNsfw = false;
+      await saveVideoToVaultDB({
+        id: 'safe-vault-card-1',
+        title: 'Safe Nature Documentary',
+        videoUrl: 'https://ex.com/nature.mp4',
+        isNsfw: false
+      });
+
+      settings.allowNsfw = true;
+      settings.vaultFilter = 'nsfw';
+      setAdultContentEnabled(false);
+
+      assert.strictEqual(settings.vaultFilter, 'all');
+      await renderVaultList();
+      assert.ok(
+        elements.get('vaultList').innerHTML.includes('Safe Nature Documentary'),
+        'Safe Vault item must remain visible after switching from 18+ mode with nsfw filter active'
+      );
+
+      // Also verify loadState normalizes persisted nsfw_favorites when allowNsfw is false
+      storage.set(
+        'reelvault_settings_v2',
+        JSON.stringify({ allowNsfw: false, vaultFilter: 'nsfw_favorites' })
+      );
+      loadState();
+      assert.strictEqual(settings.vaultFilter, 'all');
+    });
+
+    it('should rehydrate offlineBlob from IndexedDB Vault on restorePlaybackState without loading dead remote URLs', async () => {
+      const { elements } = setupTestEnv();
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      settings.allowNsfw = false;
+      settings.resumePlayback = true;
+      const cachedBlob = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'video/mp4' });
+      const saved = await saveVideoToVaultDB(
+        {
+          id: 'offline-resume-1',
+          title: 'Offline Airplane Clip',
+          videoUrl: 'http://127.0.0.1:41999/dead-server.mp4',
+          format: 'mp4',
+          isNsfw: false
+        },
+        { blob: cachedBlob, ext: 'mp4', mime: 'video/mp4' }
+      );
+
+      setAppState({ videoQueue: [saved], currentIndex: 0 });
+      savePlaybackState(12.5);
+
+      // Simulate fresh reload where in-memory queue & mainVideo are empty
+      setAppState({ videoQueue: [], currentIndex: -1, playbackPositions: {} });
+      const mainVideo = elements.get('mainVideo');
+      mainVideo.src = '';
+
+      const restored = restorePlaybackState();
+      assert.strictEqual(restored, true);
+      // Before IndexedDB settles, mainVideo.src must NOT be set to the dead remote HTTP URL
+      assert.notStrictEqual(mainVideo.src, 'http://127.0.0.1:41999/dead-server.mp4');
+
+      await rehydrateQueueOfflineBlobsFromVault();
+      const active = getAppState().videoQueue[0];
+      assert.ok(active.offlineBlob instanceof Blob, 'offlineBlob should be rehydrated from IndexedDB');
+      assert.ok(mainVideo.src.startsWith('blob:'), `Expected blob: URL, got ${mainVideo.src}`);
+      assert.strictEqual(mainVideo.currentTime, 12.5);
+    });
+
+    it('should keep cache-vault-item button disabled mid-flight and show error toast when offline download fails', async () => {
+      const { elements } = setupTestEnv();
+      const origFetch = globalThis.fetch;
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      let shouldFailNow = false;
+      const pendingRejects = [];
+      globalThis.fetch = () => {
+        if (shouldFailNow) {
+          return Promise.reject(new Error('HTTP 404'));
+        }
+        return new Promise((_, reject) => {
+          pendingRejects.push(reject);
+        });
+      };
+
+      try {
+        settings.allowNsfw = false;
+        const saved = await saveVideoToVaultDB({
+          id: 'vault-cache-fail-1',
+          title: 'Dead Stream Vault Item',
+          videoUrl: 'https://ex.com/404.mp4',
+          format: 'mp4',
+          isNsfw: false
+        });
+
+        const cachePromise = saveAndCacheVideoToVault(saved, true);
+        await new Promise((r) => setTimeout(r, 15));
+
+        // Even if renderVaultList() runs mid-flight, button must stay disabled with Caching label
+        await renderVaultList();
+        const midHtml = elements.get('vaultList').innerHTML;
+        assert.ok(midHtml.includes('⏳ Caching...'), 'Button should show ⏳ Caching... while active');
+        assert.ok(midHtml.includes('disabled'), 'Button should remain disabled while active');
+
+        shouldFailNow = true;
+        for (const fn of pendingRejects) {
+          fn(new Error('HTTP 404'));
+        }
+        await cachePromise;
+
+        assert.ok(
+          elements.get('toast').textContent.includes('Could not cache video offline'),
+          `Expected failure toast, got: ${elements.get('toast').textContent}`
+        );
+        const finalHtml = elements.get('vaultList').innerHTML;
+        assert.ok(finalHtml.includes('☁️ Cache Offline'), 'Button should reset after failure');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+  });
+
+  describe('Pass-2 Audit Regressions: Scanned 18+ Privacy Scrub, Preset Source Deletion & Vault Shuffle/Resume', () => {
+    it('tags URLs scanned in 18+ Mode (or from known 18+ domains) as isNsfw and purges them when exiting 18+ Mode', async () => {
+      const { elements } = setupTestEnv();
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        text: async () =>
+          '<html><body><video src="https://cdn-media.example.org/private_clip.mp4"></video></body></html>'
+      });
+
+      try {
+        setAdultContentEnabled(true);
+        const directFound = await scanUrlForVideos(
+          'https://cdn-media.example.org/direct_adult_reel.mp4',
+          'Scanned Page'
+        );
+        assert.strictEqual(directFound.length, 1);
+        assert.strictEqual(directFound[0].isNsfw, true);
+
+        const pageFound = await scanUrlForVideos(
+          'https://cdn-media.example.org/gallery.html',
+          'Scanned Page'
+        );
+        assert.strictEqual(pageFound.length, 1);
+        assert.strictEqual(pageFound[0].isNsfw, true);
+
+        renderSearchResults(pageFound);
+        setAppState({
+          videoQueue: [pageFound[0]],
+          currentIndex: 0
+        });
+        updatePlayerUI();
+        savePlaybackState();
+        assert.ok(elements.get('mainVideo').src.includes('private_clip.mp4'));
+        assert.ok(elements.get('searchResultsList').innerHTML.includes('private_clip'));
+
+        // Turning 18+ Mode OFF must completely scrub player, queue, search results, and saved resume state
+        setAdultContentEnabled(false);
+        const afterState = getAppState();
+        assert.strictEqual(afterState.videoQueue.length, 0);
+        assert.strictEqual(afterState.currentIndex, -1);
+        assert.strictEqual(afterState.lastSearchResults.length, 0);
+        assert.strictEqual(elements.get('mainVideo').src, '');
+        assert.ok(!elements.get('searchResultsList').innerHTML.includes('private_clip'));
+        assert.strictEqual(globalThis.localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE), null);
+
+        // Known explicit 18+ domain should also be tagged isNsfw even if scanned while allowNsfw is false
+        const domainFound = await scanUrlForVideos(
+          'https://www.eporner.com/hd-porn/test_clip.mp4',
+          'Scanned Page'
+        );
+        assert.strictEqual(domainFound[0].isNsfw, true);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('persists deleted 18+ preset sources across mode switches, respects empty 18+ source list, and re-unlocks on explicit preset load', () => {
+      setupTestEnv();
+      setAdultContentEnabled(true);
+      const initialNsfwCount = getAppState().sources.filter((s) => s.isNsfw).length;
+      assert.strictEqual(initialNsfwCount, ADULT_PRESET_SOURCES.length);
+
+      // Delete 2 built-in 18+ presets and record in deletedSourceIds
+      const removedIds = ADULT_PRESET_SOURCES.slice(0, 2).map((p) => p.id);
+      setAppState({
+        sources: getAppState().sources.filter((s) => !removedIds.includes(s.id)),
+        deletedSourceIds: [...removedIds]
+      });
+
+      // Toggle Safe Mode -> 18+ Mode: deleted presets must NOT resurrect
+      setAdultContentEnabled(false);
+      setAdultContentEnabled(true);
+      const afterToggleNsfw = getAppState().sources.filter((s) => s.isNsfw);
+      assert.strictEqual(afterToggleNsfw.length, ADULT_PRESET_SOURCES.length - 2);
+      for (const id of removedIds) {
+        assert.ok(!afterToggleNsfw.some((s) => s.id === id), `Deleted preset ${id} should not resurrect`);
+      }
+
+      // Delete ALL 18+ presets: getEffectiveActiveSources() must return [] (0 sources), NOT fallback to all 11
+      const allPresetIds = ADULT_PRESET_SOURCES.map((p) => p.id);
+      setAppState({
+        sources: getAppState().sources.filter((s) => !s.isNsfw),
+        deletedSourceIds: allPresetIds
+      });
+      assert.strictEqual(getEffectiveActiveSources().length, 0);
+
+      // Explicit unlockAdultPresetSources() ("Unlock 18+ Source Pack" button) restores all presets
+      const restoredCount = unlockAdultPresetSources();
+      assert.strictEqual(restoredCount, ADULT_PRESET_SOURCES.length);
+      assert.strictEqual(getEffectiveActiveSources().length, ADULT_PRESET_SOURCES.length);
+    });
+
+    it('shuffles visible Vault items under "All Vault Videos" & "Favorites Only" in 18+ Mode and resumes watched Vault items on reload', async () => {
+      setupTestEnv();
+      const records = new Map();
+      const store = {
+        getAll: () => {
+          const req = { result: [...records.values()], onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        },
+        put: (rec) => {
+          records.set(rec.id, rec);
+          const req = { result: rec.id, onsuccess: null };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+      globalThis.indexedDB = {
+        open: () => {
+          const req = {
+            result: {
+              objectStoreNames: { contains: () => true },
+              transaction: () => ({ objectStore: () => store })
+            },
+            onsuccess: null
+          };
+          queueMicrotask(() => req.onsuccess?.());
+          return req;
+        }
+      };
+
+      const savedClip = await saveVideoToVaultDB({
+        id: 'vault-general-clip-1',
+        title: 'Saved Offline Clip',
+        videoUrl: 'https://cdn.example.org/saved_clip.mp4',
+        format: 'mp4',
+        isNsfw: false,
+        favorite: true
+      });
+      assert.ok(savedClip);
+
+      setAdultContentEnabled(true);
+      settings.vaultFilter = 'all';
+      await renderVaultList();
+
+      const shuffled = await shuffleVaultToPlayer({ startReels: false });
+      assert.strictEqual(shuffled.length, 1, 'Shuffle Vault in "all" mode should include visible Vault items');
+      assert.strictEqual(getAppState().videoQueue[0].fromVault, true);
+
+      // "nsfw" filter in Vault must still strictly filter to 18+ items only
+      settings.vaultFilter = 'nsfw';
+      const nsfwShuffled = await shuffleVaultToPlayer({ startReels: false });
+      assert.strictEqual(nsfwShuffled.length, 0, '18+ Only Vault filter should still exclude non-18+ Vault items');
+
+      // Reload resume in 18+ Mode: Vault item (fromVault: true) resumes, whereas regular Safe feed item is still blocked
+      settings.vaultFilter = 'all';
+      setAppState({
+        videoQueue: [
+          {
+            id: 'vault-general-clip-1',
+            title: 'Saved Offline Clip',
+            videoUrl: 'https://cdn.example.org/saved_clip.mp4',
+            format: 'mp4',
+            isNsfw: false,
+            fromVault: true
+          },
+          {
+            id: 'regular-safe-feed-1',
+            title: 'Regular Safe Feed Item',
+            videoUrl: 'https://cdn.example.org/safe_feed.mp4',
+            format: 'mp4',
+            isNsfw: false
+          }
+        ],
+        currentIndex: 0
+      });
+      savePlaybackState();
+
+      setAppState({ videoQueue: [], currentIndex: -1 });
+      const restored = restorePlaybackState();
+      assert.strictEqual(restored, true);
+      assert.strictEqual(getAppState().videoQueue.length, 1);
+      assert.strictEqual(getAppState().videoQueue[0].id, 'vault-general-clip-1');
+    });
+  });
 });
+
+

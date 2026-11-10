@@ -321,7 +321,8 @@ let settings = {
   autoConvert: true,
   autoAdvance: true,
   prebuffer: true,
-  offlineVaultCache: true
+  offlineVaultCache: true,
+  deletedSourceIds: []
 };
 let videoQueue = [];
 let currentIndex = -1;
@@ -473,7 +474,7 @@ async function loadFfmpegConverter(onStatus) {
     }
 
     const ffmpeg = new FFmpegWasm();
-    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
     const [workerURL, coreURL, wasmURL] = await Promise.all([
       toBlobURL('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js', 'text/javascript'),
       toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
@@ -535,36 +536,38 @@ async function transcodeBlobWithFfmpegWasm(sourceBlob, inputExt, onProgress) {
     const uint8 = new Uint8Array(await sourceBlob.arrayBuffer());
     await ffmpeg.writeFile(inputName, uint8);
 
-    // Try fast container stream copy first (instant for MKV/MOV/TS/FLV/AVI containing H.264)
+    // Try fast container stream copy first (instant for MP4/MKV/MOV/TS/FLV/AVI containing H.264)
     let remuxSucceeded = false;
-    if (['mkv', 'mov', 'm4v', 'ts', 'm2ts', 'flv', 'f4v', 'avi'].includes(safeExt)) {
+    if (['mp4', 'mkv', 'mov', 'm4v', 'ts', 'm2ts', 'flv', 'f4v', 'avi'].includes(safeExt)) {
       onProgress?.(`Remuxing .${safeExt.toUpperCase()} container to .MP4...`, 35);
-      const copyExitCode = await ffmpeg.exec([
-        '-i', inputName,
-        '-c', 'copy',
-        '-movflags', '+faststart',
-        outputName
-      ]);
+      const remuxArgs = ['-i', inputName, '-c', 'copy'];
+      if (safeExt === 'ts' || safeExt === 'm2ts') {
+        remuxArgs.push('-bsf:a', 'aac_adtstoasc');
+      }
+      remuxArgs.push('-movflags', '+faststart', outputName);
+      const copyExitCode = await ffmpeg.exec(remuxArgs);
       if (copyExitCode === 0) {
         try {
           const copiedData = await ffmpeg.readFile(outputName);
           if (copiedData && copiedData.byteLength > 1024) {
             remuxSucceeded = true;
-            return new Blob([copiedData.buffer], { type: 'video/mp4' });
+            return new Blob([new Uint8Array(copiedData)], { type: 'video/mp4' });
           }
         } catch {
           remuxSucceeded = false;
         }
       }
+      try { await ffmpeg.deleteFile(outputName); } catch {}
     }
 
-    // Full transcode to iPhone-compatible MP4 (MPEG-4 / H.264 + AAC with yuv420p)
+    // Full transcode to universal iPhone & browser-compatible MP4 (H.264 libx264 + AAC with yuv420p)
     if (!remuxSucceeded) {
       onProgress?.(`Transcoding .${safeExt.toUpperCase()} to iPhone .MP4...`, 25);
-      const exitCode = await ffmpeg.exec([
+      let exitCode = await ffmpeg.exec([
         '-i', inputName,
-        '-c:v', 'mpeg4',
-        '-q:v', '5',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '26',
         '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
@@ -573,13 +576,27 @@ async function transcodeBlobWithFfmpegWasm(sourceBlob, inputExt, onProgress) {
         outputName
       ]);
       if (exitCode !== 0) {
+        try { await ffmpeg.deleteFile(outputName); } catch {}
+        exitCode = await ffmpeg.exec([
+          '-i', inputName,
+          '-c:v', 'mpeg4',
+          '-q:v', '5',
+          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          outputName
+        ]);
+      }
+      if (exitCode !== 0) {
         throw new Error(`FFmpeg transcode exited with code ${exitCode}`);
       }
       const data = await ffmpeg.readFile(outputName);
       if (!data || data.byteLength < 512) {
         throw new Error('FFmpeg produced empty output');
       }
-      return new Blob([data.buffer], { type: 'video/mp4' });
+      return new Blob([new Uint8Array(data)], { type: 'video/mp4' });
     }
   } finally {
     ffmpeg.off('progress', progressHandler);
@@ -608,10 +625,12 @@ async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
   return new Promise((resolve, reject) => {
     const srcUrl = URL.createObjectURL(sourceBlob);
     const tempVideo = document.createElement('video');
-    tempVideo.muted = true;
+    tempVideo.muted = false;
+    tempVideo.volume = 1;
     tempVideo.playsInline = true;
     tempVideo.preload = 'auto';
     tempVideo.src = srcUrl;
+    let audioCtx = null;
 
     const cleanup = () => {
       try {
@@ -619,6 +638,12 @@ async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
         tempVideo.removeAttribute('src');
         tempVideo.load();
       } catch {}
+      if (audioCtx) {
+        try {
+          audioCtx.close?.();
+        } catch {}
+        audioCtx = null;
+      }
       URL.revokeObjectURL(srcUrl);
     };
 
@@ -645,6 +670,25 @@ async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
         const stream = canvas.captureStream ? canvas.captureStream(30) : null;
         if (!stream) {
           throw new Error('Canvas captureStream unavailable');
+        }
+
+        // Route decoded audio silently into MediaRecorder without speaker output
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (AudioCtx) {
+          try {
+            audioCtx = new AudioCtx();
+            await audioCtx.resume?.();
+            const mediaSource = audioCtx.createMediaElementSource(tempVideo);
+            const mediaDest = audioCtx.createMediaStreamDestination();
+            mediaSource.connect(mediaDest);
+            for (const audioTrack of mediaDest.stream.getAudioTracks()) {
+              stream.addTrack(audioTrack);
+            }
+          } catch {
+            tempVideo.muted = true;
+          }
+        } else {
+          tempVideo.muted = true;
         }
 
         const chunks = [];
@@ -936,11 +980,12 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
   // 3. Download the primary file (or crawl & stitch snippets if it is an HLS .m3u8 playlist)
   let rawBlob = null;
   let effectiveInputExt = fmtInfo.ext;
+  let assembledHls = null;
 
   if (fmtInfo.ext === 'm3u8') {
-    const assembled = await downloadAndAssembleM3u8Stream(videoItem.videoUrl, onProgress);
-    rawBlob = assembled.blob;
-    effectiveInputExt = assembled.ext;
+    assembledHls = await downloadAndAssembleM3u8Stream(videoItem.videoUrl, onProgress);
+    rawBlob = assembledHls.blob;
+    effectiveInputExt = assembledHls.ext;
   } else {
     rawBlob = await fetchVideoBlobWithProgress(
       videoItem.videoUrl,
@@ -986,11 +1031,22 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
     };
   }
 
-  // 5. Graceful fallback: if on-device transcode wasn't possible, return original or MP4-wrapped blob
+  // 5. Graceful fallback: if on-device transcode wasn't possible, return true container extension & MIME
+  if (assembledHls) {
+    const hlsExt = assembledHls.ext || 'mp4';
+    const hlsMime = assembledHls.mime || (hlsExt === 'ts' ? 'video/mp2t' : 'video/mp4');
+    return {
+      blob: rawBlob,
+      ext: hlsExt,
+      mime: hlsMime,
+      wasConverted: false
+    };
+  }
+
   return {
     blob: rawBlob,
-    ext: fmtInfo.iphoneNative ? fmtInfo.ext : 'mp4',
-    mime: fmtInfo.iphoneNative ? fmtInfo.mime : 'video/mp4',
+    ext: fmtInfo.ext === 'gifv' ? 'mp4' : fmtInfo.ext,
+    mime: fmtInfo.ext === 'gifv' ? 'video/mp4' : fmtInfo.mime,
     wasConverted: false
   };
 }
@@ -1052,68 +1108,187 @@ async function saveVideoToVaultDB(videoItem, offlineBlobData = null) {
     delete copy.convertedBlobUrl;
     delete copy.offlineObjectUrl;
 
-    if (offlineBlobData?.blob instanceof Blob) {
-      copy.offlineBlob = offlineBlobData.blob;
-      copy.offlineMime = offlineBlobData.mime || 'video/mp4';
-      copy.offlineExt = offlineBlobData.ext || 'mp4';
-      copy.offlineSize = offlineBlobData.blob.size;
-      copy.hasOfflineBlob = true;
-    } else if (copy.offlineBlob instanceof Blob) {
-      copy.offlineSize = copy.offlineBlob.size;
-      copy.hasOfflineBlob = true;
-    }
+    const finalizePut = (existing = null) => {
+      if (existing && typeof existing === 'object') {
+        if (!copy.id && existing.id) {
+          copy.id = existing.id;
+        }
+        if (!copy.savedAt && existing.savedAt) {
+          copy.savedAt = existing.savedAt;
+        }
+        if (typeof videoItem?.isFavorite !== 'boolean' && typeof existing.isFavorite === 'boolean') {
+          copy.isFavorite = existing.isFavorite;
+        }
+        if (
+          !(offlineBlobData?.blob instanceof Blob) &&
+          !(copy.offlineBlob instanceof Blob) &&
+          existing.hasOfflineBlob
+        ) {
+          copy.offlineBlob = existing.offlineBlob;
+          copy.offlineMime = existing.offlineMime || 'video/mp4';
+          copy.offlineExt = existing.offlineExt || 'mp4';
+          copy.offlineSize = existing.offlineSize || (existing.offlineBlob?.size || 0);
+          copy.hasOfflineBlob = true;
+        }
+      }
 
-    const isNsfwItem =
-      typeof copy.isNsfw === 'boolean'
-        ? copy.isNsfw
-        : Boolean(copy.over_18 || settings.allowNsfw);
+      if (offlineBlobData?.blob instanceof Blob) {
+        copy.offlineBlob = offlineBlobData.blob;
+        copy.offlineMime = offlineBlobData.mime || 'video/mp4';
+        copy.offlineExt = offlineBlobData.ext || 'mp4';
+        copy.offlineSize = offlineBlobData.blob.size;
+        copy.hasOfflineBlob = true;
+      } else if (copy.offlineBlob instanceof Blob) {
+        copy.offlineSize = copy.offlineBlob.size;
+        copy.hasOfflineBlob = true;
+      }
 
-    const record = {
-      ...copy,
-      isNsfw: isNsfwItem,
-      isFavorite: Boolean(copy.isFavorite),
-      id: copy.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-      savedAt: copy.savedAt || Date.now()
+      const isNsfwItem =
+        typeof copy.isNsfw === 'boolean'
+          ? copy.isNsfw
+          : Boolean(copy.over_18 || settings.allowNsfw);
+
+      const record = {
+        ...copy,
+        isNsfw: isNsfwItem,
+        isFavorite: Boolean(copy.isFavorite),
+        id: copy.id || 'v-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+        savedAt: copy.savedAt || Date.now()
+      };
+
+      if (videoItem && typeof videoItem === 'object') {
+        videoItem.id = record.id;
+        if (record.hasOfflineBlob) {
+          videoItem.hasOfflineBlob = true;
+          videoItem.offlineSize = record.offlineSize;
+        }
+      }
+
+      const req = store.put(record);
+      req.onsuccess = () => resolve(record);
+      req.onerror = () => reject(req.error);
     };
-    const req = store.put(record);
-    req.onsuccess = () => resolve(record);
-    req.onerror = () => reject(req.error);
+
+    if (typeof store.getAll === 'function') {
+      try {
+        const getAllReq = store.getAll();
+        getAllReq.onsuccess = () => {
+          const all = Array.isArray(getAllReq.result) ? getAllReq.result : [];
+          const match = all.find(
+            (r) =>
+              r &&
+              ((copy.id && r.id === copy.id) ||
+                (copy.videoUrl && r.videoUrl && r.videoUrl === copy.videoUrl))
+          );
+          finalizePut(match || null);
+        };
+        getAllReq.onerror = () => finalizePut(null);
+        return;
+      } catch {
+        // Fallback to direct put if store.getAll is unavailable
+      }
+    }
+    finalizePut(null);
   });
+}
+
+const activeVaultCacheIds = new Set();
+
+function syncCachedVaultBlobToQueue(savedRecord) {
+  if (!savedRecord || !(savedRecord.offlineBlob instanceof Blob)) return;
+  for (const qItem of videoQueue) {
+    if (
+      qItem &&
+      ((savedRecord.id && qItem.id === savedRecord.id) ||
+        (savedRecord.videoUrl && qItem.videoUrl === savedRecord.videoUrl))
+    ) {
+      qItem.id = savedRecord.id;
+      qItem.offlineBlob = savedRecord.offlineBlob;
+      qItem.offlineMime = savedRecord.offlineMime || 'video/mp4';
+      qItem.offlineExt = savedRecord.offlineExt || 'mp4';
+      qItem.offlineSize = savedRecord.offlineSize || savedRecord.offlineBlob.size;
+      qItem.hasOfflineBlob = true;
+    }
+  }
 }
 
 // Save video to Vault and optionally cache its full .MP4 bytes in IndexedDB for Airplane-Mode playback
 async function saveAndCacheVideoToVault(videoItem, forceOfflineDownload = false) {
-  const savedRecord = await saveVideoToVaultDB(videoItem);
-  await renderVaultList();
+  if (
+    forceOfflineDownload &&
+    videoItem &&
+    ((videoItem.id && activeVaultCacheIds.has(videoItem.id)) ||
+      (videoItem.videoUrl && activeVaultCacheIds.has(videoItem.videoUrl)))
+  ) {
+    return videoItem;
+  }
+
+  let savedRecord = await saveVideoToVaultDB(videoItem);
+  if (videoItem && typeof videoItem === 'object' && savedRecord?.id) {
+    videoItem.id = savedRecord.id;
+  }
 
   if (!forceOfflineDownload && !settings.offlineVaultCache) {
+    await renderVaultList();
     showToast('Saved link to Vault!');
     return savedRecord;
   }
 
   // If we already have the blob in memory, store it immediately
-  if (videoItem.convertedBlob instanceof Blob) {
-    await saveVideoToVaultDB(savedRecord, {
+  if (videoItem?.convertedBlob instanceof Blob) {
+    savedRecord = await saveVideoToVaultDB(savedRecord, {
       blob: videoItem.convertedBlob,
       ext: 'mp4',
       mime: 'video/mp4'
     });
+    if (videoItem && typeof videoItem === 'object') {
+      videoItem.offlineBlob = savedRecord.offlineBlob;
+      videoItem.hasOfflineBlob = true;
+      videoItem.offlineSize = savedRecord.offlineSize;
+    }
+    syncCachedVaultBlobToQueue(savedRecord);
     await renderVaultList();
     showToast('Saved & cached offline in Vault!');
     return savedRecord;
   }
 
-  showToast('Saved to Vault! Caching video for offline playback...');
+  const cacheId = savedRecord?.id || videoItem?.id || null;
+  const cacheUrl = savedRecord?.videoUrl || videoItem?.videoUrl || null;
+  if (cacheId) activeVaultCacheIds.add(cacheId);
+  if (cacheUrl) activeVaultCacheIds.add(cacheUrl);
+  await renderVaultList();
+
+  showToast(
+    forceOfflineDownload
+      ? '⏳ Caching video for offline playback...'
+      : 'Saved to Vault! Caching video for offline playback...'
+  );
+
   try {
     const blobResult = await obtainIphoneReadyVideoBlob(videoItem, false);
     if (blobResult?.blob instanceof Blob) {
-      await saveVideoToVaultDB(savedRecord, blobResult);
-      await renderVaultList();
+      savedRecord = await saveVideoToVaultDB(savedRecord, blobResult);
+      if (videoItem && typeof videoItem === 'object') {
+        videoItem.offlineBlob = savedRecord.offlineBlob;
+        videoItem.hasOfflineBlob = true;
+        videoItem.offlineSize = savedRecord.offlineSize;
+      }
+      syncCachedVaultBlobToQueue(savedRecord);
       const mb = (blobResult.blob.size / (1024 * 1024)).toFixed(1);
       showToast(`Cached offline in Vault (${mb} MB)!`);
+    } else if (forceOfflineDownload) {
+      showToast('Could not cache video offline for this stream.');
     }
   } catch {
-    // Metadata/link is still saved even if CORS prevented raw blob caching
+    if (forceOfflineDownload) {
+      showToast('Could not cache video offline (stream unavailable or blocked by CORS).');
+    } else {
+      showToast('Saved link to Vault (offline video cache unavailable for this stream).');
+    }
+  } finally {
+    if (cacheId) activeVaultCacheIds.delete(cacheId);
+    if (cacheUrl) activeVaultCacheIds.delete(cacheUrl);
+    await renderVaultList();
   }
   return savedRecord;
 }
@@ -1145,7 +1320,15 @@ async function toggleCurrentVideoFavorite() {
   current.isFavorite = !current.isFavorite;
   try {
     const saved = await saveVideoToVaultDB(current);
-    if (saved?.id) current.id = saved.id;
+    if (saved?.id) {
+      current.id = saved.id;
+      for (const qItem of videoQueue) {
+        if (qItem && (qItem.id === saved.id || (qItem.videoUrl && qItem.videoUrl === current.videoUrl))) {
+          qItem.id = saved.id;
+          qItem.isFavorite = current.isFavorite;
+        }
+      }
+    }
     await renderVaultList();
   } catch {
     // keep in-memory favorite state even if IndexedDB is unavailable
@@ -1160,6 +1343,15 @@ async function toggleCurrentVideoFavorite() {
 async function shuffleVaultToPlayer(options = {}) {
   const { favoritesOnly = false, nsfwOnly = false, startReels = false } = options;
   const allItems = await getAllVaultVideos();
+
+  if (
+    !settings.allowNsfw &&
+    (settings.vaultFilter === 'nsfw' || settings.vaultFilter === 'nsfw_favorites')
+  ) {
+    settings.vaultFilter = 'all';
+  } else if (settings.allowNsfw && settings.vaultFilter === 'sfw') {
+    settings.vaultFilter = 'all';
+  }
 
   const matching = allItems.filter((item) => {
     if (!settings.allowNsfw && item.isNsfw) return false;
@@ -1180,7 +1372,16 @@ async function shuffleVaultToPlayer(options = {}) {
     return [];
   }
 
-  const shuffled = [...matching].sort(() => Math.random() - 0.5);
+  const shuffled = matching
+    .map((item) => ({ ...item, fromVault: true }))
+    .sort(() => Math.random() - 0.5);
+  const nextUrls = new Set(shuffled.map((item) => item?.convertedBlobUrl || item?.offlineObjectUrl).filter(Boolean));
+  revokeVideoItemBlobUrls(
+    videoQueue.filter(
+      (item) =>
+        !nextUrls.has(item?.convertedBlobUrl) && !nextUrls.has(item?.offlineObjectUrl)
+    )
+  );
   videoQueue = shuffled;
   currentIndex = 0;
   for (const item of shuffled) {
@@ -1199,25 +1400,72 @@ async function shuffleVaultToPlayer(options = {}) {
 }
 
 async function deleteVaultVideoDB(id) {
+  let deletedUrl = null;
+  try {
+    const existing = await getAllVaultVideos();
+    const target = existing.find((v) => v && v.id === id);
+    if (target?.videoUrl) deletedUrl = target.videoUrl;
+  } catch {}
+
   const db = await openVaultDB();
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const tx = db.transaction(VAULT_STORE, 'readwrite');
     const store = tx.objectStore(VAULT_STORE);
     const req = store.delete(id);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
+
+  let touchedActiveQueue = false;
+  for (const qItem of videoQueue) {
+    if (qItem && (qItem.id === id || (deletedUrl && qItem.videoUrl === deletedUrl))) {
+      qItem.isFavorite = false;
+      qItem.hasOfflineBlob = false;
+      delete qItem.offlineBlob;
+      delete qItem.offlineSize;
+      if (qItem.offlineObjectUrl) {
+        try {
+          URL.revokeObjectURL?.(qItem.offlineObjectUrl);
+        } catch {}
+        delete qItem.offlineObjectUrl;
+      }
+      touchedActiveQueue = true;
+    }
+  }
+  if (touchedActiveQueue && typeof document !== 'undefined' && document.getElementById('mainVideo')) {
+    updatePlayerUI();
+  }
 }
 
 async function clearVaultDB() {
   const db = await openVaultDB();
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const tx = db.transaction(VAULT_STORE, 'readwrite');
     const store = tx.objectStore(VAULT_STORE);
     const req = store.clear();
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
+
+  let touchedActiveQueue = false;
+  for (const qItem of videoQueue) {
+    if (qItem && (qItem.isFavorite || qItem.hasOfflineBlob || qItem.offlineBlob || qItem.offlineObjectUrl)) {
+      qItem.isFavorite = false;
+      qItem.hasOfflineBlob = false;
+      delete qItem.offlineBlob;
+      delete qItem.offlineSize;
+      if (qItem.offlineObjectUrl) {
+        try {
+          URL.revokeObjectURL?.(qItem.offlineObjectUrl);
+        } catch {}
+        delete qItem.offlineObjectUrl;
+      }
+      touchedActiveQueue = true;
+    }
+  }
+  if (touchedActiveQueue && typeof document !== 'undefined' && document.getElementById('mainVideo')) {
+    updatePlayerUI();
+  }
 }
 
 // Load & Save Settings / Sources
@@ -1236,11 +1484,19 @@ function loadState() {
   try {
     const rawSettings = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     if (rawSettings) {
-      settings = { ...settings, ...JSON.parse(rawSettings) };
+      Object.assign(settings, JSON.parse(rawSettings));
+      if (!Array.isArray(settings.deletedSourceIds)) {
+        settings.deletedSourceIds = [];
+      }
       if (settings.nsfwMode === 'mixed' || !settings.nsfwMode) {
         settings.nsfwMode = settings.allowNsfw ? 'strict' : 'safe';
       }
       if (settings.allowNsfw && settings.vaultFilter === 'sfw') {
+        settings.vaultFilter = 'all';
+      } else if (
+        !settings.allowNsfw &&
+        (settings.vaultFilter === 'nsfw' || settings.vaultFilter === 'nsfw_favorites')
+      ) {
         settings.vaultFilter = 'all';
       }
     }
@@ -1274,7 +1530,7 @@ function showToast(message) {
 }
 
 function updateHeaderSummary() {
-  const enabledCount = sources.filter((s) => s.enabled).length;
+  const enabledCount = getEffectiveActiveSources().length;
   const el = document.getElementById('activeSourceSummary');
   if (el) {
     const modeLabel =
@@ -1288,10 +1544,21 @@ function updateHeaderSummary() {
 }
 
 // Unlock built-in 18+ source presets into the user's sources list (without duplicating)
-function unlockAdultPresetSources() {
+function unlockAdultPresetSources(options = {}) {
+  const { respectDeleted = false } = options;
+  if (!respectDeleted && Array.isArray(settings.deletedSourceIds) && settings.deletedSourceIds.length > 0) {
+    const presetIds = new Set(ADULT_PRESET_SOURCES.map((p) => p.id));
+    settings.deletedSourceIds = settings.deletedSourceIds.filter((id) => !presetIds.has(id));
+    saveSettings();
+  }
+  const deletedSet =
+    respectDeleted && Array.isArray(settings.deletedSourceIds)
+      ? new Set(settings.deletedSourceIds)
+      : null;
   const existingIds = new Set(sources.map((s) => s.id));
   let added = 0;
   for (const preset of ADULT_PRESET_SOURCES) {
+    if (deletedSet && deletedSet.has(preset.id)) continue;
     if (!existingIds.has(preset.id)) {
       sources.push(structuredClone(preset));
       existingIds.add(preset.id);
@@ -1576,6 +1843,32 @@ function isPeerTubeVideoItem(item) {
   return false;
 }
 
+function revokeVideoItemBlobUrls(items) {
+  if (!Array.isArray(items) || typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') return;
+  const activeUrls = new Set();
+  for (const q of videoQueue) {
+    if (q?.convertedBlobUrl) activeUrls.add(q.convertedBlobUrl);
+    if (q?.offlineObjectUrl) activeUrls.add(q.offlineObjectUrl);
+  }
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.convertedBlobUrl && !activeUrls.has(item.convertedBlobUrl)) {
+      try {
+        URL.revokeObjectURL(item.convertedBlobUrl);
+      } catch {}
+      delete item.convertedBlobUrl;
+    }
+    if (item.offlineObjectUrl && !activeUrls.has(item.offlineObjectUrl)) {
+      try {
+        URL.revokeObjectURL(item.offlineObjectUrl);
+      } catch {}
+      delete item.offlineObjectUrl;
+    }
+  }
+}
+
+let modeGeneration = 0;
+
 function syncQueueAfterSourceChange() {
   sourcePoolCache.clear();
   const ptEnabled = isPeerTubeExplicitlyEnabled();
@@ -1584,7 +1877,9 @@ function syncQueueAfterSourceChange() {
   if (!ptEnabled && videoQueue.some((item) => isPeerTubeVideoItem(item))) {
     const currentItem = videoQueue[currentIndex];
     const wasPlayingPt = isPeerTubeVideoItem(currentItem);
+    const removedPt = videoQueue.filter((item) => isPeerTubeVideoItem(item));
     videoQueue = videoQueue.filter((item) => !isPeerTubeVideoItem(item));
+    revokeVideoItemBlobUrls(removedPt);
     if (videoQueue.length === 0) {
       currentIndex = -1;
     } else if (currentIndex >= videoQueue.length) {
@@ -1609,7 +1904,9 @@ function syncQueueAfterSourceChange() {
   if (active.length === 0) {
     stopContinuousBackgroundPuller();
     if (currentIndex >= 0 && videoQueue.length > currentIndex + 1) {
+      const trimmed = videoQueue.slice(currentIndex + 1);
       videoQueue = videoQueue.slice(0, currentIndex + 1);
+      revokeVideoItemBlobUrls(trimmed);
       if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
         updatePlayerUI();
       }
@@ -1623,7 +1920,13 @@ function getEffectiveActiveSources() {
     return sources.filter((s) => s.enabled && !s.isNsfw);
   }
   const hasAnyNsfwSources = sources.some((s) => s && s.isNsfw);
-  if (!hasAnyNsfwSources) {
+  const deletedSet = Array.isArray(settings.deletedSourceIds)
+    ? new Set(settings.deletedSourceIds)
+    : null;
+  const hasDeletedAdultPreset =
+    Boolean(deletedSet && deletedSet.size > 0) &&
+    ADULT_PRESET_SOURCES.some((p) => deletedSet.has(p.id));
+  if (!hasAnyNsfwSources && !hasDeletedAdultPreset) {
     return structuredClone(ADULT_PRESET_SOURCES);
   }
   return sources.filter((s) => s.enabled && s.isNsfw);
@@ -1703,18 +2006,25 @@ function unlockAppGate() {
     document.getElementById('appLockError')?.classList.add('hidden');
     const pinInput = document.getElementById('appLockPinInput');
     if (pinInput) pinInput.value = '';
+    if (settings.prebuffer && videoQueue.length > 0) {
+      scheduleBackgroundQueuePrebuffer();
+    }
   }
   return true;
 }
 
 function lockAppGate() {
   isAppUnlocked = false;
+  stopContinuousBackgroundPuller();
   try {
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.removeItem(APP_UNLOCK_SESSION_KEY);
     }
   } catch {}
   if (typeof document !== 'undefined') {
+    if (isReelsFullscreen) {
+      toggleReelsFullscreen(false);
+    }
     const videoEl = document.getElementById('mainVideo');
     try {
       videoEl?.pause?.();
@@ -1753,6 +2063,7 @@ async function registerNsfwBiometric() {
       pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
       authenticatorSelection: {
         authenticatorAttachment: 'platform',
+        residentKey: 'preferred',
         userVerification: 'required'
       },
       timeout: 30000
@@ -1791,7 +2102,9 @@ function scrubNsfwFromActiveSession() {
   const current = videoQueue[currentIndex];
   const wasPlayingNsfw = isItemNsfw(current);
 
+  const removedNsfw = videoQueue.filter((item) => isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => !isItemNsfw(item));
+  revokeVideoItemBlobUrls(removedNsfw);
   if (videoQueue.length === 0) {
     currentIndex = -1;
   } else if (currentIndex >= videoQueue.length) {
@@ -1803,7 +2116,11 @@ function scrubNsfwFromActiveSession() {
     if (videoEl) {
       try {
         videoEl.pause?.();
-        videoEl.src = '';
+        if (typeof videoEl.removeAttribute === 'function') {
+          videoEl.removeAttribute('src');
+        } else {
+          videoEl.src = '';
+        }
         videoEl.load?.();
       } catch {}
     }
@@ -1851,7 +2168,9 @@ function scrubSafeFromActiveSession() {
   const current = videoQueue[currentIndex];
   const wasPlayingSafe = Boolean(current && !isItemNsfw(current));
 
+  const removedSafe = videoQueue.filter((item) => !isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => isItemNsfw(item));
+  revokeVideoItemBlobUrls(removedSafe);
   if (videoQueue.length === 0) {
     currentIndex = -1;
   } else if (currentIndex >= videoQueue.length) {
@@ -1863,7 +2182,11 @@ function scrubSafeFromActiveSession() {
     if (videoEl) {
       try {
         videoEl.pause?.();
-        videoEl.src = '';
+        if (typeof videoEl.removeAttribute === 'function') {
+          videoEl.removeAttribute('src');
+        } else {
+          videoEl.src = '';
+        }
         videoEl.load?.();
       } catch {}
     }
@@ -1906,25 +2229,32 @@ function scrubSafeFromActiveSession() {
 
 // Panic / "Boss Key": immediately drops into Safe Mode, exits fullscreen, and loads a safe NASA space clip
 function triggerPanicSafeMode() {
+  modeGeneration++;
   if (isReelsFullscreen) {
     toggleReelsFullscreen(false);
   }
   setAdultContentEnabled(false);
 
   const safeClip = structuredClone(FALLBACK_VIDEOS[0]);
+  const prevQueue = videoQueue;
   videoQueue = [safeClip];
   currentIndex = 0;
+  revokeVideoItemBlobUrls(prevQueue);
 
   if (typeof document !== 'undefined') {
+    setPlayerLoading(false);
     const videoEl = document.getElementById('mainVideo');
+    if (videoEl) {
+      videoEl.muted = true;
+    }
+    switchTab('view-discover');
+    updatePlayerUI();
     if (videoEl) {
       videoEl.muted = true;
       try {
         videoEl.pause?.();
       } catch {}
     }
-    switchTab('view-discover');
-    updatePlayerUI();
   }
   showToast('🛡️ Safe Mode Active');
 }
@@ -1945,6 +2275,7 @@ function sanitizeVideoItemForStorage(videoItem) {
   delete copy.convertedBlob;
   delete copy.convertedBlobUrl;
   delete copy.offlineObjectUrl;
+  delete copy._rehydratingOfflineBlob;
   return copy;
 }
 
@@ -2000,10 +2331,20 @@ function savePlaybackState(overrideTime = null) {
     playbackPositions[key] = time;
   }
 
+  const maxSavedQueue = 25;
+  const sliceStart =
+    currentIndex >= maxSavedQueue
+      ? Math.max(0, Math.min(currentIndex - Math.floor(maxSavedQueue / 2), videoQueue.length - maxSavedQueue))
+      : 0;
+  const savedQueueSlice = videoQueue
+    .slice(sliceStart, sliceStart + maxSavedQueue)
+    .map(sanitizeVideoItemForStorage)
+    .filter(Boolean);
+
   const snapshot = {
     currentVideo: sanitizeVideoItemForStorage(current),
-    videoQueue: videoQueue.slice(0, 25).map(sanitizeVideoItemForStorage).filter(Boolean),
-    currentIndex,
+    videoQueue: savedQueueSlice,
+    currentIndex: Math.max(0, currentIndex - sliceStart),
     currentTime: time,
     wasPlaying: Boolean(videoEl && !videoEl.paused),
     positions: { ...playbackPositions },
@@ -2017,6 +2358,73 @@ function savePlaybackState(overrideTime = null) {
   } catch {}
 
   return snapshot;
+}
+
+let rehydrateOfflineBlobsPromise = null;
+
+async function rehydrateQueueOfflineBlobsFromVault() {
+  if (rehydrateOfflineBlobsPromise) {
+    return await rehydrateOfflineBlobsPromise;
+  }
+  rehydrateOfflineBlobsPromise = (async () => {
+    let hydratedAny = false;
+    let clearedPendingActive = false;
+    try {
+      if (!Array.isArray(videoQueue) || videoQueue.length === 0) return false;
+      const vaultItems = await getAllVaultVideos();
+      if (Array.isArray(vaultItems) && vaultItems.length > 0) {
+        for (const qItem of videoQueue) {
+          if (!qItem || qItem.offlineBlob instanceof Blob) continue;
+          const match = vaultItems.find(
+            (v) =>
+              v &&
+              v.offlineBlob instanceof Blob &&
+              ((qItem.id && v.id === qItem.id) ||
+                (qItem.videoUrl && v.videoUrl && v.videoUrl === qItem.videoUrl) ||
+                (qItem.originalUrl && v.originalUrl && v.originalUrl === qItem.originalUrl))
+          );
+          if (match) {
+            if (!qItem.id && match.id) qItem.id = match.id;
+            qItem.offlineBlob = match.offlineBlob;
+            qItem.offlineMime = match.offlineMime || 'video/mp4';
+            qItem.offlineExt = match.offlineExt || 'mp4';
+            qItem.offlineSize = match.offlineSize || match.offlineBlob.size;
+            qItem.hasOfflineBlob = true;
+            hydratedAny = true;
+          }
+        }
+      }
+      return hydratedAny;
+    } catch {
+      return false;
+    } finally {
+      if (Array.isArray(videoQueue)) {
+        const active = videoQueue[currentIndex];
+        if (active && active._rehydratingOfflineBlob) {
+          clearedPendingActive = true;
+        }
+        for (const qItem of videoQueue) {
+          if (qItem && qItem._rehydratingOfflineBlob) {
+            delete qItem._rehydratingOfflineBlob;
+          }
+        }
+      }
+      rehydrateOfflineBlobsPromise = null;
+      if (
+        (hydratedAny || clearedPendingActive) &&
+        typeof document !== 'undefined' &&
+        document.getElementById('mainVideo')
+      ) {
+        updatePlayerUI();
+        if (!isAppUnlocked && document.body?.classList?.contains?.('app-locked')) {
+          try {
+            document.getElementById('mainVideo')?.pause?.();
+          } catch {}
+        }
+      }
+    }
+  })();
+  return await rehydrateOfflineBlobsPromise;
 }
 
 function restorePlaybackState() {
@@ -2041,6 +2449,10 @@ function restorePlaybackState() {
 
     if (!settings.allowNsfw) {
       restoredQueue = restoredQueue.filter((item) => !isItemNsfw(item));
+    } else {
+      restoredQueue = restoredQueue.filter(
+        (item) => isItemNsfw(item) || Boolean(item?.fromVault)
+      );
     }
     if (!isPeerTubeExplicitlyEnabled()) {
       restoredQueue = restoredQueue.filter((item) => !isPeerTubeVideoItem(item));
@@ -2072,6 +2484,17 @@ function restorePlaybackState() {
       }
     }
 
+    const canRehydrateFromIdb = typeof indexedDB !== 'undefined';
+    let hasFlaggedOfflineItems = false;
+    if (canRehydrateFromIdb) {
+      for (const item of restoredQueue) {
+        if (item?.hasOfflineBlob && !(item.offlineBlob instanceof Blob)) {
+          item._rehydratingOfflineBlob = true;
+          hasFlaggedOfflineItems = true;
+        }
+      }
+    }
+
     videoQueue = restoredQueue;
     currentIndex = restoredIndex;
     for (const item of videoQueue) {
@@ -2080,6 +2503,10 @@ function restorePlaybackState() {
 
     if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
       updatePlayerUI();
+    }
+
+    if (canRehydrateFromIdb && (hasFlaggedOfflineItems || restoredQueue.some((i) => !(i?.offlineBlob instanceof Blob)))) {
+      rehydrateQueueOfflineBlobsFromVault().catch(() => {});
     }
     return true;
   } catch {
@@ -2284,7 +2711,11 @@ function syncAgeGateUI() {
   document.getElementById('searchNsfwChipsBar')?.classList.toggle('hidden', !isAllowed);
   document.getElementById('loadAdultPresetsBtn')?.classList.toggle('hidden', !isAllowed);
   document.getElementById('adultDirectorySection')?.classList.toggle('hidden', !isAllowed);
-  document.getElementById('vaultFilterSelect')?.classList.toggle('hidden', !isAllowed);
+  const vaultFilterEl = document.getElementById('vaultFilterSelect');
+  if (vaultFilterEl) {
+    vaultFilterEl.classList.toggle('hidden', !isAllowed);
+    vaultFilterEl.value = settings.vaultFilter || 'all';
+  }
 
   // Remove/hide purely safe video engine options when 18+ mode is On, and hide 18+-only engines in Safe Mode
   if (typeof document !== 'undefined') {
@@ -2322,6 +2753,7 @@ function syncAgeGateUI() {
   }
 
   syncNsfwLockUI();
+  updateHeaderSummary();
 }
 
 function openAgeGateModal() {
@@ -2339,7 +2771,10 @@ function openAgeGateModal() {
     const needsLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
     pinSection.classList.toggle('hidden', !needsLock);
   }
-  if (pinInput) pinInput.value = '';
+  if (pinInput) {
+    pinInput.value = '';
+    pinInput.classList?.toggle?.('hidden', Boolean(!settings.nsfwPin && settings.nsfwBiometricId));
+  }
   pinError?.classList.add('hidden');
   if (bioBtn) {
     bioBtn.classList.toggle('hidden', !settings.nsfwBiometricId);
@@ -2355,15 +2790,25 @@ function closeAgeGateModal() {
 }
 
 function setAdultContentEnabled(enabled) {
+  modeGeneration++;
   settings.allowNsfw = Boolean(enabled);
+  if (typeof document !== 'undefined') {
+    setPlayerLoading(false);
+  }
   if (settings.allowNsfw) {
     settings.nsfwMode = 'strict';
+    if (settings.vaultFilter === 'sfw') {
+      settings.vaultFilter = 'all';
+    }
     if (sources.length > 0) {
-      unlockAdultPresetSources();
+      unlockAdultPresetSources({ respectDeleted: true });
     }
     scrubSafeFromActiveSession();
   } else {
     settings.nsfwMode = 'safe';
+    if (settings.vaultFilter === 'nsfw' || settings.vaultFilter === 'nsfw_favorites') {
+      settings.vaultFilter = 'all';
+    }
     scrubNsfwFromActiveSession();
   }
   sourcePoolCache.clear();
@@ -3622,9 +4067,26 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   return nonPreview.length > 0 ? [...nonPreview, ...all.filter((u) => !nonPreview.includes(u))] : all;
 }
 
+function safeDecodeURIComponent(str) {
+  try {
+    return decodeURIComponent(str);
+  } catch {
+    return String(str ?? '');
+  }
+}
+
+const KNOWN_NSFW_DOMAIN_REGEX =
+  /(?:^|[./])(?:redgifs|eporner|fulltaboo|pornone|spankbang|xvideos|xhamster|pornhub|xnxx|youporn|tube8|tnaflix|chaturbate|stripchat)\./i;
+
+function isKnownNsfwUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  return KNOWN_NSFW_DOMAIN_REGEX.test(rawUrl);
+}
+
 // 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSubpageCrawl = true) {
   const trimmed = targetUrl.trim();
+  const markScannedNsfw = Boolean(settings.allowNsfw) || isKnownNsfwUrl(trimmed);
 
   // Direct RedGIFs watch/embed link resolver
   if (/redgifs\.com\/(?:watch|ifr|detail)\//i.test(trimmed)) {
@@ -3636,16 +4098,20 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
 
   if (DIRECT_VIDEO_URL_REGEX.test(trimmed)) {
     const normalized = normalizeAndAutoRewriteVideoUrl(trimmed);
+    if (!normalized || !isFormatAllowedBySettings(normalized.format)) {
+      return [];
+    }
     const fileName = trimmed.split('/').pop().split('?')[0].split('#')[0] || 'Direct Video';
     return [
       {
         id: `url-${Date.now()}`,
-        title: decodeURIComponent(fileName),
+        title: safeDecodeURIComponent(fileName),
         videoUrl: normalized.videoUrl,
         originalUrl: normalized.originalUrl,
         convertedUrl: normalized.convertedUrl,
         format: normalized.format,
         isAutoConverted: normalized.isAutoConverted,
+        ...(markScannedNsfw ? { isNsfw: true } : {}),
         sourceName: customLabel,
         pageUrl: trimmed
       }
@@ -3678,12 +4144,13 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     const shortName = vUrl.split('/').pop().split('?')[0] || `Video #${idx + 1}`;
     results.push({
       id: `scan-${Date.now()}-${idx}`,
-      title: idx === 0 && pageTitle ? pageTitle : decodeURIComponent(shortName),
+      title: idx === 0 && pageTitle ? pageTitle : safeDecodeURIComponent(shortName),
       videoUrl: normalized.videoUrl,
       originalUrl: normalized.originalUrl,
       convertedUrl: normalized.convertedUrl,
       format: normalized.format,
       isAutoConverted: normalized.isAutoConverted,
+      ...(markScannedNsfw || isKnownNsfwUrl(vUrl) ? { isNsfw: true } : {}),
       sourceName: customLabel,
       pageUrl: trimmed
     });
@@ -3805,6 +4272,14 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       );
       results.push(...fallbackItems);
     } catch {}
+  }
+
+  if (markScannedNsfw) {
+    for (const item of results) {
+      if (item && typeof item === 'object') {
+        item.isNsfw = true;
+      }
+    }
   }
 
   return results;
@@ -4287,7 +4762,9 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
 
 function getSourceCacheKey(source) {
   const ptFlag = isPeerTubeExplicitlyEnabled(source) ? 'pt1' : 'pt0';
-  return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}`;
+  const durFilter = settings.tubeDurationFilter || 'all';
+  const qualFilter = settings.tubeQualityFilter || 'all';
+  return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}:${durFilter}:${qualFilter}`;
 }
 
 function interleaveVideoBuckets(buckets) {
@@ -4314,7 +4791,9 @@ async function pullFromSource(source) {
   const cacheKey = getSourceCacheKey(source);
   const cached = sourcePoolCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SOURCE_CACHE_TTL_MS) {
-    const unseen = cached.items.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+    const unseen = filterAndSortTubeResults(
+      cached.items.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl))
+    );
     if (unseen.length >= 2) {
       return unseen;
     }
@@ -4390,6 +4869,9 @@ function setPlayerLoading(isLoading, message = 'Pulling random video...') {
     overlay?.classList.remove('hidden');
   } else {
     overlay?.classList.add('hidden');
+    if (videoQueue.length === 0) {
+      emptyEl?.classList.remove('hidden');
+    }
   }
 }
 
@@ -4415,6 +4897,9 @@ function getEffectivePlaybackUrl(videoItem) {
 // Run one cycle of the continuous background puller across active sources in round-robin order
 async function runContinuousPullCycle() {
   if (!settings.prebuffer) return 0;
+  if (typeof document !== 'undefined' && document.body?.classList?.contains?.('app-locked')) {
+    return 0;
+  }
   if (continuousPullPromise) {
     return await continuousPullPromise;
   }
@@ -4429,6 +4914,8 @@ async function runContinuousPullCycle() {
   isBackgroundRefilling = true;
   continuousPullPromise = (async () => {
     let addedCount = 0;
+    const pullGen = modeGeneration;
+    const pullAllowNsfw = Boolean(settings.allowNsfw);
     try {
       const batchSize = Math.min(2, effectiveSources.length);
       const batchSources = [];
@@ -4441,6 +4928,11 @@ async function runContinuousPullCycle() {
       const settled = await Promise.allSettled(
         batchSources.map((src) => pullFromSource(src))
       );
+
+      if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+        return 0;
+      }
+
       const buckets = [];
       for (const r of settled) {
         if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
@@ -4771,10 +5263,39 @@ function updatePlayerUI() {
     if (skipBack10Btn) skipBack10Btn.disabled = true;
     if (skipFwd15Btn) skipFwd15Btn.disabled = true;
     if (skipFwd30Btn) skipFwd30Btn.disabled = true;
+    if (speedSelectEl) {
+      speedSelectEl.value = String(settings.playbackSpeed || 1);
+    }
+    if (titleEl) titleEl.textContent = 'Tap "Shuffle Random" to begin';
+    if (badgeEl) badgeEl.textContent = 'Ready';
+    if (origLink) {
+      origLink.href = '#';
+      origLink.classList.add('hidden');
+    }
+    document.getElementById('prebufferBadge')?.classList.add('hidden');
+    if (reelsHudBadge) reelsHudBadge.textContent = 'Reels Mode';
+    if (reelsHudTitle) reelsHudTitle.textContent = 'Swipe Up for Next Video';
     tagsBarEl?.classList.add('hidden');
     if (tagsBarEl) tagsBarEl.innerHTML = '';
     formatBadgeEl?.classList.add('hidden');
     convertNowBtn?.classList.add('hidden');
+    if (videoEl) {
+      try {
+        videoEl.pause?.();
+      } catch {}
+      if (videoEl.src || videoEl.getAttribute?.('src')) {
+        if (typeof videoEl.removeAttribute === 'function') {
+          videoEl.removeAttribute('src');
+        } else {
+          videoEl.src = '';
+        }
+        videoEl.load?.();
+      }
+    }
+    const loadingEl = document.getElementById('playerLoading');
+    if (!loadingEl || loadingEl.classList.contains('hidden')) {
+      emptyEl?.classList.remove('hidden');
+    }
     updateReelsSeekerUI();
     return;
   }
@@ -4846,9 +5367,16 @@ function updatePlayerUI() {
     }
   }
 
+  const isLockedOverlay =
+    typeof document !== 'undefined' &&
+    Boolean(document.body?.classList?.contains?.('app-locked'));
+
   const targetPlayUrl = getEffectivePlaybackUrl(current);
   const savedTime = getSavedPlaybackTime(current);
-  if (videoEl) {
+  const awaitingOfflineRehydrate = Boolean(
+    current._rehydratingOfflineBlob && !(current.offlineBlob instanceof Blob)
+  );
+  if (videoEl && !awaitingOfflineRehydrate) {
     if (videoEl.src !== targetPlayUrl) {
       if (videoEl.dataset) {
         videoEl.dataset.autoConvertAttempted = 'false';
@@ -4876,7 +5404,7 @@ function updatePlayerUI() {
           { once: true }
         );
       }
-      if (settings.autoPlay) {
+      if (settings.autoPlay && !isLockedOverlay) {
         videoEl.play?.()?.catch?.(() => {
           // iOS may require user tap if unmuted; user can tap play on controls
         });
@@ -4893,7 +5421,9 @@ function updatePlayerUI() {
   savePlaybackState(savedTime > 0 ? savedTime : null);
 
   // Trigger background pre-buffering for the upcoming video
-  scheduleBackgroundQueuePrebuffer();
+  if (!isLockedOverlay) {
+    scheduleBackgroundQueuePrebuffer();
+  }
 }
 
 function advanceToNextVideo() {
@@ -4914,6 +5444,34 @@ function goToPrevVideo() {
   }
 }
 
+let downloadStatusHideTimer = null;
+let activeDownloadStatusOps = 0;
+
+function beginDownloadStatusOp(statusBox) {
+  if (downloadStatusHideTimer) {
+    clearTimeout(downloadStatusHideTimer);
+    downloadStatusHideTimer = null;
+  }
+  activeDownloadStatusOps++;
+  statusBox?.classList.remove('hidden');
+}
+
+function finishDownloadStatusOp(statusBox, progressBar, delayMs = 1000) {
+  activeDownloadStatusOps = Math.max(0, activeDownloadStatusOps - 1);
+  if (activeDownloadStatusOps > 0) return;
+  if (downloadStatusHideTimer) {
+    clearTimeout(downloadStatusHideTimer);
+  }
+  downloadStatusHideTimer = setTimeout(() => {
+    downloadStatusHideTimer = null;
+    if (activeDownloadStatusOps === 0) {
+      statusBox?.classList.add('hidden');
+      if (progressBar) progressBar.style.width = '0%';
+    }
+  }, delayMs);
+  downloadStatusHideTimer.unref?.();
+}
+
 // Convert the currently active video in-place to .MP4 and reload the player
 async function convertCurrentVideoForPlayer(videoItem) {
   if (!videoItem || videoItem.convertedBlobUrl) return false;
@@ -4924,7 +5482,7 @@ async function convertCurrentVideoForPlayer(videoItem) {
   const progressBar = document.getElementById('downloadProgressBar');
   const convertNowBtn = document.getElementById('convertNowBtn');
 
-  statusBox?.classList.remove('hidden');
+  beginDownloadStatusOp(statusBox);
   if (convertNowBtn) convertNowBtn.disabled = true;
 
   try {
@@ -4951,11 +5509,7 @@ async function convertCurrentVideoForPlayer(videoItem) {
     return false;
   } finally {
     if (convertNowBtn) convertNowBtn.disabled = false;
-    const hideTimer = setTimeout(() => {
-      statusBox?.classList.add('hidden');
-      if (progressBar) progressBar.style.width = '0%';
-    }, 1000);
-    hideTimer.unref?.();
+    finishDownloadStatusOp(statusBox, progressBar, 1000);
   }
 }
 
@@ -4966,6 +5520,16 @@ async function handleVideoPlaybackError() {
   const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
   const current = videoQueue[currentIndex];
   if (!current || !videoEl) return false;
+
+  // 0. If this video has a cached offline Blob in IndexedDB Vault, rehydrate and switch to blob: immediately
+  if (!(current.offlineBlob instanceof Blob)) {
+    const rehydrated = await rehydrateQueueOfflineBlobsFromVault();
+    if (rehydrated && current.offlineBlob instanceof Blob) {
+      consecutiveErrorSkips = 0;
+      updatePlayerUI();
+      return true;
+    }
+  }
 
   // 1. If a server-transcoded or alternate .mp4 stream URL is available, try it immediately
   if (
@@ -4996,6 +5560,21 @@ async function handleVideoPlaybackError() {
     }
   }
 
+  // If the user navigated to a different video while auto-conversion was in flight,
+  // remove only the failed video (`current`) and preserve the user's active video
+  if (videoQueue[currentIndex] !== current) {
+    const staleIdx = videoQueue.indexOf(current);
+    if (staleIdx >= 0) {
+      const removedStale = videoQueue.splice(staleIdx, 1);
+      revokeVideoItemBlobUrls(removedStale);
+      if (staleIdx < currentIndex) {
+        currentIndex = Math.max(0, currentIndex - 1);
+      }
+      updatePlayerUI();
+    }
+    return true;
+  }
+
   // 3. Stream is dead/restricted/unplayable: remove it from queue and auto-advance to a working video
   if (consecutiveErrorSkips >= 3) {
     consecutiveErrorSkips = 0;
@@ -5005,7 +5584,8 @@ async function handleVideoPlaybackError() {
 
   consecutiveErrorSkips++;
   showToast('Stream unavailable — pulling a working video...');
-  videoQueue.splice(currentIndex, 1);
+  const removed = videoQueue.splice(currentIndex, 1);
+  revokeVideoItemBlobUrls(removed);
 
   if (videoQueue.length > 0) {
     if (currentIndex >= videoQueue.length) {
@@ -5021,6 +5601,9 @@ async function handleVideoPlaybackError() {
 }
 
 async function pullRandomVideos(count = 1, customKeyword = null) {
+  const pullGen = modeGeneration;
+  const pullAllowNsfw = Boolean(settings.allowNsfw);
+
   if (typeof document !== 'undefined') {
     const mainEl = document.querySelector?.('.app-main');
     if (mainEl && typeof mainEl.scrollTop === 'number') {
@@ -5044,7 +5627,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         type: 'keyword',
         value: customKeyword,
         label: customKeyword,
-        isNsfw: Boolean(settings.allowNsfw)
+        isNsfw: pullAllowNsfw
       });
     } else {
       const activeSources = getEffectiveActiveSources();
@@ -5061,6 +5644,9 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       let waveCount = 0;
 
       while (inspectedCount < totalActive && waveCount < 3) {
+        if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+          return;
+        }
         const batchSize = Math.min(MAX_FOREGROUND_SOURCE_BATCH, totalActive - inspectedCount);
         const waveSources = [];
         for (let i = 0; i < batchSize; i++) {
@@ -5075,6 +5661,10 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         const results = await Promise.allSettled(
           shuffledWave.map((src) => pullFromSource(src))
         );
+
+        if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+          return;
+        }
 
         for (const r of results) {
           if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
@@ -5091,12 +5681,16 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
 
       pool = interleaveVideoBuckets(sourceBuckets);
 
-      if (pool.length === 0 && settings.allowNsfw) {
+      if (pool.length === 0 && pullAllowNsfw) {
         try {
           const fallbackSeed = activeSources[0]?.value || 'popular hd';
           pool = await fetchDirectEpornerVideos(fallbackSeed, 6, activeSources[0]?.label || '18+ HD Feed', null, false);
         } catch {}
       }
+    }
+
+    if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+      return;
     }
 
     let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
@@ -5131,6 +5725,9 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       showToast(`Added ${selected.length} random videos to your queue!`);
     }
   } catch {
+    if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+      return;
+    }
     if (!settings.allowNsfw) {
       const fallbackItem = FALLBACK_VIDEOS[Math.floor(Math.random() * FALLBACK_VIDEOS.length)];
       videoQueue.push(fallbackItem);
@@ -5179,7 +5776,7 @@ async function downloadVideoToIphone(videoItem) {
   const progressBar = document.getElementById('downloadProgressBar');
   const saveBtn = document.getElementById('saveToPhoneBtn');
 
-  statusBox?.classList.remove('hidden');
+  beginDownloadStatusOp(statusBox);
   if (statusText) statusText.textContent = 'Preparing video for iPhone...';
   if (statusPercent) statusPercent.textContent = '0%';
   if (progressBar) progressBar.style.width = '8%';
@@ -5253,11 +5850,7 @@ async function downloadVideoToIphone(videoItem) {
     }
   } finally {
     if (saveBtn) saveBtn.disabled = false;
-    const hideTimer = setTimeout(() => {
-      statusBox?.classList.add('hidden');
-      if (progressBar) progressBar.style.width = '0%';
-    }, 1200);
-    hideTimer.unref?.();
+    finishDownloadStatusOp(statusBox, progressBar, 1200);
   }
 }
 
@@ -5367,11 +5960,21 @@ async function renderVaultList() {
     ? allItems.filter((item) => Boolean(item.isNsfw)).length
     : 0;
 
+  if (
+    !settings.allowNsfw &&
+    (settings.vaultFilter === 'nsfw' || settings.vaultFilter === 'nsfw_favorites')
+  ) {
+    settings.vaultFilter = 'all';
+  } else if (settings.allowNsfw && settings.vaultFilter === 'sfw') {
+    settings.vaultFilter = 'all';
+  }
+
   if (hiddenNoticeEl) {
     hiddenNoticeEl.classList.toggle('hidden', !(hiddenNsfwCount > 0 && !settings.allowNsfw));
   }
   if (vaultFilterEl) {
     vaultFilterEl.classList.toggle('hidden', !settings.allowNsfw);
+    vaultFilterEl.value = settings.vaultFilter || 'all';
   }
 
   const items = allItems.filter((item) => {
@@ -5421,10 +6024,13 @@ async function renderVaultList() {
     .map((item) => {
       const fMeta = getFormatBadgeInfo(item);
       const isOfflineReady = Boolean(item.hasOfflineBlob || item.offlineBlob);
+      const isCachingNow =
+        activeVaultCacheIds.has(item.id) ||
+        Boolean(item.videoUrl && activeVaultCacheIds.has(item.videoUrl));
       const sizeMb = item.offlineSize ? `${(item.offlineSize / (1024 * 1024)).toFixed(1)} MB` : '';
       const offlineBadgeHtml = isOfflineReady
         ? `<span class="offline-badge">✅ Offline ${sizeMb}</span>`
-        : `<button class="btn-inline-convert" data-action="cache-vault-item" data-id="${escapeHtml(item.id)}">☁️ Cache Offline</button>`;
+        : `<button class="btn-inline-convert" data-action="cache-vault-item" data-id="${escapeHtml(item.id)}"${isCachingNow ? ' disabled' : ''}>${isCachingNow ? '⏳ Caching...' : '☁️ Cache Offline'}</button>`;
       const nsfwBadgeHtml = item.isNsfw ? `<span class="nsfw-badge">🔞 18+</span>` : '';
 
       return `
@@ -5524,18 +6130,33 @@ function initBookmarkletAndUrlParams() {
     if (listEl) {
       listEl.innerHTML = `<p class="muted-center">Scanning "${escapeHtml(scanTarget)}" for downloadable videos...</p>`;
     }
+    const scanGen = modeGeneration;
+    const scanAllowNsfw = Boolean(settings.allowNsfw);
     scanUrlForVideos(scanTarget, 'Safari Bookmarklet')
       .then((found) => {
+        if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+          return;
+        }
+        if (scanAllowNsfw || settings.allowNsfw) {
+          found.forEach((item) => {
+            if (item) item.isNsfw = true;
+          });
+        }
         renderSearchResults(found);
         showToast(`Found ${found.length} video(s) from Safari page!`);
       })
       .catch(() => {
+        if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+          return;
+        }
         renderSearchResults([]);
         showToast('Could not scan that URL due to site security restrictions.');
       });
   } else if (queryTarget) {
     pullRandomVideos(1, queryTarget);
   }
+
+  return Boolean(scanTarget || queryTarget);
 }
 
 // ==========================================
@@ -5608,12 +6229,12 @@ if (typeof document !== 'undefined') {
   });
 
   if (settings.allowNsfw) {
-    unlockAdultPresetSources();
+    unlockAdultPresetSources({ respectDeleted: true });
   }
   updateHeaderSummary();
   renderSourcesList();
   await renderVaultList();
-  initBookmarkletAndUrlParams();
+  const launchedDeepLink = initBookmarkletAndUrlParams();
 
   // Sync settings controls
   const nsfwToggle = document.getElementById('allowNsfwToggle');
@@ -5647,8 +6268,10 @@ if (typeof document !== 'undefined') {
   if (offlineVaultToggle) offlineVaultToggle.checked = settings.offlineVaultCache !== false;
 
   // Restore last watched video and timestamp if no deep-link query/scan was launched
-  if (videoQueue.length === 0 && settings.resumePlayback) {
-    restorePlaybackState();
+  if (!launchedDeepLink && videoQueue.length === 0 && settings.resumePlayback) {
+    if (restorePlaybackState()) {
+      await rehydrateQueueOfflineBlobsFromVault();
+    }
     if (!isAppUnlocked) {
       try {
         document.getElementById('mainVideo')?.pause?.();
@@ -5726,11 +6349,13 @@ if (typeof document !== 'undefined') {
 
   tubeDurationSelect?.addEventListener('change', () => {
     settings.tubeDurationFilter = tubeDurationSelect.value || 'all';
+    sourcePoolCache.clear();
     saveSettings();
   });
 
   tubeQualitySelect?.addEventListener('change', () => {
     settings.tubeQualityFilter = tubeQualitySelect.value || 'all';
+    sourcePoolCache.clear();
     saveSettings();
   });
 
@@ -6228,13 +6853,26 @@ if (typeof document !== 'undefined') {
       listEl.innerHTML = `<p class="muted-center">Scanning page for downloadable video files (.mp4, .mov, .webm, .mkv, .ogv, etc.)...</p>`;
     }
 
+    const scanGen = modeGeneration;
+    const scanAllowNsfw = Boolean(settings.allowNsfw);
     try {
       const found = await scanUrlForVideos(urlInput, 'Scanned Page');
+      if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+        return;
+      }
+      if (scanAllowNsfw || settings.allowNsfw) {
+        found.forEach((item) => {
+          if (item) item.isNsfw = true;
+        });
+      }
       renderSearchResults(found);
       if (found.length > 0) {
         showToast(`Found ${found.length} video(s) on page!`);
       }
     } catch {
+      if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+        return;
+      }
       renderSearchResults([]);
       showToast('Could not scan that URL due to site security restrictions.');
     }
@@ -6314,6 +6952,11 @@ if (typeof document !== 'undefined') {
     saveSources();
     renderSourcesList();
     e.target.reset();
+    const activeSeg = document.querySelector('.segmented-control .segment.active');
+    const activeRadio = activeSeg?.querySelector?.('input[type="radio"]');
+    if (activeRadio) {
+      activeRadio.checked = true;
+    }
     const nsfwCheckEl = document.getElementById('newSourceNsfwCheck');
     if (nsfwCheckEl) nsfwCheckEl.checked = Boolean(settings.allowNsfw);
     showToast('Added source to your list!');
@@ -6444,7 +7087,17 @@ if (typeof document !== 'undefined') {
 
     const delBtn = e.target.closest('button[data-action="delete-source"]');
     if (delBtn) {
-      sources = sources.filter((s) => s.id !== delBtn.dataset.id);
+      const targetId = delBtn.dataset.id;
+      if (targetId) {
+        if (!Array.isArray(settings.deletedSourceIds)) {
+          settings.deletedSourceIds = [];
+        }
+        if (!settings.deletedSourceIds.includes(targetId)) {
+          settings.deletedSourceIds.push(targetId);
+          saveSettings();
+        }
+      }
+      sources = sources.filter((s) => s.id !== targetId);
       saveSources();
       syncQueueAfterSourceChange();
       renderSourcesList();
@@ -6477,6 +7130,7 @@ if (typeof document !== 'undefined') {
   // Settings Controls
   formatModeSelect?.addEventListener('change', () => {
     settings.formatMode = formatModeSelect.value || 'all';
+    sourcePoolCache.clear();
     saveSettings();
     showToast(
       settings.formatMode === 'all'
@@ -6573,6 +7227,12 @@ if (typeof document !== 'undefined') {
   // 4-Digit PIN & FaceID Lock Settings
   document.getElementById('saveNsfwPinBtn')?.addEventListener('click', () => {
     const pinInput = document.getElementById('nsfwPinInput');
+    const hasExistingLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
+    if (hasExistingLock && !settings.allowNsfw) {
+      showToast('🔒 Unlock 18+ Mode with your current PIN first to change PIN');
+      openAgeGateModal();
+      return;
+    }
     const ok = setNsfwPin(pinInput?.value);
     if (ok) {
       if (pinInput) pinInput.value = '';
@@ -6582,14 +7242,43 @@ if (typeof document !== 'undefined') {
     }
   });
 
-  document.getElementById('clearNsfwPinBtn')?.addEventListener('click', () => {
-    clearNsfwPin();
+  document.getElementById('clearNsfwPinBtn')?.addEventListener('click', async () => {
     const pinInput = document.getElementById('nsfwPinInput');
+    const hasExistingLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
+    if (hasExistingLock && !settings.allowNsfw) {
+      const enteredPin = String(pinInput?.value || '').trim();
+      if (settings.nsfwPin) {
+        if (!enteredPin || !verifyNsfwPin(enteredPin)) {
+          showToast('🔒 Enter your current 4-digit PIN (or unlock 18+ Mode first) to clear lock');
+          openAgeGateModal();
+          return;
+        }
+      } else if (settings.nsfwBiometricId) {
+        let verified = false;
+        try {
+          verified = await authenticateNsfwBiometric();
+        } catch {
+          verified = false;
+        }
+        if (!verified) {
+          showToast('🔒 Verify FaceID / TouchID first to clear lock');
+          openAgeGateModal();
+          return;
+        }
+      }
+    }
+    clearNsfwPin();
     if (pinInput) pinInput.value = '';
     showToast('🔓 Cleared PIN & FaceID lock');
   });
 
   document.getElementById('setupBiometricBtn')?.addEventListener('click', async () => {
+    const hasExistingLock = Boolean(settings.nsfwPin || settings.nsfwBiometricId);
+    if (hasExistingLock && !settings.allowNsfw) {
+      showToast('🔒 Unlock 18+ Mode with your current PIN first');
+      openAgeGateModal();
+      return;
+    }
     try {
       const ok = await registerNsfwBiometric();
       if (ok) {
@@ -6618,11 +7307,32 @@ if (typeof document !== 'undefined') {
     }
   });
 
-  document.getElementById('confirmAgeGateBtn')?.addEventListener('click', () => {
+  document.getElementById('confirmAgeGateBtn')?.addEventListener('click', async () => {
     if (settings.nsfwPin) {
-      const enteredPin = document.getElementById('ageGatePinInput')?.value;
+      const enteredPin = String(document.getElementById('ageGatePinInput')?.value || '').trim();
       if (!verifyNsfwPin(enteredPin)) {
+        if (!enteredPin && settings.nsfwBiometricId) {
+          try {
+            const bioOk = await authenticateNsfwBiometric();
+            if (bioOk) {
+              setAdultContentEnabled(true);
+              closeAgeGateModal();
+              return;
+            }
+          } catch {}
+        }
         document.getElementById('ageGatePinError')?.classList.remove('hidden');
+        return;
+      }
+    } else if (settings.nsfwBiometricId) {
+      try {
+        const verified = await authenticateNsfwBiometric();
+        if (!verified) {
+          showToast('FaceID / TouchID verification required to unlock 18+ mode.');
+          return;
+        }
+      } catch {
+        showToast('FaceID / TouchID verification cancelled.');
         return;
       }
     }
@@ -6659,37 +7369,53 @@ if (typeof document !== 'undefined') {
   });
 
   document.getElementById('resetSourcesBtn')?.addEventListener('click', () => {
+    modeGeneration++;
+    const preservedPin = settings.nsfwPin || '';
+    const preservedBiometricId = settings.nsfwBiometricId || '';
     sources = structuredClone(DEFAULT_SOURCES);
-    settings = {
+    Object.assign(settings, {
       allowNsfw: false,
       nsfwMode: 'safe',
       autoMuteNsfw: true,
       resumePlayback: true,
       discreetFilenames: true,
-      nsfwPin: '',
-      nsfwBiometricId: '',
+      nsfwPin: preservedPin,
+      nsfwBiometricId: preservedBiometricId,
       tubeDurationFilter: 'all',
       tubeQualityFilter: 'all',
       vaultFilter: 'all',
+      playbackSpeed: 1,
       autoPlay: true,
       formatMode: 'all',
       autoConvert: true,
       autoAdvance: true,
       prebuffer: true,
-      offlineVaultCache: true
-    };
+      offlineVaultCache: true,
+      deletedSourceIds: []
+    });
     if (nsfwToggle) nsfwToggle.checked = false;
+    if (nsfwModeSelect) nsfwModeSelect.value = 'safe';
+    if (autoMuteNsfwToggle) autoMuteNsfwToggle.checked = true;
     if (resumePlaybackToggle) resumePlaybackToggle.checked = true;
+    if (discreetFilenamesToggle) discreetFilenamesToggle.checked = true;
+    if (tubeDurationSelect) tubeDurationSelect.value = 'all';
+    if (tubeQualitySelect) tubeQualitySelect.value = 'all';
+    if (vaultFilterSelect) vaultFilterSelect.value = 'all';
     if (autoPlayToggle) autoPlayToggle.checked = true;
     if (formatModeSelect) formatModeSelect.value = 'all';
     if (autoConvertToggle) autoConvertToggle.checked = true;
     if (autoAdvanceToggle) autoAdvanceToggle.checked = true;
     if (prebufferToggle) prebufferToggle.checked = true;
     if (offlineVaultToggle) offlineVaultToggle.checked = true;
+    const speedSel = document.getElementById('playbackSpeedSelect');
+    if (speedSel) speedSel.value = '1';
+    revokeVideoItemBlobUrls(videoQueue);
     videoQueue = [];
     currentIndex = -1;
     playbackPositions = {};
+    lastSearchResults = [];
     seenUrls.clear();
+    sourcePoolCache.clear();
     try {
       localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
     } catch {}
@@ -6697,6 +7423,13 @@ if (typeof document !== 'undefined') {
     saveSettings();
     syncAgeGateUI();
     renderSourcesList();
+    if (document.getElementById('searchResultsList')) {
+      renderSearchResults([]);
+    }
+    if (document.getElementById('vaultList')) {
+      renderVaultList();
+    }
+    setPlayerLoading(false);
     updatePlayerUI();
     showToast('Reset to default sources & settings');
   });
@@ -6729,7 +7462,7 @@ if (typeof document !== 'undefined') {
     if (!item) return;
 
     if (btn.dataset.action === 'play-vault-item') {
-      videoQueue.push(item);
+      videoQueue.push({ ...item, fromVault: true });
       currentIndex = videoQueue.length - 1;
       switchTab('view-discover');
       updatePlayerUI();
@@ -6836,6 +7569,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isPeerTubeSource,
     isPeerTubeExplicitlyEnabled,
     buildKeywordEnginePromises,
+    getSourceCacheKey,
     interleaveVideoBuckets,
     pullFromSource,
     pullRandomVideos,
@@ -6875,6 +7609,7 @@ if (typeof module !== 'undefined' && module.exports) {
     renderSearchResults,
     renderVaultList,
     saveVideoToVaultDB,
+    saveAndCacheVideoToVault,
     toggleVaultFavorite,
     toggleCurrentVideoFavorite,
     shuffleVaultToPlayer,
@@ -6898,12 +7633,14 @@ if (typeof module !== 'undefined' && module.exports) {
     lockAppGate,
     registerNsfwBiometric,
     authenticateNsfwBiometric,
+    revokeVideoItemBlobUrls,
     scrubNsfwFromActiveSession,
     scrubSafeFromActiveSession,
     triggerPanicSafeMode,
     getSavedPlaybackTime,
     savePlaybackState,
     restorePlaybackState,
+    rehydrateQueueOfflineBlobsFromVault,
     handleVisibilityPlaybackChange,
     syncAgeGateUI,
     openAgeGateModal,
@@ -6921,8 +7658,18 @@ if (typeof module !== 'undefined' && module.exports) {
       playbackPositions
     }),
     setAppState: (patch = {}) => {
-      if (Array.isArray(patch.sources)) sources = patch.sources;
+      if (Array.isArray(patch.sources)) {
+        sources = patch.sources;
+        if (!Array.isArray(patch.deletedSourceIds)) {
+          settings.deletedSourceIds = [];
+        }
+      }
+      if (Array.isArray(patch.deletedSourceIds)) {
+        settings.deletedSourceIds = patch.deletedSourceIds;
+      }
       if (Array.isArray(patch.videoQueue)) {
+        const nextSet = new Set(patch.videoQueue);
+        revokeVideoItemBlobUrls(videoQueue.filter((item) => !nextSet.has(item)));
         videoQueue = patch.videoQueue;
         consecutiveErrorSkips = 0;
         if (patch.videoQueue.length === 0 && !patch.playbackPositions) {

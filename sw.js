@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reelvault-v17';
+const CACHE_NAME = 'reelvault-v20';
 const APP_SHELL = [
   './',
   './index.html',
@@ -17,7 +17,11 @@ self.addEventListener('install', (event) => {
     caches.open(CACHE_NAME).then((cache) =>
       Promise.all(
         APP_SHELL.map((url) =>
-          fetch(url, { cache: 'no-cache' }).then((res) => cache.put(url, res))
+          fetch(url, { cache: 'no-cache' }).then((res) => {
+            if (res && res.ok) {
+              return cache.put(url, res);
+            }
+          })
         )
       )
     )
@@ -50,8 +54,10 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     fetch(event.request, { cache: 'no-cache' })
       .then((response) => {
-        const clone = response.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        if (response && response.ok) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
         return response;
       })
       .catch(() => caches.match(event.request, { ignoreSearch: true }))
