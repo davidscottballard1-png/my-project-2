@@ -751,6 +751,55 @@ describe('ReelVault Unit Tests', () => {
         assert.ok(stat.size > 0, `Service Worker APP_SHELL asset is empty: ${relPath}`);
       }
     });
+
+    it('should keep sw.js CACHE_NAME version in lockstep with index.html app.js?v= cache-buster and reject poisoned proxy payloads', () => {
+      const swCode = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
+      const indexHtml = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+      const swVerMatch = swCode.match(/CACHE_NAME\s*=\s*['"]reelvault-v(\d+)['"]/);
+      const htmlVerMatch = indexHtml.match(/<script\s+src=["']\.\/app\.js\?v=(\d+)["']><\/script>/);
+
+      assert.ok(swVerMatch, 'sw.js must define CACHE_NAME = "reelvault-v<N>"');
+      assert.ok(htmlVerMatch, 'index.html must include <script src="./app.js?v=<N>"></script>');
+      assert.strictEqual(
+        swVerMatch[1],
+        htmlVerMatch[1],
+        `sw.js version (v${swVerMatch[1]}) must match index.html script version (v${htmlVerMatch[1]}) so Safari invalidates stale caches`
+      );
+
+      const { isInvalidCorsProxyPayload } = require('../app.js');
+      assert.strictEqual(
+        isInvalidCorsProxyPayload('Too many requests, please try again later.', true, 'https://www.reddit.com/r/nsfw.json'),
+        true
+      );
+      assert.strictEqual(
+        isInvalidCorsProxyPayload(
+          'corsproxy.io: Production domains require a paid plan and API key.',
+          true,
+          'https://www.eporner.com/embed/abc/'
+        ),
+        true
+      );
+      assert.strictEqual(
+        isInvalidCorsProxyPayload(
+          '<html><head><title>Just a moment...</title></head><body></body></html>',
+          true,
+          'https://fulltaboo.tv/'
+        ),
+        true
+      );
+      assert.strictEqual(
+        isInvalidCorsProxyPayload({ error: 'Paid plan required' }, false, 'https://www.reddit.com/r/RealGirls/hot.json'),
+        true
+      );
+      assert.strictEqual(
+        isInvalidCorsProxyPayload({ status: 'blocked' }, false, 'https://www.eporner.com/api/v2/video/search/?query=hd'),
+        true
+      );
+      assert.strictEqual(
+        isInvalidCorsProxyPayload({ message: 'Forbidden' }, false, 'https://api.redgifs.com/v2/auth/temporary'),
+        true
+      );
+    });
   });
 
   // Helper to create a fast in-memory DOM environment for UI tests

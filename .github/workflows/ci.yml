@@ -1,0 +1,54 @@
+name: ReelVault CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 12:00 UTC check to catch third-party CORS proxy policy changes early
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-and-regression-tests:
+    name: Syntax & 147 Unit/Regression Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check app.js
+          node --check sw.js
+          node --check scripts/smoke-live-proxies.mjs
+
+      - name: Run full unit & regression test suite
+        run: node --test tests/*.js
+
+  live-production-proxy-smoke:
+    name: Live github.io Origin CORS Proxy Smoke Check
+    needs: unit-and-regression-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Verify production CORS proxy pool with Origin https://davidscottballard1-png.github.io
+        run: node scripts/smoke-live-proxies.mjs
