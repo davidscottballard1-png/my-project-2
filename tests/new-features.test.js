@@ -39,6 +39,7 @@ const {
   upgradeUnsignedRedgifsItems,
   armPlaybackStartupWatchdog,
   clearPlaybackStartupWatchdog,
+  rescueDeadVideoStream,
   restorePlaybackState,
   updatePlayerUI,
   getAppState,
@@ -2466,7 +2467,352 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('should salvage expired RedGIFs and Tube clips in-place by re-minting fresh signed stream URLs from pageUrl before skipping', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+
+      const mockVideoEl = {
+        src: 'https://media.redgifs.com/SalvageClip.mp4?expires=1700000000&signature=expiredSig',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, status: 200, json: async () => ({ token: 'fresh-guest-token' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/salvageclip')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              gif: {
+                id: 'salvageclip',
+                duration: 18,
+                urls: {
+                  hd: 'https://media.redgifs.com/SalvageClip.mp4?expires=4102444800&signature=mintedFreshHd',
+                  sd: 'https://thumbs4.redgifs.com/SalvageClip-mobile.mp4?expires=4102444800&signature=mintedFreshSd'
+                }
+              }
+            })
+          };
+        }
+        if (u.includes('eporner.com/embed/ep999')) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              '<script>window.EP = { src: "https://cdn2.eporner.com/streams/ep999_fresh_720p.mp4?token=newTok" };</script>'
+          };
+        }
+        return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        const expiredRgClip = {
+          id: 'rg-salvageclip',
+          title: 'Expired RedGIFs Clip',
+          videoUrl: 'https://media.redgifs.com/SalvageClip.mp4?expires=1700000000&signature=expiredSig',
+          pageUrl: 'https://www.redgifs.com/watch/salvageclip',
+          format: 'mp4',
+          sourceName: 'RedGIFs HD'
+        };
+        const nextClip = {
+          id: 'next-clip',
+          title: 'Backup Clip',
+          videoUrl: 'https://cdn.example.com/backup.mp4',
+          format: 'mp4'
+        };
+
+        setAppState({ videoQueue: [expiredRgClip, nextClip], currentIndex: 0 });
+        const salvaged = await handleVideoPlaybackError();
+        assert.strictEqual(salvaged, true);
+        assert.strictEqual(
+          getAppState().videoQueue[0].id,
+          'rg-salvageclip',
+          'Exact same video should remain at index 0 instead of being skipped'
+        );
+        assert.strictEqual(
+          mockVideoEl.src,
+          'https://media.redgifs.com/SalvageClip.mp4?expires=4102444800&signature=mintedFreshHd',
+          'Player src should switch to the newly minted signed HD URL'
+        );
+        assert.strictEqual(
+          getAppState().videoQueue[0].convertedUrl,
+          'https://thumbs4.redgifs.com/SalvageClip-mobile.mp4?expires=4102444800&signature=mintedFreshSd'
+        );
+
+        // Also verify Tube/Eporner embed re-scrape rescue
+        const expiredTubeClip = {
+          id: 'ep-ep999',
+          title: 'Expired Tube Clip',
+          videoUrl: 'https://cdn1.eporner.com/streams/ep999_720p.mp4?token=expiredTok',
+          pageUrl: 'https://www.eporner.com/video-ep999/title/',
+          format: 'mp4'
+        };
+        const rescuedTube = await rescueDeadVideoStream(expiredTubeClip);
+        assert.ok(rescuedTube, 'Eporner clip should be rescued via embed re-scrape');
+        assert.strictEqual(rescuedTube.videoUrl, 'https://cdn2.eporner.com/streams/ep999_fresh_720p.mp4?token=newTok');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should rescue broken Reddit DASH MP4s via native HLSPlaylist.m3u8 and purged Mastodon caches via home instance API', async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('reddit.com/r/Unexpected/comments/xyz123/cool_post.json')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => [
+              {
+                data: {
+                  children: [
+                    {
+                      data: {
+                        id: 'xyz123',
+                        secure_media: {
+                          reddit_video: {
+                            fallback_url: 'https://v.redd.it/vid99/DASH_720.mp4',
+                            hls_url: 'https://v.redd.it/vid99/HLSPlaylist.m3u8?a=173999'
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          };
+        }
+        if (u === 'https://ohai.social/api/v1/statuses/987654321') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              id: '987654321',
+              media_attachments: [
+                {
+                  type: 'video',
+                  url: 'https://files.ohai.social/media_attachments/files/origin-video.mp4'
+                }
+              ]
+            })
+          };
+        }
+        return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        const redditItem = {
+          id: 'rd-xyz123',
+          title: 'Reddit Clip',
+          videoUrl: 'https://v.redd.it/vid99/DASH_720.mp4',
+          pageUrl: 'https://www.reddit.com/r/Unexpected/comments/xyz123/cool_post/',
+          format: 'mp4'
+        };
+        const rescuedReddit = await rescueDeadVideoStream(redditItem);
+        assert.ok(rescuedReddit, 'Broken Reddit DASH MP4 should be rescued via native HLSPlaylist.m3u8');
+        assert.strictEqual(rescuedReddit.videoUrl, 'https://v.redd.it/vid99/HLSPlaylist.m3u8?a=173999');
+        assert.strictEqual(rescuedReddit.format, 'm3u8');
+
+        const mastodonItem = {
+          id: 'masto-55',
+          title: 'Purged Cache Mastodon Clip',
+          videoUrl: 'https://files.mastodon.social/cache/media_attachments/purged.mp4',
+          pageUrl: 'https://ohai.social/@creator/987654321',
+          format: 'mp4'
+        };
+        const rescuedMasto = await rescueDeadVideoStream(mastodonItem);
+        assert.ok(rescuedMasto, 'Purged mastodon.social cache URL should be rescued from home instance status API');
+        assert.strictEqual(rescuedMasto.videoUrl, 'https://files.ohai.social/media_attachments/files/origin-video.mp4');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('should salvage hotlink-blocked MP4 streams into an in-memory blob: URL via CORS proxy when <video> rejects external Referer', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+
+      const mockVideoEl = {
+        src: 'https://hotlink-guarded.example/media/clip77.mp4',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      const fakeMp4Bytes = new Uint8Array(4096).fill(7);
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.startsWith('https://corsproxy.io/?')) {
+          return {
+            ok: true,
+            status: 200,
+            headers: {
+              get: (h) => {
+                if (h.toLowerCase() === 'content-type') return 'video/mp4';
+                if (h.toLowerCase() === 'content-length') return String(fakeMp4Bytes.byteLength);
+                return null;
+              }
+            },
+            blob: async () => new Blob([fakeMp4Bytes], { type: 'video/mp4' })
+          };
+        }
+        return { ok: false, status: 403, text: async () => 'Hotlink Forbidden', json: async () => ({}) };
+      };
+
+      try {
+        const hotlinkedClip = {
+          id: 'web-hotlink-1',
+          title: 'Hotlink Guarded Clip',
+          videoUrl: 'https://hotlink-guarded.example/media/clip77.mp4',
+          pageUrl: 'https://hotlink-guarded.example/watch/77',
+          format: 'mp4'
+        };
+        const backupClip = {
+          id: 'backup-2',
+          title: 'Backup',
+          videoUrl: 'https://cdn.example.com/backup2.mp4',
+          format: 'mp4'
+        };
+
+        setAppState({ videoQueue: [hotlinkedClip, backupClip], currentIndex: 0 });
+        const recovered = await handleVideoPlaybackError();
+        assert.strictEqual(recovered, true);
+        assert.strictEqual(getAppState().videoQueue[0].id, 'web-hotlink-1', 'Hotlinked clip should stay active instead of skipping');
+        assert.strictEqual(
+          mockVideoEl.src.startsWith('blob:'),
+          true,
+          'Player should switch to an in-memory blob: URL created from proxied video bytes'
+        );
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should attempt Live Stream Rescue at most once and immediately skip when a video is genuinely 404 upstream', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+
+      const mockVideoEl = {
+        src: 'https://media.redgifs.com/GoneForever.mp4?expires=1700000000&signature=old',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, status: 200, json: async () => ({ token: 'tok' }) };
+        }
+        // Simulate 410 Gone / 404 Deleted everywhere upstream
+        return { ok: false, status: 410, text: async () => 'Gone', json: async () => ({}) };
+      };
+
+      try {
+        const deletedClip = {
+          id: 'rg-goneforever',
+          title: 'Deleted Upstream Clip',
+          videoUrl: 'https://media.redgifs.com/GoneForever.mp4?expires=1700000000&signature=old',
+          pageUrl: 'https://www.redgifs.com/watch/goneforever',
+          format: 'mp4'
+        };
+        const workingNext = {
+          id: 'working-next',
+          title: 'Working Next Clip',
+          videoUrl: 'https://cdn.example.com/working-next.mp4',
+          format: 'mp4'
+        };
+
+        setAppState({ videoQueue: [deletedClip, workingNext], currentIndex: 0 });
+        const skipped = await handleVideoPlaybackError();
+        assert.strictEqual(skipped, true);
+        assert.strictEqual(deletedClip._streamRescueAttempted, true, 'Should mark rescue attempted once');
+        assert.deepStrictEqual(
+          getAppState().videoQueue.map((v) => v.id),
+          ['working-next'],
+          'Genuinely deleted upstream clip must be removed and skipped cleanly after rescue returns null'
+        );
+        assert.strictEqual(mockVideoEl.src, 'https://cdn.example.com/working-next.mp4');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
   });
 });
+
 
 

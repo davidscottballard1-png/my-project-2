@@ -5503,6 +5503,7 @@ function updatePlayerUI() {
       if (videoEl.dataset) {
         videoEl.dataset.autoConvertAttempted = 'false';
         videoEl.dataset.triedConvertedUrl = 'false';
+        videoEl.dataset.streamRescueAttempted = current._streamRescueAttempted ? 'true' : 'false';
       }
       if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
         videoEl.muted = true;
@@ -5703,6 +5704,301 @@ function recordDeadStreamUrl(url, originSourceId = null) {
   }
 }
 
+const STREAM_RESCUE_TIMEOUT_MS = 3500;
+const PROXY_BLOB_SALVAGE_MAX_BYTES = 25 * 1024 * 1024;
+
+// Attempt to salvage the exact video when its initial CDN URL expired, was cache-purged, or hotlink-blocked
+async function rescueDeadVideoStream(videoItem, opts = {}) {
+  if (!videoItem || typeof videoItem !== 'object') return null;
+  if (videoItem._streamRescueAttempted) return null;
+  if (videoItem.fromVault || videoItem.offlineBlob instanceof Blob) return null;
+
+  const pageUrl = typeof videoItem.pageUrl === 'string' ? videoItem.pageUrl.trim() : '';
+  const origUrl = typeof videoItem.originalUrl === 'string' ? videoItem.originalUrl.trim() : '';
+  const itemId = String(videoItem.id || '');
+  const hasOriginHint =
+    Boolean(pageUrl) ||
+    /redgifs\.com/i.test(`${origUrl} ${videoItem.videoUrl || ''}`) ||
+    /^(?:rg|masto|pt|ep)-/i.test(itemId);
+
+  if (!hasOriginHint) return null;
+  videoItem._streamRescueAttempted = true;
+
+  const isUsableRescueUrl = (candidate) => {
+    if (!candidate || typeof candidate !== 'string') return false;
+    const trimmed = candidate.trim();
+    if (!/^https?:\/\//i.test(trimmed)) return false;
+    if (deadUrls.has(trimmed)) return false;
+    if (trimmed === videoItem.videoUrl || trimmed === videoItem.convertedUrl) return false;
+    if (/^https?:\/\/gvideo\.eporner\.com\/[^/]+\/[^/?]+\.mp4$/i.test(trimmed)) return false;
+    if (/^https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/[^?]+$/i.test(trimmed)) return false;
+    const fmt = detectVideoFormat(trimmed, 'mp4');
+    return Boolean(fmt.iphoneNative || isFormatAllowedBySettings(fmt.ext));
+  };
+
+  let rescueTimer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    rescueTimer = setTimeout(() => resolve(null), STREAM_RESCUE_TIMEOUT_MS);
+    rescueTimer.unref?.();
+  });
+
+  const workPromise = (async () => {
+    // 1. RedGIFs: clear stale bearer token and mint fresh signed HD/SD stream URLs
+    const rgId =
+      extractRedgifsId(pageUrl || origUrl || videoItem.videoUrl || '') ||
+      (itemId.startsWith('rg-') ? itemId.slice(3) : null);
+    if (rgId) {
+      cachedRedgifsToken = null;
+      cachedRedgifsTokenExpiry = 0;
+      const resolvedRg = await resolveRedgifsUrlToMp4(
+        `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`,
+        videoItem.title || 'RedGIFs HD Clip'
+      );
+      if (resolvedRg) {
+        const candidates = [resolvedRg.videoUrl, resolvedRg.convertedUrl].filter(isUsableRescueUrl);
+        if (candidates.length > 0) {
+          return {
+            videoUrl: candidates[0],
+            convertedUrl: candidates[1] || null,
+            format: 'mp4'
+          };
+        }
+      }
+    }
+
+    // 2. Reddit post permalink: fetch <pageUrl>.json for native HLSPlaylist.m3u8 or fresh mirror/RedGIFs link
+    if (/^https?:\/\/(?:www\.|old\.)?reddit\.com\/r\/[^/]+\/comments\//i.test(pageUrl)) {
+      try {
+        const cleanRedditUrl = pageUrl.split('?')[0].split('#')[0].replace(/\/+$/, '');
+        const postJson = await fetchWithCorsFallback(`${cleanRedditUrl}.json?raw_json=1`, false);
+        const rawPost = Array.isArray(postJson)
+          ? postJson[0]?.data?.children?.[0]?.data
+          : postJson?.data?.children?.[0]?.data;
+        const mediaPost = rawPost?.crosspost_parent_list?.[0] || rawPost;
+        if (mediaPost) {
+          const destUrl = mediaPost.url_overridden_by_dest || mediaPost.url || '';
+          if (/redgifs\.com/i.test(destUrl)) {
+            cachedRedgifsToken = null;
+            cachedRedgifsTokenExpiry = 0;
+            const rgFromPost = await resolveRedgifsUrlToMp4(destUrl, videoItem.title);
+            const rgCandidates = [rgFromPost?.videoUrl, rgFromPost?.convertedUrl].filter(isUsableRescueUrl);
+            if (rgCandidates.length > 0) {
+              return {
+                videoUrl: rgCandidates[0],
+                convertedUrl: rgCandidates[1] || null,
+                format: 'mp4'
+              };
+            }
+          }
+
+          const rdCandidates = [
+            mediaPost?.secure_media?.reddit_video?.hls_url,
+            mediaPost?.media?.reddit_video?.hls_url,
+            mediaPost?.secure_media?.reddit_video?.fallback_url,
+            mediaPost?.media?.reddit_video?.fallback_url,
+            mediaPost?.preview?.reddit_video_preview?.fallback_url
+          ]
+            .filter((u) => typeof u === 'string')
+            .map((u) => u.replace(/&amp;/g, '&'))
+            .filter(isUsableRescueUrl);
+
+          if (rdCandidates.length > 0) {
+            const primary = rdCandidates[0];
+            return {
+              videoUrl: primary,
+              convertedUrl: rdCandidates[1] || null,
+              format: detectVideoFormat(primary, primary.includes('.m3u8') ? 'm3u8' : 'mp4').ext
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Mastodon federated status: query the origin home instance when mastodon.social purged its local cache
+    const mastoMatch = pageUrl.match(
+      /^(https?:\/\/[^/]+)\/(?:@[^/]+\/|users\/[^/]+\/statuses\/|statuses\/)(\d+)\b/i
+    );
+    if (mastoMatch?.[1] && mastoMatch?.[2]) {
+      try {
+        const stRes = await fetchWithTimeout(`${mastoMatch[1]}/api/v1/statuses/${mastoMatch[2]}`, 2500);
+        if (stRes.ok) {
+          const stData = await stRes.json();
+          const atts = Array.isArray(stData?.media_attachments) ? stData.media_attachments : [];
+          const mastoCandidates = [];
+          for (const att of atts) {
+            if (att?.type === 'video' || att?.type === 'gifv') {
+              if (isUsableRescueUrl(att.url)) mastoCandidates.push(att.url);
+              if (isUsableRescueUrl(att.remote_url)) mastoCandidates.push(att.remote_url);
+            }
+          }
+          if (mastoCandidates.length > 0) {
+            const primary = mastoCandidates[0];
+            return {
+              videoUrl: primary,
+              convertedUrl: mastoCandidates[1] || null,
+              format: detectVideoFormat(primary, 'mp4').ext
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // 4. PeerTube federated instance: query origin video API for alternate resolution files or HLS playlist
+    const ptMatch = pageUrl.match(/^(https?:\/\/[^/]+)\/(?:w|videos\/watch)\/([a-zA-Z0-9-]+)\b/i);
+    if (ptMatch?.[1] && ptMatch?.[2]) {
+      try {
+        const ptRes = await fetchWithTimeout(
+          `${ptMatch[1]}/api/v1/videos/${encodeURIComponent(ptMatch[2])}`,
+          2500
+        );
+        if (ptRes.ok) {
+          const detail = await ptRes.json();
+          const files = [
+            ...(Array.isArray(detail?.files) ? detail.files : []),
+            ...(Array.isArray(detail?.streamingPlaylists?.[0]?.files) ? detail.streamingPlaylists[0].files : [])
+          ];
+          const ptCandidates = [
+            ...files.map((f) => f?.fileDownloadUrl || f?.fileUrl),
+            detail?.streamingPlaylists?.[0]?.playlistUrl
+          ].filter(isUsableRescueUrl);
+          if (ptCandidates.length > 0) {
+            const primary = ptCandidates[0];
+            return {
+              videoUrl: primary,
+              convertedUrl: ptCandidates[1] || null,
+              format: detectVideoFormat(primary, primary.includes('.m3u8') ? 'm3u8' : 'mp4').ext
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // 5. Archive.org item metadata: switch to an alternate non-private MP4/MOV derivative in the same item
+    const iaMatch =
+      pageUrl.match(/archive\.org\/details\/([^/?#]+)/i) ||
+      String(videoItem.videoUrl || '').match(/archive\.org\/download\/([^/?#]+)\//i);
+    if (iaMatch?.[1] && pageUrl) {
+      try {
+        const iaId = iaMatch[1];
+        const metaRes = await fetchWithTimeout(
+          `https://archive.org/metadata/${encodeURIComponent(iaId)}`,
+          2500
+        );
+        if (metaRes.ok) {
+          const meta = await metaRes.json();
+          const files = Array.isArray(meta?.files) ? meta.files : [];
+          const iaCandidates = files
+            .filter((f) => typeof f?.name === 'string' && /\.(?:mp4|m4v|mov)$/i.test(f.name) && !f.private)
+            .map(
+              (f) =>
+                `https://archive.org/download/${encodeURIComponent(iaId)}/${encodeArchiveFilePath(f.name)}`
+            )
+            .filter(isUsableRescueUrl);
+          if (iaCandidates.length > 0) {
+            return {
+              videoUrl: iaCandidates[0],
+              convertedUrl: iaCandidates[1] || null,
+              format: detectVideoFormat(iaCandidates[0], 'mp4').ext
+            };
+          }
+        }
+      } catch {}
+    }
+
+    // 6. Tube / Open-Web watch or embed page re-scrape (mints fresh signed CDN URLs)
+    const epIdMatch =
+      itemId.match(/^ep-([a-zA-Z0-9]+)$/i) ||
+      pageUrl.match(/eporner\.com\/(?:video-|hd-porn\/|embed\/)([a-zA-Z0-9]+)/i);
+    const scrapeTargets = [];
+    if (epIdMatch?.[1]) {
+      scrapeTargets.push(`https://www.eporner.com/embed/${epIdMatch[1]}/`);
+    }
+    if (
+      pageUrl &&
+      /^https?:\/\//i.test(pageUrl) &&
+      !DIRECT_VIDEO_URL_REGEX.test(pageUrl) &&
+      !/reddit\.com\/r\//i.test(pageUrl) &&
+      !/redgifs\.com\//i.test(pageUrl) &&
+      !scrapeTargets.includes(pageUrl)
+    ) {
+      scrapeTargets.push(pageUrl);
+    }
+
+    for (const target of scrapeTargets) {
+      try {
+        const html = await fetchWithCorsFallback(target, true);
+        const extracted = extractVideoUrlsFromHtml(html, target).filter(isUsableRescueUrl);
+        if (extracted.length > 0) {
+          const mp4First = [
+            ...extracted.filter((u) => /\.mp4(\?|$)/i.test(u)),
+            ...extracted.filter((u) => !/\.mp4(\?|$)/i.test(u))
+          ];
+          const primary = mp4First[0];
+          return {
+            videoUrl: primary,
+            convertedUrl: mp4First[1] || null,
+            format: detectVideoFormat(primary, 'mp4').ext
+          };
+        }
+      } catch {}
+    }
+
+    // 7. Hotlink / Referer block bypass: if <video> failed fast (not timeout), pull bytes via CORS proxy into a local blob: URL
+    const hotlinkTarget = videoItem.videoUrl;
+    if (
+      opts?.reason !== 'timeout' &&
+      typeof URL !== 'undefined' &&
+      typeof URL.createObjectURL === 'function' &&
+      typeof hotlinkTarget === 'string' &&
+      /^https?:\/\//i.test(hotlinkTarget) &&
+      !/^https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/[^?]+$/i.test(hotlinkTarget) &&
+      !/^https?:\/\/gvideo\.eporner\.com\//i.test(hotlinkTarget)
+    ) {
+      const proxyController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const proxyTimer = proxyController ? setTimeout(() => proxyController.abort(), 2500) : null;
+      proxyTimer?.unref?.();
+      try {
+        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(hotlinkTarget)}`;
+        const pRes = proxyController
+          ? await fetch(proxyUrl, { signal: proxyController.signal })
+          : await fetch(proxyUrl);
+        if (pRes && pRes.ok) {
+          const ct = String(pRes.headers?.get?.('content-type') || '').toLowerCase();
+          const len = Number(pRes.headers?.get?.('content-length')) || 0;
+          if (
+            !ct.includes('text/html') &&
+            !ct.includes('application/json') &&
+            (ct.startsWith('video/') || ct === 'application/octet-stream' || /\.mp4(\?|$)/i.test(hotlinkTarget)) &&
+            (len === 0 || len <= PROXY_BLOB_SALVAGE_MAX_BYTES) &&
+            typeof pRes.blob === 'function'
+          ) {
+            const rawBlob = await pRes.blob();
+            if (rawBlob && rawBlob.size > 1024 && rawBlob.size <= PROXY_BLOB_SALVAGE_MAX_BYTES) {
+              const typedBlob = rawBlob.type?.startsWith('video/')
+                ? rawBlob
+                : new Blob([rawBlob], { type: 'video/mp4' });
+              const blobUrl = URL.createObjectURL(typedBlob);
+              if (blobUrl) {
+                return { blobUrl };
+              }
+            }
+          }
+        }
+      } catch {} finally {
+        if (proxyTimer) clearTimeout(proxyTimer);
+      }
+    }
+
+    return null;
+  })();
+
+  try {
+    return await Promise.race([workPromise, timeoutPromise]);
+  } finally {
+    if (rescueTimer) clearTimeout(rescueTimer);
+  }
+}
+
 // Recover automatically when a pulled video fails to decode, hangs, or 403/404s on iOS Safari
 async function handleVideoPlaybackError(opts = {}) {
   if (isHandlingPlaybackError) return false;
@@ -5757,6 +6053,71 @@ async function handleVideoPlaybackError(opts = {}) {
       const convertedOk = await convertCurrentVideoForPlayer(current);
       if (convertedOk) {
         return true;
+      }
+    }
+
+    // Mark the current dead URL(s) before attempting Live Stream Rescue so rescue picks a fresh stream
+    if (current.videoUrl) recordDeadStreamUrl(current.videoUrl);
+    if (current.convertedUrl) recordDeadStreamUrl(current.convertedUrl);
+
+    // 2.5. Live Stream Rescue (~3.5s cap): re-mint fresh signed URLs from pageUrl/API or salvage hotlink-blocked bytes
+    if (!current._streamRescueAttempted && videoEl.dataset?.streamRescueAttempted !== 'true') {
+      if (videoEl.dataset) videoEl.dataset.streamRescueAttempted = 'true';
+      const rescued = await rescueDeadVideoStream(current, opts);
+      if (rescued) {
+        if (videoQueue[currentIndex] !== current) {
+          if (rescued.blobUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+            try {
+              URL.revokeObjectURL(rescued.blobUrl);
+            } catch {}
+          }
+          return true;
+        }
+        if (rescued.blobUrl) {
+          if (
+            current.convertedBlobUrl &&
+            current.convertedBlobUrl !== rescued.blobUrl &&
+            typeof URL !== 'undefined' &&
+            typeof URL.revokeObjectURL === 'function'
+          ) {
+            try {
+              URL.revokeObjectURL(current.convertedBlobUrl);
+            } catch {}
+          }
+          current.convertedBlobUrl = rescued.blobUrl;
+          current.isAutoConverted = true;
+          clearPlaybackStartupWatchdog();
+          videoEl.src = rescued.blobUrl;
+          videoEl.load?.();
+          if (settings.autoPlay) {
+            videoEl.play?.()?.catch?.((err) => {
+              if (err?.name === 'NotAllowedError') clearPlaybackStartupWatchdog();
+            });
+          }
+          showToast('Recovered blocked stream — playing now!');
+          return true;
+        }
+        if (rescued.videoUrl) {
+          current.videoUrl = rescued.videoUrl;
+          current.convertedUrl = rescued.convertedUrl || null;
+          if (rescued.format) {
+            current.format = rescued.format;
+          }
+          if (videoEl.dataset) {
+            videoEl.dataset.triedConvertedUrl = rescued.convertedUrl ? 'false' : 'true';
+          }
+          videoEl.src = rescued.videoUrl;
+          videoEl.load?.();
+          armPlaybackStartupWatchdog(videoEl, current, rescued.videoUrl);
+          if (settings.autoPlay) {
+            videoEl.play?.()?.catch?.((err) => {
+              if (err?.name === 'NotAllowedError') clearPlaybackStartupWatchdog();
+            });
+          }
+          savePlaybackState();
+          showToast('Refreshed stream link — playing now!');
+          return true;
+        }
       }
     }
 
@@ -7941,6 +8302,7 @@ if (typeof module !== 'undefined' && module.exports) {
     armPlaybackStartupWatchdog,
     clearPlaybackStartupWatchdog,
     recordDeadStreamUrl,
+    rescueDeadVideoStream,
     isStaleOrDisallowedRestoredItem,
     upgradeUnsignedRedgifsItems,
     setNsfwPin,
