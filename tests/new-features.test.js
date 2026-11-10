@@ -35,6 +35,12 @@ const {
   animateReelsSlide,
   getEffectiveActiveSources,
   syncQueueAfterSourceChange,
+  fetchDirectEpornerVideos,
+  upgradeUnsignedRedgifsItems,
+  armPlaybackStartupWatchdog,
+  clearPlaybackStartupWatchdog,
+  restorePlaybackState,
+  updatePlayerUI,
   getAppState,
   setAppState,
   syncAgeGateUI,
@@ -1473,7 +1479,17 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
           };
         }
 
-        // Simulate Reddit, RedGIFs, FullTaboo, and CORS proxies all returning 403/522
+        // Simulate Eporner embed page returning real player stream for epDirect101 (and 403 for epDirect202)
+        if (u.includes('eporner.com/embed/epDirect101')) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              '<script>window.EP.video = { "src": "https:\\/\\/cdn.eporner.com\\/streams\\/epDirect101_720p.mp4" };</script>'
+          };
+        }
+
+        // Simulate Reddit, RedGIFs, FullTaboo, epDirect202, and CORS proxies returning 403/522
         return { ok: false, status: 403, text: async () => 'Forbidden', json: async () => ({}) };
       };
 
@@ -1488,11 +1504,21 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         const ftItems = await scanUrlForVideos('https://fulltaboo.tv/', 'FullTaboo.tv', true);
         assert.strictEqual(ftItems.length, 0, 'FullTaboo.tv scan must not masquerade Eporner streams as FullTaboo.tv');
 
+        // Direct check: epDirect202 (403 embed) must be dropped instead of fabricating gvideo.eporner.com
+        const directEp = await fetchDirectEpornerVideos('popular hd', 4, 'Free Tube 18+');
+        assert.strictEqual(directEp.length, 1, 'Unscrapable embed items must be dropped rather than guessing gvideo.eporner.com');
+        assert.strictEqual(directEp[0].videoUrl, 'https://cdn.eporner.com/streams/epDirect101_720p.mp4');
+
         // Enabled Free Tube sources ('src-nsfw-tube-hd', 'src-nsfw-romantic') still populate videoQueue cleanly
         await pullRandomVideos(1);
         const stateAfter = getAppState();
         assert.strictEqual(stateAfter.videoQueue.length, 1, 'Shuffle Random should populate videoQueue via enabled Free Tube sources');
-        assert.strictEqual(stateAfter.videoQueue[0].videoUrl.startsWith('https://gvideo.eporner.com/'), true);
+        assert.strictEqual(stateAfter.videoQueue[0].videoUrl, 'https://cdn.eporner.com/streams/epDirect101_720p.mp4');
+        assert.strictEqual(
+          stateAfter.videoQueue[0].videoUrl.includes('gvideo.eporner.com'),
+          false,
+          'Synthetic unplayable gvideo.eporner.com URLs must never be queued'
+        );
         assert.ok(
           ['src-nsfw-tube-hd', 'src-nsfw-romantic'].includes(stateAfter.videoQueue[0].originSourceId),
           'Queued Free Tube clip must carry the originSourceId of the enabled Free Tube source'
@@ -2076,6 +2102,371 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('should abort hung streams via armPlaybackStartupWatchdog (even at 00:02 / 00:00 savedTime) without auto-converting native MP4', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const origAutoConvert = settings.autoConvert;
+      const prevDoc = globalThis.document;
+
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount++;
+        return { ok: false, status: 504 };
+      };
+
+      const mockVideoEl = {
+        src: 'https://files.mastodon.example/hung.mp4',
+        readyState: 0,
+        currentTime: 2.0,
+        duration: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        },
+        getAttribute(attr) {
+          return attr === 'src' ? this.src : null;
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      try {
+        settings.autoConvert = true;
+        const hungClip = {
+          id: 'hung-1',
+          title: 'Hung Stream',
+          videoUrl: 'https://files.mastodon.example/hung.mp4',
+          format: 'mp4',
+          sourceName: 'Test Source'
+        };
+        const healthyClip = {
+          id: 'healthy-2',
+          title: 'Working Stream',
+          videoUrl: 'https://cdn.example.com/working.mp4',
+          format: 'mp4',
+          sourceName: 'Test Source'
+        };
+
+        setAppState({ videoQueue: [hungClip, healthyClip], currentIndex: 0 });
+        mockVideoEl.currentTime = 2.0; // Simulate 00:02 / 00:00 restored savedTime with readyState === 0
+        armPlaybackStartupWatchdog(mockVideoEl, hungClip, hungClip.videoUrl, 25);
+
+        await new Promise((r) => setTimeout(r, 70));
+
+        const after = getAppState();
+        assert.strictEqual(fetchCount, 0, 'Should NOT waste time auto-converting a hung native .mp4 stream');
+        assert.strictEqual(after.deadUrls.has('https://files.mastodon.example/hung.mp4'), true);
+        assert.strictEqual(after.videoQueue.length, 1);
+        assert.strictEqual(after.videoQueue[0].id, 'healthy-2');
+        assert.strictEqual(mockVideoEl.src, 'https://cdn.example.com/working.mp4');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        settings.autoConvert = origAutoConvert;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should blacklist dead URLs, purge duplicate dead items from queue, skip MP4 auto-convert, and guard re-entrancy in handleVideoPlaybackError', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const origAutoConvert = settings.autoConvert;
+      const prevDoc = globalThis.document;
+
+      let fetchCalls = 0;
+      globalThis.fetch = async () => {
+        fetchCalls++;
+        return { ok: false, status: 403 };
+      };
+
+      const mockVideoEl = {
+        src: 'https://cdn.example.com/dead-loop.mp4',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      try {
+        settings.autoConvert = true;
+        const dead1 = {
+          id: 'dead-1',
+          title: 'Dead 1',
+          videoUrl: 'https://cdn.example.com/dead-loop.mp4',
+          format: 'mp4',
+          originSourceId: 'src-test'
+        };
+        const dead2Duplicate = {
+          id: 'dead-2',
+          title: 'Dead 1 Duplicate',
+          videoUrl: 'https://cdn.example.com/dead-loop.mp4',
+          format: 'mp4',
+          originSourceId: 'src-test'
+        };
+        const good3 = {
+          id: 'good-3',
+          title: 'Good 3',
+          videoUrl: 'https://cdn.example.com/good-stream.mp4',
+          format: 'mp4',
+          originSourceId: 'src-test'
+        };
+
+        setAppState({ videoQueue: [dead1, dead2Duplicate, good3], currentIndex: 0 });
+
+        // Fire two concurrent error events — second must no-op via isHandlingPlaybackError guard
+        const [r1, r2] = await Promise.all([
+          handleVideoPlaybackError(),
+          handleVideoPlaybackError()
+        ]);
+        assert.strictEqual(r1, true);
+        assert.strictEqual(r2, false, 'Concurrent duplicate error event must be ignored while recovery is in flight');
+        assert.strictEqual(fetchCalls, 0, 'Native .mp4 playback error must skip browser auto-convert proxy fetches');
+
+        const after = getAppState();
+        assert.strictEqual(after.deadUrls.has('https://cdn.example.com/dead-loop.mp4'), true);
+        assert.deepStrictEqual(
+          after.videoQueue.map((v) => v.id),
+          ['good-3'],
+          'Both the failed item and any queued duplicate with the same dead URL must be purged immediately'
+        );
+        assert.strictEqual(mockVideoEl.src, 'https://cdn.example.com/good-stream.mp4');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        settings.autoConvert = origAutoConvert;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should upgrade bare unsigned Reddit RedGIFs CDN URLs to signed API streams and drop deleted 404 clips', async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, status: 200, json: async () => ({ token: 'temp-rg-token' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/liveclip')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              gif: {
+                id: 'liveclip',
+                duration: 14,
+                tags: ['amateur', 'hd'],
+                urls: {
+                  hd: 'https://media.redgifs.com/LiveClip.mp4?expires=4102444800&signature=hdSig',
+                  sd: 'https://thumbs4.redgifs.com/LiveClip-mobile.mp4?expires=4102444800&signature=sdSig'
+                }
+              }
+            })
+          };
+        }
+        return { ok: false, status: 404, text: async () => 'Not Found', json: async () => ({}) };
+      };
+
+      try {
+        const rawItems = [
+          {
+            id: 'rd-1',
+            title: 'Unsigned Live RedGIFs',
+            videoUrl: 'https://thumbs4.redgifs.com/LiveClip.mp4',
+            convertedUrl: 'https://media.redgifs.com/LiveClip.mp4',
+            format: 'mp4',
+            sourceName: 'r/RealGirls'
+          },
+          {
+            id: 'rd-2',
+            title: 'Deleted Unsigned RedGIFs',
+            videoUrl: 'https://media.redgifs.com/DeletedClip.mp4',
+            format: 'mp4',
+            sourceName: 'r/RealGirls'
+          },
+          {
+            id: 'rd-3',
+            title: 'Native Reddit Hosted Video',
+            videoUrl: 'https://v.redd.it/abc123/DASH_720.mp4',
+            format: 'mp4',
+            sourceName: 'r/RealGirls'
+          }
+        ];
+
+        const upgraded = await upgradeUnsignedRedgifsItems(rawItems);
+        assert.strictEqual(upgraded.length, 2, 'Deleted 404 RedGIFs item must be dropped instead of queuing an unsigned 403 URL');
+        const live = upgraded.find((x) => x.id === 'rd-1');
+        const nativeRd = upgraded.find((x) => x.id === 'rd-3');
+        assert.ok(live, 'Resolved RedGIFs item should be kept');
+        assert.strictEqual(live.videoUrl, 'https://media.redgifs.com/LiveClip.mp4?expires=4102444800&signature=hdSig');
+        assert.strictEqual(
+          live.convertedUrl,
+          'https://thumbs4.redgifs.com/LiveClip-mobile.mp4?expires=4102444800&signature=sdSig',
+          'Genuine signed SD stream on thumbs4.redgifs.com must be preserved intact as convertedUrl fallback'
+        );
+        assert.strictEqual(live.sourceName, 'r/RealGirls', 'Original Reddit source badge must be preserved');
+        assert.strictEqual(nativeRd.videoUrl, 'https://v.redd.it/abc123/DASH_720.mp4');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('should purge stale Mastodon (#redgifs), expired CDN URLs, unsigned RedGIFs, and synthetic gvideo.eporner.com items in restorePlaybackState', () => {
+      const origState = getAppState();
+      const origAllowNsfw = settings.allowNsfw;
+      const origResume = settings.resumePlayback;
+      const prevStorage = globalThis.localStorage;
+      const prevDoc = globalThis.document;
+
+      const store = new Map();
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: () => null,
+        querySelector: () => null
+      };
+
+      try {
+        settings.allowNsfw = true;
+        settings.resumePlayback = true;
+        const activeRgSource = {
+          id: 'src-nsfw-redgifs',
+          type: 'redgifs',
+          value: 'trending',
+          label: 'RedGIFs HD',
+          enabled: true,
+          isNsfw: true
+        };
+        const disabledTubeSource = {
+          id: 'src-nsfw-tube-hd',
+          type: 'freetube',
+          value: 'popular hd',
+          label: 'Free Tube 18+',
+          enabled: false,
+          isNsfw: true
+        };
+        setAppState({ sources: [activeRgSource, disabledTubeSource], videoQueue: [], currentIndex: -1 });
+
+        const savedPayload = {
+          currentIndex: 0,
+          currentVideo: {
+            id: 'masto-stale',
+            videoUrl: 'https://files.mastodon.social/media_attachments/files/stale.mp4',
+            sourceName: 'Mastodon (#redgifs)',
+            isNsfw: true
+          },
+          videoQueue: [
+            {
+              id: 'masto-stale',
+              title: 'Stale Mastodon Redgifs',
+              videoUrl: 'https://files.mastodon.social/media_attachments/files/stale.mp4',
+              sourceName: 'Mastodon (#redgifs)',
+              isNsfw: true
+            },
+            {
+              id: 'expired-rg',
+              title: 'Expired Signed Stream',
+              videoUrl: 'https://media.redgifs.com/OldClip.mp4?expires=1600000000&signature=expired',
+              originSourceId: 'src-nsfw-redgifs',
+              sourceName: 'RedGIFs HD',
+              isNsfw: true
+            },
+            {
+              id: 'bare-unsigned-rg',
+              title: 'Bare Unsigned RedGIFs',
+              videoUrl: 'https://thumbs4.redgifs.com/BareUnsigned.mp4',
+              originSourceId: 'src-nsfw-redgifs',
+              sourceName: 'RedGIFs HD',
+              isNsfw: true
+            },
+            {
+              id: 'synthetic-ep',
+              title: 'Guessed Eporner',
+              videoUrl: 'https://gvideo.eporner.com/xyz99/xyz99.mp4',
+              originSourceId: 'src-nsfw-tube-hd',
+              sourceName: 'Free Tube 18+',
+              isNsfw: true
+            },
+            {
+              id: 'fresh-signed-rg',
+              title: 'Fresh Signed RedGIFs',
+              videoUrl: 'https://media.redgifs.com/FreshClip.mp4?expires=4102444800&signature=fresh',
+              originSourceId: 'src-nsfw-redgifs',
+              sourceName: 'RedGIFs HD',
+              isNsfw: true
+            },
+            {
+              id: 'vault-saved',
+              title: 'Offline Vault Video',
+              videoUrl: 'https://thumbs4.redgifs.com/VaultSaved.mp4',
+              fromVault: true,
+              hasOfflineBlob: true,
+              sourceName: 'Vault',
+              isNsfw: true
+            }
+          ],
+          positions: {}
+        };
+        store.set(STORAGE_KEYS.PLAYBACK_STATE, JSON.stringify(savedPayload));
+
+        const restored = restorePlaybackState();
+        assert.strictEqual(restored, true, 'Should restore remaining valid/Vault items after purging stale entries');
+        const restoredIds = getAppState().videoQueue.map((v) => v.id);
+        assert.deepStrictEqual(
+          restoredIds,
+          ['fresh-signed-rg', 'vault-saved'],
+          'Stale Mastodon (#redgifs), expired ?expires=, bare unsigned RedGIFs, and synthetic gvideo.eporner.com items must all be purged'
+        );
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.localStorage = prevStorage;
+        globalThis.document = prevDoc;
+        settings.allowNsfw = origAllowNsfw;
+        settings.resumePlayback = origResume;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
   });
 });
+
 

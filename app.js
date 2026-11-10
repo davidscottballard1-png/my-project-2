@@ -327,6 +327,7 @@ let settings = {
 let videoQueue = [];
 let currentIndex = -1;
 let seenUrls = new Set();
+let deadUrls = new Set();
 let lastSearchResults = [];
 let playbackPositions = {};
 let isReelsFullscreen = false;
@@ -738,7 +739,7 @@ async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
   });
 }
 
-// Fetch video bytes with CORS proxy fallback and live progress
+// Fetch video bytes with CORS proxy fallback, hard connection timeout, and live progress
 async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progressLabel = 'Downloading video...') {
   let response = null;
   const candidateUrls = [
@@ -747,13 +748,28 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
   ];
 
   for (const url of candidateUrls) {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller
+      ? setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {}
+        }, 8000)
+      : null;
+    timer?.unref?.();
     try {
-      const res = await fetch(url);
-      if (res.ok) {
+      const res = controller ? await fetch(url, { signal: controller.signal }) : await fetch(url);
+      if (timer) clearTimeout(timer);
+      if (res && res.ok) {
+        const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
+        if (ct.includes('text/html')) {
+          continue;
+        }
         response = res;
         break;
       }
     } catch {
+      if (timer) clearTimeout(timer);
       // try next candidate
     }
   }
@@ -2475,6 +2491,48 @@ async function rehydrateQueueOfflineBlobsFromVault() {
   return await rehydrateOfflineBlobsPromise;
 }
 
+function isStaleOrDisallowedRestoredItem(item, activeSources) {
+  if (!item || typeof item !== 'object') return true;
+  if (item.fromVault || item.hasOfflineBlob || item.offlineBlob instanceof Blob) {
+    return false;
+  }
+
+  const url = String(item.videoUrl || '').trim();
+  if (!url || deadUrls.has(url)) return true;
+
+  // Drop synthetic unscraped gvideo.eporner.com URLs and bare unsigned RedGIFs CDN URLs
+  if (/^https?:\/\/gvideo\.eporner\.com\/[^/]+\/[^/?]+\.mp4$/i.test(url)) return true;
+  if (/^https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/[^?]+$/i.test(url)) return true;
+
+  // Drop expired signed CDN stream URLs (?expires=<unix_seconds>)
+  const expMatch = url.match(/[?&](?:expires|exp|e)=(\d{9,11})\b/i);
+  if (expMatch && Number(expMatch[1]) * 1000 < Date.now() - 30_000) {
+    return true;
+  }
+
+  const list = Array.isArray(activeSources) ? activeSources : [];
+  const activeIds = new Set(list.map((s) => s?.id).filter(Boolean));
+  if (activeIds.size > 0 && item.originSourceId && !activeIds.has(item.originSourceId)) {
+    return true;
+  }
+
+  const srcName = String(item.sourceName || '');
+  if (/^(?:Mastodon|Lemmy)\b/i.test(srcName)) {
+    const fedEnabled = list.some((s) =>
+      /^dir-fed-lemmy|\b(?:lemmy|fediverse|mastodon)\b/i.test(
+        `${s?.id || ''} ${s?.value || ''} ${s?.label || ''}`
+      )
+    );
+    if (!fedEnabled) return true;
+  }
+  if (/^FullTaboo/i.test(srcName)) {
+    const ftEnabled = list.some((s) => /fulltaboo\.tv/i.test(String(s?.value || '')));
+    if (!ftEnabled) return true;
+  }
+
+  return false;
+}
+
 function restorePlaybackState() {
   if (!settings.resumePlayback) return false;
   try {
@@ -2505,6 +2563,10 @@ function restorePlaybackState() {
     if (!isPeerTubeExplicitlyEnabled()) {
       restoredQueue = restoredQueue.filter((item) => !isPeerTubeVideoItem(item));
     }
+    const activeSources = getEffectiveActiveSources();
+    restoredQueue = restoredQueue.filter(
+      (item) => !isStaleOrDisallowedRestoredItem(item, activeSources)
+    );
     if (restoredQueue.length === 0) return false;
 
     const targetKey = getPlaybackItemKey(parsed.currentVideo);
@@ -3221,22 +3283,32 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
     const token = await getRedgifsTempToken();
     const apiUrl = `https://api.redgifs.com/v2/gifs/${encodeURIComponent(rgId.toLowerCase())}`;
     const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const res = await fetch(apiUrl, { headers });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    timer.unref?.();
+    let res;
+    try {
+      res = await fetch(apiUrl, { headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     if (res.ok) {
       const data = await res.json();
       const gif = data?.gif;
-      const mp4Url = gif?.urls?.hd || gif?.urls?.sd;
+      const hdUrl = gif?.urls?.hd || null;
+      const sdUrl = gif?.urls?.sd || null;
+      const mp4Url = hdUrl || sdUrl;
       if (mp4Url) {
         return {
           id: `rg-${gif.id || rgId.toLowerCase()}`,
           title: (Array.isArray(gif.tags) && gif.tags.length ? `RedGIFs: ${gif.tags.slice(0, 4).join(', ')}` : fallbackTitle),
           videoUrl: mp4Url,
           originalUrl: rawUrl,
-          convertedUrl: mp4Url,
+          convertedUrl: hdUrl && sdUrl && sdUrl !== mp4Url ? sdUrl : null,
           format: 'mp4',
           duration: Number(gif.duration) || 0,
           tags: Array.isArray(gif.tags) ? gif.tags.slice(0, 6) : [],
-          isHd: Boolean(gif?.urls?.hd),
+          isHd: Boolean(hdUrl),
           isNsfw: true,
           sourceName: 'RedGIFs HD',
           pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`
@@ -3252,14 +3324,15 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
     const embedUrl = `https://www.redgifs.com/ifr/${encodeURIComponent(rgId.toLowerCase())}`;
     const html = await fetchWithCorsFallback(embedUrl, true);
     const streams = extractVideoUrlsFromHtml(html, embedUrl);
-    const bestMp4 = streams.find((u) => /\.mp4(\?|$)/i.test(u)) || streams[0];
+    const mp4Streams = streams.filter((u) => /\.mp4(\?|$)/i.test(u));
+    const bestMp4 = mp4Streams[0] || streams[0];
     if (bestMp4) {
       return {
         id: `rg-${rgId.toLowerCase()}`,
         title: fallbackTitle,
         videoUrl: bestMp4,
         originalUrl: rawUrl,
-        convertedUrl: bestMp4,
+        convertedUrl: mp4Streams[1] && mp4Streams[1] !== bestMp4 ? mp4Streams[1] : null,
         format: 'mp4',
         isHd: true,
         isNsfw: true,
@@ -3316,13 +3389,13 @@ function getSubredditNicheQuery(rawSubreddit) {
     .trim();
 }
 
-// Native-CORS 18+ direct .mp4 fallback using Eporner JSON API v2 (Access-Control-Allow-Origin: *) + gvideo CDN
+// Native-CORS 18+ direct .mp4 fetcher using Eporner JSON API v2 + real embed stream extraction (no guessed URLs)
 async function fetchDirectEpornerVideos(
   rawQuery,
   limit = 6,
   customSourceLabel = null,
   orderOverride = null,
-  tryEmbedScrape = false
+  tryEmbedScrape = true
 ) {
   if (!settings.allowNsfw || !isFormatAllowedBySettings('mp4')) return [];
   const cleaned = String(rawQuery || '')
@@ -3362,31 +3435,33 @@ async function fetchDirectEpornerVideos(
   if (videos.length === 0) return [];
 
   const results = [];
-  const slice = videos.slice(0, Math.max(3, limit));
+  const slice = videos.slice(0, Math.min(6, Math.max(3, limit)));
 
   await Promise.allSettled(
-    slice.map(async (v, idx) => {
+    slice.map(async (v) => {
       if (!v?.id) return;
-      const directCdnMp4 = `https://gvideo.eporner.com/${v.id}/${v.id}.mp4`;
       const embedUrl = v.embed || `https://www.eporner.com/embed/${v.id}/`;
-      let chosenStream = null;
+      let chosenStream = typeof v.stream_url === 'string' ? v.stream_url : (typeof v.mp4 === 'string' ? v.mp4 : null);
+      let altStream = null;
 
-      if (tryEmbedScrape && idx < 3) {
+      if (!chosenStream && tryEmbedScrape !== false) {
         try {
           const pageHtml = await fetchWithCorsFallback(embedUrl, true);
           const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
+          const mp4Streams = streams.filter((u) => /\.mp4(\?|$)/i.test(u));
           chosenStream =
-            streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
-            streams.find((u) => /\.mp4(\?|$)/i.test(u)) ||
+            mp4Streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
+            mp4Streams[0] ||
             streams[0] ||
             null;
+          altStream = mp4Streams.find((u) => u !== chosenStream) || null;
         } catch {
           chosenStream = null;
         }
       }
 
-      const finalStream = chosenStream || directCdnMp4;
-      const normalized = normalizeAndAutoRewriteVideoUrl(finalStream);
+      if (!chosenStream) return;
+      const normalized = normalizeAndAutoRewriteVideoUrl(chosenStream);
       if (!normalized || !isFormatAllowedBySettings(normalized.format)) return;
 
       results.push({
@@ -3394,14 +3469,10 @@ async function fetchDirectEpornerVideos(
         title: v.title || 'Free Tube 18+ Video',
         videoUrl: normalized.videoUrl,
         originalUrl: normalized.originalUrl,
-        convertedUrl:
-          normalized.convertedUrl || (finalStream !== directCdnMp4 ? directCdnMp4 : null),
+        convertedUrl: normalized.convertedUrl || altStream,
         format: normalized.format,
         duration: Number(v.length_sec) || 0,
-        isHd:
-          /720|1080|hd/i.test(finalStream) ||
-          Boolean(v.hd) ||
-          !chosenStream,
+        isHd: /720|1080|hd/i.test(chosenStream) || Boolean(v.hd),
         isNsfw: true,
         sourceName: customSourceLabel || `Free Tube (${rawQuery || '18+'})`,
         pageUrl: v.url || embedUrl
@@ -3422,7 +3493,9 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     if (!Array.isArray(gifs)) return;
     for (const g of gifs) {
       if (!g?.id || seenIds.has(g.id)) continue;
-      const mp4Url = g?.urls?.hd || g?.urls?.sd;
+      const hdUrl = g?.urls?.hd || null;
+      const sdUrl = g?.urls?.sd || null;
+      const mp4Url = hdUrl || sdUrl;
       if (!mp4Url || !isFormatAllowedBySettings('mp4')) continue;
       seenIds.add(g.id);
       const tagLabel = Array.isArray(g.tags) && g.tags.length ? g.tags.slice(0, 4).join(', ') : cleanKw;
@@ -3431,11 +3504,11 @@ async function searchRedgifsVideos(keyword, limit = 6) {
         title: `RedGIFs HD — ${tagLabel}`,
         videoUrl: mp4Url,
         originalUrl: mp4Url,
-        convertedUrl: mp4Url.replace(/^https?:\/\/thumbs\d*\.redgifs\.com\//i, 'https://media.redgifs.com/'),
+        convertedUrl: hdUrl && sdUrl && sdUrl !== mp4Url ? sdUrl : null,
         format: 'mp4',
         duration: Number(g.duration) || 0,
         tags: Array.isArray(g.tags) ? g.tags.slice(0, 6) : [],
-        isHd: Boolean(g?.urls?.hd),
+        isHd: Boolean(hdUrl),
         isNsfw: true,
         sourceName: `RedGIFs (${cleanKw})`,
         pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(g.id)}`
@@ -3484,7 +3557,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     // ignore direct API error and try Reddit RedGIFs index below
   }
 
-  // 3. Fallback: if RedGIFs API returned 0 results or was blocked, search Reddit's index of redgifs.com links
+  // 3. Fallback: if RedGIFs API returned 0 results or was blocked, search Reddit's index of redgifs.com links and resolve signed URLs
   if (results.length === 0) {
     try {
       const isTrendingDefault = cleanKw.toLowerCase() === 'trending';
@@ -3497,7 +3570,8 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       const fallbackItems = extractRedditVideosFromListing(json, `RedGIFs (${cleanKw})`, true).filter(
         (item) => /redgifs\.com/i.test(`${item?.videoUrl || ''} ${item?.originalUrl || ''}`)
       );
-      results.push(...fallbackItems.slice(0, limit));
+      const signedItems = await upgradeUnsignedRedgifsItems(fallbackItems.slice(0, limit));
+      results.push(...signedItems);
     } catch {
       // ignore fallback error
     }
@@ -3622,6 +3696,46 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
   return results;
 }
 
+async function upgradeUnsignedRedgifsItems(items) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const output = [];
+  const unsignedQueue = [];
+
+  for (const item of items) {
+    if (!item?.videoUrl) continue;
+    if (/^https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/[^?]+$/i.test(item.videoUrl)) {
+      unsignedQueue.push(item);
+    } else {
+      output.push(item);
+    }
+  }
+
+  if (unsignedQueue.length > 0) {
+    const toResolve = unsignedQueue.slice(0, 6);
+    const settled = await Promise.allSettled(
+      toResolve.map(async (item) => {
+        const resolved = await resolveRedgifsUrlToMp4(item.videoUrl, item.title);
+        if (!resolved?.videoUrl) return null;
+        return {
+          ...item,
+          videoUrl: resolved.videoUrl,
+          originalUrl: resolved.videoUrl,
+          convertedUrl: resolved.convertedUrl || null,
+          duration: item.duration || resolved.duration || 0,
+          isHd: Boolean(item.isHd || resolved.isHd)
+        };
+      })
+    );
+    for (const s of settled) {
+      if (s.status === 'fulfilled' && s.value) {
+        output.push(s.value);
+      }
+    }
+  }
+
+  return output;
+}
+
 async function fetchSubredditVideos(subreddit) {
   const cleanSub = subreddit.replace(/^\/?r\//i, '').trim();
   const encodedSubPath = cleanSub
@@ -3640,9 +3754,13 @@ async function fetchSubredditVideos(subreddit) {
   for (const url of endpoints) {
     try {
       const json = await fetchWithCorsFallback(url, false);
-      const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
+      const extracted = await upgradeUnsignedRedgifsItems(
+        extractRedditVideosFromListing(json, `r/${cleanSub}`)
+      );
       if (extracted.length > 0) return extracted;
-      const sfwOrAll = extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
+      const sfwOrAll = await upgradeUnsignedRedgifsItems(
+        extractRedditVideosFromListing(json, `r/${cleanSub}`, true)
+      );
       if (sfwOrAll.length > 0) return sfwOrAll;
     } catch {
       // Try alternate Reddit mirror
@@ -3728,7 +3846,7 @@ async function searchRedditVideosByKeyword(keyword) {
   }
 
   await Promise.allSettled(tasks);
-  return results;
+  return await upgradeUnsignedRedgifsItems(results);
 }
 
 // 5. PeerTube Global Federated Search Engine (via SepiaSearch API + PeerTube Instance Video API)
@@ -3817,7 +3935,13 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
 
 // 6. Lemmy & Mastodon Open Fediverse Video Feeds
 async function searchFediverseVideos(keyword) {
-  const cleanTag = keyword.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  const tagWords = String(keyword || '')
+    .replace(/\b(?:lemmy|fediverse|mastodon|redgifs)\b/gi, ' ')
+    .trim()
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-zA-Z0-9]/g, '').toLowerCase())
+    .filter((w) => w.length >= 2);
+  const cleanTag = tagWords[0] || (settings.allowNsfw ? 'nsfw' : 'video');
   const results = [];
 
   const tasks = [
@@ -3834,19 +3958,23 @@ async function searchFediverseVideos(keyword) {
         if (st?.sensitive && !settings.allowNsfw) continue;
         const attachments = Array.isArray(st?.media_attachments) ? st.media_attachments : [];
         for (const att of attachments) {
-          if ((att.type === 'video' || att.type === 'gifv') && att.url) {
+          if ((att.type === 'video' || att.type === 'gifv') && typeof att.url === 'string' && /^https:\/\//i.test(att.url)) {
             const fmt = detectVideoFormat(att.url, 'mp4');
             if (!isFormatAllowedBySettings(fmt.ext)) continue;
             const plainText = String(st.content || '')
               .replace(/<[^>]+>/g, ' ')
               .replace(/\s+/g, ' ')
               .trim();
+            const remoteFallback =
+              typeof att.remote_url === 'string' && /^https:\/\//i.test(att.remote_url) && att.remote_url !== att.url
+                ? att.remote_url
+                : null;
             results.push({
               id: `masto-${att.id || st.id}`,
               title: plainText.slice(0, 75) || `Mastodon #${cleanTag} Clip`,
               videoUrl: att.url,
               originalUrl: att.url,
-              convertedUrl: null,
+              convertedUrl: remoteFallback,
               format: fmt.ext,
               isNsfw: Boolean(st?.sensitive),
               sourceName: `Mastodon (#${cleanTag})`,
@@ -3884,12 +4012,8 @@ async function searchFediverseVideos(keyword) {
               sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
               pageUrl: post.ap_id || candidateUrl
             });
-            continue;
           }
-          const rgId = extractRedgifsId(candidateUrl);
-          if (rgId) {
-            candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
-          }
+          continue;
         }
 
         if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
@@ -3940,12 +4064,8 @@ async function searchFediverseVideos(keyword) {
                 sourceName: `Lemmy 18+ (${entry?.community?.name || 'nsfw'})`,
                 pageUrl: post.ap_id || candidateUrl
               });
-              continue;
             }
-            const rgId = extractRedgifsId(candidateUrl);
-            if (rgId) {
-              candidateUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
-            }
+            continue;
           }
 
           if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
@@ -4767,15 +4887,17 @@ function interleaveVideoBuckets(buckets) {
 // Pull videos from a single source object, randomize within the source pool, and tag originSourceId
 async function pullFromSource(source) {
   const stampAndShuffle = (list) =>
-    shuffleArray(list).map((item) =>
-      source?.id ? { ...item, originSourceId: source.id } : { ...item }
-    );
+    shuffleArray(list)
+      .filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl))
+      .map((item) => (source?.id ? { ...item, originSourceId: source.id } : { ...item }));
 
   const cacheKey = getSourceCacheKey(source);
   const cached = sourcePoolCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SOURCE_CACHE_TTL_MS) {
     const unseen = filterAndSortTubeResults(
-      cached.items.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl))
+      cached.items.filter(
+        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+      )
     );
     if (unseen.length >= 2) {
       return stampAndShuffle(unseen);
@@ -4928,7 +5050,9 @@ async function runContinuousPullCycle() {
         }
       }
 
-      const interleaved = interleaveVideoBuckets(buckets);
+      const interleaved = interleaveVideoBuckets(buckets).filter(
+        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl)
+      );
       let fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
       if (fresh.length === 0 && interleaved.length > 1 && effectiveSources.length === 1) {
         const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
@@ -5277,6 +5401,7 @@ function updatePlayerUI() {
     formatBadgeEl?.classList.add('hidden');
     convertNowBtn?.classList.add('hidden');
     if (videoEl) {
+      clearPlaybackStartupWatchdog();
       try {
         videoEl.pause?.();
       } catch {}
@@ -5401,9 +5526,22 @@ function updatePlayerUI() {
           { once: true }
         );
       }
+      if (
+        settings.autoPlay &&
+        !isLockedOverlay &&
+        !(current.offlineBlob instanceof Blob) &&
+        !/^blob:/i.test(targetPlayUrl)
+      ) {
+        armPlaybackStartupWatchdog(videoEl, current, targetPlayUrl);
+      } else {
+        clearPlaybackStartupWatchdog();
+      }
       if (settings.autoPlay && !isLockedOverlay) {
-        videoEl.play?.()?.catch?.(() => {
-          // iOS may require user tap if unmuted; user can tap play on controls
+        videoEl.play?.()?.catch?.((err) => {
+          // iOS may require user tap if unmuted; disarm watchdog so we don't skip while waiting for user gesture
+          if (err?.name === 'NotAllowedError') {
+            clearPlaybackStartupWatchdog();
+          }
         });
       }
     } else if (savedTime > 0 && (!videoEl.currentTime || Math.abs(videoEl.currentTime - savedTime) > 1.5)) {
@@ -5510,91 +5648,194 @@ async function convertCurrentVideoForPlayer(videoItem) {
   }
 }
 
+const STREAM_STARTUP_TIMEOUT_MS = 8000;
+let playbackWatchdogTimer = null;
 let consecutiveErrorSkips = 0;
+let isHandlingPlaybackError = false;
 
-// Recover automatically when a pulled video fails to decode or 403/404s on iOS Safari
-async function handleVideoPlaybackError() {
+function clearPlaybackStartupWatchdog() {
+  if (playbackWatchdogTimer) {
+    clearTimeout(playbackWatchdogTimer);
+    playbackWatchdogTimer = null;
+  }
+}
+
+function armPlaybackStartupWatchdog(videoEl, watchedItem, expectedUrl, timeoutMs = STREAM_STARTUP_TIMEOUT_MS) {
+  clearPlaybackStartupWatchdog();
+  if (!videoEl || !watchedItem || !expectedUrl) return;
+  const baselineTime = Number(videoEl.currentTime) || 0;
+  playbackWatchdogTimer = setTimeout(() => {
+    playbackWatchdogTimer = null;
+    if (videoQueue[currentIndex] !== watchedItem) return;
+    if (
+      typeof document !== 'undefined' &&
+      (document.hidden || document.body?.classList?.contains?.('app-locked'))
+    ) {
+      return;
+    }
+    if (
+      (Number(videoEl.readyState) || 0) >= 2 ||
+      (Number(videoEl.currentTime) || 0) > baselineTime + 0.1
+    ) {
+      return;
+    }
+    try {
+      videoEl.pause?.();
+    } catch {}
+    handleVideoPlaybackError({ reason: 'timeout' }).catch(() => {});
+  }, timeoutMs);
+  playbackWatchdogTimer.unref?.();
+}
+
+function recordDeadStreamUrl(url, originSourceId = null) {
+  if (!url || typeof url !== 'string') return;
+  deadUrls.add(url);
+  for (const [cacheKey, entry] of sourcePoolCache.entries()) {
+    if (!entry || !Array.isArray(entry.items)) continue;
+    if (originSourceId && cacheKey.startsWith(`${originSourceId}:`) && consecutiveErrorSkips >= 1) {
+      sourcePoolCache.delete(cacheKey);
+      continue;
+    }
+    entry.items = entry.items.filter((it) => it?.videoUrl && !deadUrls.has(it.videoUrl));
+    if (entry.items.length === 0) {
+      sourcePoolCache.delete(cacheKey);
+    }
+  }
+}
+
+// Recover automatically when a pulled video fails to decode, hangs, or 403/404s on iOS Safari
+async function handleVideoPlaybackError(opts = {}) {
+  if (isHandlingPlaybackError) return false;
   const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
   const current = videoQueue[currentIndex];
   if (!current || !videoEl) return false;
 
-  // 0. If this video has a cached offline Blob in IndexedDB Vault, rehydrate and switch to blob: immediately
-  if (!(current.offlineBlob instanceof Blob)) {
-    const rehydrated = await rehydrateQueueOfflineBlobsFromVault();
-    if (rehydrated && current.offlineBlob instanceof Blob) {
+  isHandlingPlaybackError = true;
+  clearPlaybackStartupWatchdog();
+
+  try {
+    // 0. If this video has a cached offline Blob in IndexedDB Vault, rehydrate and switch to blob: immediately
+    if (!(current.offlineBlob instanceof Blob)) {
+      const rehydrated = await rehydrateQueueOfflineBlobsFromVault();
+      if (rehydrated && current.offlineBlob instanceof Blob) {
+        consecutiveErrorSkips = 0;
+        updatePlayerUI();
+        return true;
+      }
+    }
+
+    // 1. If a server-transcoded or alternate .mp4 stream URL is available, try it immediately
+    if (
+      current.convertedUrl &&
+      !deadUrls.has(current.convertedUrl) &&
+      videoEl.dataset?.triedConvertedUrl !== 'true' &&
+      videoEl.src !== current.convertedUrl
+    ) {
+      if (current.videoUrl) recordDeadStreamUrl(current.videoUrl);
+      if (videoEl.dataset) videoEl.dataset.triedConvertedUrl = 'true';
+      videoEl.src = current.convertedUrl;
+      videoEl.load?.();
+      armPlaybackStartupWatchdog(videoEl, current, current.convertedUrl);
+      if (settings.autoPlay) {
+        videoEl.play?.()?.catch?.(() => {});
+      }
+      return true;
+    }
+
+    // 2. Try on-device auto-conversion ONLY when the format is non-native (e.g. .webm/.mkv/.avi) and didn't time out
+    const ext = (current.format || detectVideoFormat(current.videoUrl).ext).toLowerCase();
+    const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+    if (
+      settings.autoConvert &&
+      !fmtInfo.iphoneNative &&
+      opts?.reason !== 'timeout' &&
+      !current.convertedBlobUrl &&
+      videoEl.dataset?.autoConvertAttempted !== 'true'
+    ) {
+      if (videoEl.dataset) videoEl.dataset.autoConvertAttempted = 'true';
+      showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
+      const convertedOk = await convertCurrentVideoForPlayer(current);
+      if (convertedOk) {
+        return true;
+      }
+    }
+
+    // Blacklist this dead stream URL (and evict from sourcePoolCache) so we never loop on it again
+    if (current.videoUrl) recordDeadStreamUrl(current.videoUrl, current.originSourceId);
+    if (current.convertedUrl) recordDeadStreamUrl(current.convertedUrl, current.originSourceId);
+
+    // If the user navigated to a different video while recovery was in flight,
+    // remove only the failed video (`current`) and preserve the user's active video
+    if (videoQueue[currentIndex] !== current) {
+      const staleIdx = videoQueue.indexOf(current);
+      if (staleIdx >= 0) {
+        const removedStale = videoQueue.splice(staleIdx, 1);
+        revokeVideoItemBlobUrls(removedStale);
+        if (staleIdx < currentIndex) {
+          currentIndex = Math.max(0, currentIndex - 1);
+        }
+        updatePlayerUI();
+      }
+      return true;
+    }
+
+    // 3. Stream is dead/restricted/unplayable: purge it (plus any other blacklisted items) and advance
+    if (consecutiveErrorSkips >= 4) {
       consecutiveErrorSkips = 0;
-      updatePlayerUI();
-      return true;
+      showToast('Stream unavailable on source server — tap Shuffle for another video.');
+      return false;
     }
-  }
 
-  // 1. If a server-transcoded or alternate .mp4 stream URL is available, try it immediately
-  if (
-    current.convertedUrl &&
-    videoEl.dataset.triedConvertedUrl !== 'true' &&
-    videoEl.src !== current.convertedUrl
-  ) {
-    videoEl.dataset.triedConvertedUrl = 'true';
-    videoEl.src = current.convertedUrl;
-    videoEl.load?.();
-    if (settings.autoPlay) {
-      videoEl.play?.().catch?.(() => {});
+    consecutiveErrorSkips++;
+    continuousSourceCursor++;
+    showToast('Stream unavailable — pulling a working video...');
+    const removed = videoQueue.splice(currentIndex, 1);
+    revokeVideoItemBlobUrls(removed);
+
+    // Also purge any upcoming queued items already known to be dead
+    if (videoQueue.length > currentIndex) {
+      const head = videoQueue.slice(0, currentIndex);
+      const tail = videoQueue.slice(currentIndex);
+      const cleanTail = [];
+      const deadTail = [];
+      for (const item of tail) {
+        if (item?.videoUrl && deadUrls.has(item.videoUrl) && !item.fromVault && !(item.offlineBlob instanceof Blob)) {
+          deadTail.push(item);
+        } else {
+          cleanTail.push(item);
+        }
+      }
+      if (deadTail.length > 0) {
+        revokeVideoItemBlobUrls(deadTail);
+        videoQueue = [...head, ...cleanTail];
+      }
     }
-    return true;
-  }
 
-  // 2. Try on-device auto-conversion to iPhone-native .MP4
-  if (
-    settings.autoConvert &&
-    !current.convertedBlobUrl &&
-    videoEl.dataset.autoConvertAttempted !== 'true'
-  ) {
-    videoEl.dataset.autoConvertAttempted = 'true';
-    showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
-    const convertedOk = await convertCurrentVideoForPlayer(current);
-    if (convertedOk) {
-      return true;
-    }
-  }
-
-  // If the user navigated to a different video while auto-conversion was in flight,
-  // remove only the failed video (`current`) and preserve the user's active video
-  if (videoQueue[currentIndex] !== current) {
-    const staleIdx = videoQueue.indexOf(current);
-    if (staleIdx >= 0) {
-      const removedStale = videoQueue.splice(staleIdx, 1);
-      revokeVideoItemBlobUrls(removedStale);
-      if (staleIdx < currentIndex) {
-        currentIndex = Math.max(0, currentIndex - 1);
+    if (videoQueue.length > 0) {
+      if (currentIndex >= videoQueue.length) {
+        currentIndex = videoQueue.length - 1;
       }
       updatePlayerUI();
+      return true;
     }
+
+    // Clear stale broken frame before pulling a fresh clip
+    try {
+      videoEl.pause?.();
+      if (typeof videoEl.removeAttribute === 'function') {
+        videoEl.removeAttribute('src');
+      } else {
+        videoEl.src = '';
+      }
+      videoEl.load?.();
+    } catch {}
+
+    currentIndex = -1;
+    await pullRandomVideos(1);
     return true;
+  } finally {
+    isHandlingPlaybackError = false;
   }
-
-  // 3. Stream is dead/restricted/unplayable: remove it from queue and auto-advance to a working video
-  if (consecutiveErrorSkips >= 3) {
-    consecutiveErrorSkips = 0;
-    showToast('Stream unavailable on source server — tap Shuffle for another video.');
-    return false;
-  }
-
-  consecutiveErrorSkips++;
-  showToast('Stream unavailable — pulling a working video...');
-  const removed = videoQueue.splice(currentIndex, 1);
-  revokeVideoItemBlobUrls(removed);
-
-  if (videoQueue.length > 0) {
-    if (currentIndex >= videoQueue.length) {
-      currentIndex = videoQueue.length - 1;
-    }
-    updatePlayerUI();
-    return true;
-  }
-
-  currentIndex = -1;
-  await pullRandomVideos(1);
-  return true;
 }
 
 async function pullRandomVideos(count = 1, customKeyword = null) {
@@ -5679,13 +5920,17 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         }
 
         const candidatePool = interleaveVideoBuckets(sourceBuckets);
-        const unseenInWave = candidatePool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+        const unseenInWave = candidatePool.filter(
+          (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+        );
         if (unseenInWave.length >= Math.max(1, count)) {
           break;
         }
       }
 
-      pool = interleaveVideoBuckets(sourceBuckets);
+      pool = interleaveVideoBuckets(sourceBuckets).filter(
+        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl)
+      );
 
       if (pool.length === 0 && pullAllowNsfw) {
         const activeTubeSource = activeSources.find((s) => isFreeTubePresetSource(s));
@@ -5697,11 +5942,13 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
               6,
               activeTubeSource.label || 'Free Tube 18+',
               null,
-              false
+              true
             );
-            pool = fbItems.map((item) =>
-              activeTubeSource.id ? { ...item, originSourceId: activeTubeSource.id } : item
-            );
+            pool = fbItems
+              .filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl))
+              .map((item) =>
+                activeTubeSource.id ? { ...item, originSourceId: activeTubeSource.id } : item
+              );
           } catch {}
         }
       }
@@ -5715,16 +5962,20 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       return;
     }
 
-    let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+    let fresh = pool.filter(
+      (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+    );
     if (fresh.length === 0 && pool.length > 0) {
       const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
       seenUrls.clear();
       if (currentPlayingUrl && pool.length > 1) {
         seenUrls.add(currentPlayingUrl);
-        fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+        fresh = pool.filter(
+          (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+        );
       }
       if (fresh.length === 0) {
-        fresh = pool;
+        fresh = pool.filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl));
       }
     }
 
@@ -6392,10 +6643,27 @@ if (typeof document !== 'undefined') {
 
   // Track playback position so user can pick up right where they left off & sync Reels seeker
   mainVideoEl?.addEventListener('timeupdate', () => {
+    if ((Number(mainVideoEl.readyState) || 0) >= 2 && (Number(mainVideoEl.currentTime) || 0) > 0.1) {
+      clearPlaybackStartupWatchdog();
+      consecutiveErrorSkips = 0;
+    }
     savePlaybackState();
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('loadedmetadata', () => {
+    consecutiveErrorSkips = 0;
+    updateReelsSeekerUI();
+  });
+  mainVideoEl?.addEventListener('loadeddata', () => {
+    clearPlaybackStartupWatchdog();
+    consecutiveErrorSkips = 0;
+  });
+  mainVideoEl?.addEventListener('canplay', () => {
+    clearPlaybackStartupWatchdog();
+    consecutiveErrorSkips = 0;
+  });
+  mainVideoEl?.addEventListener('playing', () => {
+    clearPlaybackStartupWatchdog();
     consecutiveErrorSkips = 0;
     updateReelsSeekerUI();
   });
@@ -6404,9 +6672,22 @@ if (typeof document !== 'undefined') {
   });
   mainVideoEl?.addEventListener('play', () => {
     consecutiveErrorSkips = 0;
+    const activeItem = videoQueue[currentIndex];
+    const activeSrc = mainVideoEl.currentSrc || mainVideoEl.src || '';
+    if (
+      activeItem &&
+      (Number(mainVideoEl.readyState) || 0) < 2 &&
+      !(activeItem.offlineBlob instanceof Blob) &&
+      !/^blob:/i.test(activeSrc)
+    ) {
+      armPlaybackStartupWatchdog(mainVideoEl, activeItem, activeSrc);
+    }
     updateReelsSeekerUI();
   });
   mainVideoEl?.addEventListener('pause', () => {
+    if (!mainVideoEl.ended && !mainVideoEl.error) {
+      clearPlaybackStartupWatchdog();
+    }
     savePlaybackState();
     updateReelsSeekerUI();
   });
@@ -7657,6 +7938,11 @@ if (typeof module !== 'undefined' && module.exports) {
     syncQueueAfterSourceChange,
     shuffleArray,
     isFreeTubePresetSource,
+    armPlaybackStartupWatchdog,
+    clearPlaybackStartupWatchdog,
+    recordDeadStreamUrl,
+    isStaleOrDisallowedRestoredItem,
+    upgradeUnsignedRedgifsItems,
     setNsfwPin,
     clearNsfwPin,
     verifyMasterAppPasscode,
@@ -7687,7 +7973,8 @@ if (typeof module !== 'undefined' && module.exports) {
       isReelsFullscreen,
       isAdultDirectoryExpanded,
       lastSearchResults,
-      playbackPositions
+      playbackPositions,
+      deadUrls
     }),
     setAppState: (patch = {}) => {
       if (Array.isArray(patch.sources)) {
@@ -7703,12 +7990,15 @@ if (typeof module !== 'undefined' && module.exports) {
         settings.deletedSourceIds = patch.deletedSourceIds;
       }
       if (Array.isArray(patch.videoQueue)) {
+        clearPlaybackStartupWatchdog();
         const nextSet = new Set(patch.videoQueue);
         revokeVideoItemBlobUrls(videoQueue.filter((item) => !nextSet.has(item)));
         videoQueue = patch.videoQueue;
         consecutiveErrorSkips = 0;
+        isHandlingPlaybackError = false;
         if (patch.videoQueue.length === 0) {
           seenUrls.clear();
+          deadUrls.clear();
           if (!patch.playbackPositions) {
             playbackPositions = {};
           }
