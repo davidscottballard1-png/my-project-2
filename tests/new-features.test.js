@@ -3211,6 +3211,287 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('should prevent fast HTTP 200 proxy errors/paywalls from poisoning Promise.any on github.io and extract live Eporner /xhr/video/<id> streams across 34 sources', async () => {
+      const {
+        isLocalDevOrigin,
+        calcEpornerBase36Hash,
+        buildHttpsMediaProxyCandidates
+      } = require('../app.js');
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevWin = globalThis.window;
+      const origAllowNsfw = settings.allowNsfw;
+
+      const hitProxyHosts = [];
+      globalThis.window = {
+        location: {
+          protocol: 'https:',
+          hostname: 'davidscottballard1-png.github.io',
+          href: 'https://davidscottballard1-png.github.io/my-project-2/'
+        }
+      };
+
+      const sampleHexHash = '0123456789abcdeffedcba9876543210';
+      const expectedBase36Hash = calcEpornerBase36Hash(sampleHexHash);
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.startsWith('https://corsproxy.io/')) {
+          hitProxyHosts.push('corsproxy.io');
+          return {
+            ok: true,
+            status: 200,
+            text: async () => 'corsproxy.io: Production domains require a paid plan and API key. Free tier is localhost only.',
+            json: async () => ({ error: 'Production domains require a paid plan and API key' })
+          };
+        }
+        // Fast rate-limited proxy (42 chars >= 35!) returning HTTP 200 immediately
+        if (u.startsWith('https://api.codetabs.com/')) {
+          hitProxyHosts.push('codetabs');
+          return {
+            ok: true,
+            status: 200,
+            text: async () => 'Too many requests, please try again later.',
+            json: async () => ({ error: 'Too many requests, please try again later.' })
+          };
+        }
+        // Fast Cloudflare-challenged proxy returning HTTP 200 immediately
+        if (u.startsWith('https://api.allorigins.win/')) {
+          hitProxyHosts.push('allorigins');
+          return {
+            ok: true,
+            status: 200,
+            text: async () => '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Checking your browser...</body></html>',
+            json: async () => ({ message: 'Upstream blocked' })
+          };
+        }
+
+        // Direct Eporner JSON search API works via native CORS
+        if (u.startsWith('https://www.eporner.com/api/v2/video/search/')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              videos: [
+                {
+                  id: 'EpLiveHash77',
+                  title: 'Live Eporner XHR Stream 720p',
+                  length_sec: 320,
+                  hd: true,
+                  url: 'https://www.eporner.com/video-EpLiveHash77/live-test/',
+                  embed: 'https://www.eporner.com/embed/EpLiveHash77/'
+                }
+              ]
+            })
+          };
+        }
+
+        // Direct cross-origin fetches to Reddit & Eporner HTML/XHR throw CORS TypeError in Safari
+        if (!u.startsWith('https://api.cors.lol/?url=')) {
+          throw new TypeError('Load failed (CORS)');
+        }
+
+        // Slower healthy proxy (api.cors.lol) resolves 15ms later with real upstream payloads
+        hitProxyHosts.push('cors.lol');
+        await new Promise((r) => setTimeout(r, 15));
+        const target = decodeURIComponent(u.slice('https://api.cors.lol/?url='.length));
+
+        if (target.includes('reddit.com/r/')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              kind: 'Listing',
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: 'rd_prod_1',
+                      title: 'Production Reddit 18+ Clip',
+                      over_18: true,
+                      is_video: true,
+                      permalink: '/r/RealGirls/comments/rd_prod_1/clip/',
+                      media: {
+                        reddit_video: {
+                          fallback_url: 'https://v.redd.it/prodclip1/DASH_720.mp4?source=fallback',
+                          hls_url: 'https://v.redd.it/prodclip1/HLSPlaylist.m3u8',
+                          duration: 18,
+                          height: 720
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            })
+          };
+        }
+
+        if (target.includes('eporner.com/embed/EpLiveHash77')) {
+          // Real Eporner embed HTML has NO direct .mp4 URL, only vid + 32-hex hash
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              `<html><body><script>EP.video.player.vid = 'EpLiveHash77'; EP.video.player.hash = '${sampleHexHash}';</script></body></html>`
+          };
+        }
+
+        if (
+          target.includes(`eporner.com/xhr/video/EpLiveHash77`) &&
+          target.includes(`hash=${encodeURIComponent(expectedBase36Hash)}`)
+        ) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              sources: {
+                mp4: {
+                  '720p HD': { src: 'https://s8.eporner.com/dload/EpLiveHash77/720p.mp4' },
+                  '480p': { src: 'https://s8.eporner.com/dload/EpLiveHash77/480p.mp4' }
+                },
+                hls: {
+                  auto: { src: 'https://s8.eporner.com/hls/EpLiveHash77/master.m3u8' }
+                }
+              }
+            })
+          };
+        }
+
+        return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        assert.strictEqual(isLocalDevOrigin(), false, 'github.io must be detected as a production non-localhost origin');
+        const mediaCandidates = buildHttpsMediaProxyCandidates('http://cdn.example/clip.mp4', { forceProxy: true });
+        assert.ok(
+          mediaCandidates[0].startsWith('https://api.cors.lol/?url='),
+          'Production media proxy candidates must prioritize api.cors.lol ahead of corsproxy.io'
+        );
+
+        settings.allowNsfw = true;
+
+        // 1. Subreddit pull succeeds despite codetabs + allorigins returning fast HTTP 200 errors
+        const redditClips = await fetchSubredditVideos('RealGirls');
+        assert.strictEqual(redditClips.length, 1, 'Subreddit pull must ignore poisoned fast proxies and return valid Reddit 18+ clips');
+        assert.ok(redditClips[0].videoUrl.includes('v.redd.it/prodclip1'));
+        assert.strictEqual(
+          hitProxyHosts.includes('corsproxy.io'),
+          false,
+          'fetchWithCorsFallback must never race keyless corsproxy.io on production github.io'
+        );
+
+        // 2. Eporner Free Tube pull resolves 32-hex hash -> /xhr/video/<id> -> 720p + 480p MP4s
+        const epClips = await fetchDirectEpornerVideos('popular hd', 4, 'Free Tube 18+');
+        assert.strictEqual(epClips.length, 1, 'Eporner pull must extract real MP4 streams via embed hash + /xhr/video/<id>');
+        assert.strictEqual(epClips[0].videoUrl, 'https://s8.eporner.com/dload/EpLiveHash77/720p.mp4');
+        assert.strictEqual(epClips[0].convertedUrl, 'https://s8.eporner.com/dload/EpLiveHash77/480p.mp4');
+
+        // 3. Full 34-source Shuffle Random pull populates videoQueue cleanly instead of "No 18+ videos returned"
+        const thirtyFourNsfwSources = Array.from({ length: 34 }, (_, idx) =>
+          idx % 2 === 0
+            ? {
+                id: `src-nsfw-sub-${idx}`,
+                label: `r/RealGirls_${idx}`,
+                type: 'subreddit',
+                value: 'RealGirls',
+                enabled: true,
+                isNsfw: true
+              }
+            : {
+                id: 'src-nsfw-tube-hd',
+                label: 'Free Tube 18+ (HD)',
+                type: 'freetube',
+                value: 'popular hd',
+                enabled: true,
+                isNsfw: true
+              }
+        );
+        setAppState({ sources: thirtyFourNsfwSources, videoQueue: [], currentIndex: -1 });
+        await pullRandomVideos(2);
+        const afterPull = getAppState();
+        assert.ok(
+          afterPull.videoQueue.length >= 1,
+          'Shuffle Random across 34 enabled 18+ sources on github.io must populate videoQueue'
+        );
+      } finally {
+        settings.allowNsfw = origAllowNsfw;
+        globalThis.fetch = origFetch;
+        globalThis.window = prevWin;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should fall back to fetchWithCorsFallback in getRedgifsTempToken when direct temporary auth returns HTTP 403 without throwing', async () => {
+      const { getRedgifsTempToken } = require('../app.js');
+      const origFetch = globalThis.fetch;
+      const prevWin = globalThis.window;
+      const origAllowNsfw = settings.allowNsfw;
+
+      globalThis.window = {
+        location: {
+          protocol: 'https:',
+          hostname: 'davidscottballard1-png.github.io',
+          href: 'https://davidscottballard1-png.github.io/my-project-2/'
+        }
+      };
+      setAppState({ resetRedgifsToken: true });
+      settings.allowNsfw = true;
+
+      let sawBearerHeader = null;
+      globalThis.fetch = async (url, init = {}) => {
+        const u = String(url);
+        // Direct temporary auth returns HTTP 403 (non-throw!)
+        if (u === 'https://api.redgifs.com/v2/auth/temporary') {
+          return { ok: false, status: 403, json: async () => ({ error: 'Forbidden' }) };
+        }
+        if (
+          u.startsWith('https://api.cors.lol/?url=') &&
+          decodeURIComponent(u).includes('api.redgifs.com/v2/auth/temporary')
+        ) {
+          return { ok: true, status: 200, json: async () => ({ token: 'proxy-minted-rg-token-99' }) };
+        }
+        if (u.startsWith('https://api.redgifs.com/v2/gifs/search')) {
+          sawBearerHeader = init?.headers?.Authorization || null;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'redgifsrecovered1',
+                  duration: 14,
+                  tags: ['amateur', 'hd'],
+                  urls: {
+                    hd: 'https://media.redgifs.com/RedgifsRecovered1.mp4?expires=4102444800&signature=ok'
+                  }
+                }
+              ]
+            })
+          };
+        }
+        return { ok: false, status: 403, text: async () => 'Blocked', json: async () => ({}) };
+      };
+
+      try {
+        const tok = await getRedgifsTempToken();
+        assert.strictEqual(tok, 'proxy-minted-rg-token-99', 'Must mint guest token via CORS proxy when direct auth returns HTTP 403');
+        const clips = await searchRedgifsVideos('amateur', 3);
+        assert.strictEqual(sawBearerHeader, 'Bearer proxy-minted-rg-token-99');
+        assert.strictEqual(clips.length, 1);
+        assert.ok(clips[0].videoUrl.includes('RedgifsRecovered1.mp4'));
+      } finally {
+        setAppState({ resetRedgifsToken: true });
+        settings.allowNsfw = origAllowNsfw;
+        globalThis.fetch = origFetch;
+        globalThis.window = prevWin;
+      }
+    });
   });
 });
 

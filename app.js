@@ -346,6 +346,23 @@ function isSecurePageOrigin() {
   );
 }
 
+function isLocalDevOrigin() {
+  if (typeof window === 'undefined' || !window.location) return true;
+  const host = String(
+    window.location.hostname || getHostnameSafe(window.location.href || '') || ''
+  )
+    .trim()
+    .toLowerCase();
+  if (!host) return true;
+  return (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '[::1]' ||
+    host === '::1' ||
+    host.endsWith('.local')
+  );
+}
+
 function unwrapProxyTargetUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return '';
   let current = rawUrl.trim();
@@ -396,6 +413,7 @@ function buildHttpsMediaProxyCandidates(rawUrl, opts = {}) {
   const includeTextProxies = Boolean(opts?.includeTextProxies);
   const isInsecureHttp = /^http:\/\//i.test(cleanUrl);
   const secureOrigin = isSecurePageOrigin();
+  const localDev = isLocalDevOrigin();
   const candidates = [];
 
   if (isInsecureHttp && secureOrigin) {
@@ -410,11 +428,21 @@ function buildHttpsMediaProxyCandidates(rawUrl, opts = {}) {
   }
 
   if (/^https?:\/\//i.test(cleanUrl)) {
-    candidates.push(`https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`);
-    candidates.push(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`);
-    if (includeTextProxies) {
-      candidates.push(`https://api.cors.lol/?url=${encodeURIComponent(cleanUrl)}`);
-      candidates.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`);
+    const encoded = encodeURIComponent(cleanUrl);
+    if (localDev) {
+      candidates.push(`https://corsproxy.io/?${encoded}`);
+      candidates.push(`https://api.cors.lol/?url=${encoded}`);
+      candidates.push(`https://api.codetabs.com/v1/proxy?quest=${encoded}`);
+      if (includeTextProxies) {
+        candidates.push(`https://api.allorigins.win/raw?url=${encoded}`);
+      }
+    } else {
+      candidates.push(`https://api.cors.lol/?url=${encoded}`);
+      candidates.push(`https://api.codetabs.com/v1/proxy?quest=${encoded}`);
+      if (includeTextProxies) {
+        candidates.push(`https://api.allorigins.win/raw?url=${encoded}`);
+      }
+      candidates.push(`https://corsproxy.io/?${encoded}`);
     }
   } else if (candidates.length === 0) {
     candidates.push(cleanUrl);
@@ -834,8 +862,9 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
   const candidateUrls = buildHttpsMediaProxyCandidates(cleanTarget);
 
   for (const url of candidateUrls) {
+    const isProxyCandidate = /corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(url);
     const isHttpsUpgradeProbe =
-      isInsecureHttpTarget && /^https:\/\//i.test(url) && !/corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(url);
+      isInsecureHttpTarget && /^https:\/\//i.test(url) && !isProxyCandidate;
     const timeoutMs = isHttpsUpgradeProbe ? 2500 : 8000;
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller
@@ -851,7 +880,7 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
       if (timer) clearTimeout(timer);
       if (res && res.ok) {
         const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
-        if (ct.includes('text/html')) {
+        if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain')) {
           if (isHttpsUpgradeProbe) {
             const h = getHostnameSafe(cleanTarget);
             if (h) httpOnlyHosts.add(h);
@@ -864,7 +893,7 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
       if (isHttpsUpgradeProbe) {
         const h = getHostnameSafe(cleanTarget);
         if (h) httpOnlyHosts.add(h);
-      } else if (res && (res.status === 404 || res.status === 410)) {
+      } else if (res && (res.status === 410 || (!isProxyCandidate && res.status === 404))) {
         break;
       }
     } catch {
@@ -3060,6 +3089,93 @@ async function fetchWithTimeout(url, timeoutMs = 4500) {
   }
 }
 
+function isInvalidCorsProxyPayload(payload, asText = false, targetUrl = '') {
+  const cleanTarget = String(targetUrl || '');
+  if (asText) {
+    if (typeof payload !== 'string') return true;
+    const trimmed = payload.trim();
+    if (!trimmed) return true;
+    if (trimmed.length < 300 && !trimmed.startsWith('#EXTM3U')) {
+      if (
+        /^(?:error\b|too many requests|rate limit|429\b|403\b|502\b|503\b|504\b|forbidden\b|access denied|sorry,\s*something went wrong|invalid url|cannot get\b|corsproxy\b|origin\b.*not allowed)/i.test(
+          trimmed
+        )
+      ) {
+        return true;
+      }
+      if (
+        trimmed.startsWith('{') &&
+        !/\.(?:mp4|m3u8|webm|mov|m4v)\b/i.test(trimmed) &&
+        /"(?:error|Error|reason)"\s*:/.test(trimmed)
+      ) {
+        return true;
+      }
+    }
+    if (
+      /corsproxy\.io/i.test(trimmed) &&
+      /(?:api[\s_-]?key|paid plan|production domain|upgrade your plan|only.*localhost)/i.test(trimmed)
+    ) {
+      return true;
+    }
+    if (
+      /<title[^>]*>\s*(?:Just a moment\.\.\.|Attention Required!\s*\|\s*Cloudflare|Access denied[^<]*|403 Forbidden|429 Too Many Requests|502 Bad Gateway|503 Service Temporarily Unavailable|Whoa there,\s*pardner!|Blocked)\s*<\/title>/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  if (!payload || typeof payload !== 'object') return true;
+
+  if (!Array.isArray(payload)) {
+    const hasDataKey =
+      'data' in payload ||
+      'videos' in payload ||
+      'sources' in payload ||
+      'gifs' in payload ||
+      'gif' in payload ||
+      'token' in payload ||
+      'posts' in payload ||
+      'list' in payload ||
+      'results' in payload ||
+      'items' in payload ||
+      'files' in payload ||
+      'collection' in payload ||
+      'query' in payload ||
+      'response' in payload ||
+      'media_attachments' in payload ||
+      'streamingPlaylists' in payload;
+    if (
+      !hasDataKey &&
+      ('error' in payload ||
+        'Error' in payload ||
+        'reason' in payload ||
+        ('message' in payload && Object.keys(payload).length <= 4))
+    ) {
+      return true;
+    }
+  }
+
+  if (/reddit\.com\//i.test(cleanTarget)) {
+    const validReddit = Array.isArray(payload)
+      ? payload.length > 0 && payload[0] && typeof payload[0] === 'object' && 'data' in payload[0]
+      : 'data' in payload && payload.data && typeof payload.data === 'object';
+    if (!validReddit) return true;
+  } else if (/eporner\.com\/api\/v2\//i.test(cleanTarget)) {
+    if (!Array.isArray(payload.videos)) return true;
+  } else if (/eporner\.com\/xhr\/video\//i.test(cleanTarget)) {
+    if (!payload.sources || typeof payload.sources !== 'object') return true;
+  } else if (/api\.redgifs\.com\/v2\/auth\/temporary/i.test(cleanTarget)) {
+    if (typeof payload.token !== 'string' || !payload.token) return true;
+  } else if (/api\.redgifs\.com\/v2\/gifs\//i.test(cleanTarget)) {
+    if (!payload.gifs && !payload.gif) return true;
+  }
+
+  return false;
+}
+
 // Fetch helper with parallel CORS proxy race for Reddit / third-party pages
 async function fetchWithCorsFallback(url, asText = false) {
   const cleanUrl = unwrapProxyTargetUrl(url) || url;
@@ -3068,22 +3184,28 @@ async function fetchWithCorsFallback(url, asText = false) {
     try {
       const directRes = await fetchWithTimeout(cleanUrl, 3500);
       if (directRes.ok) {
-        return asText ? await directRes.text() : await directRes.json();
+        const directPayload = asText ? await directRes.text() : await directRes.json();
+        if (!isInvalidCorsProxyPayload(directPayload, asText, cleanUrl)) {
+          return directPayload;
+        }
       }
     } catch {
       // Direct fetch blocked by CORS or timed out; race CORS proxies in parallel
     }
   }
 
+  const encodedUrl = encodeURIComponent(cleanUrl);
   const proxies = [
-    `https://api.cors.lol/?url=${encodeURIComponent(cleanUrl)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
-    `https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`
+    `https://api.cors.lol/?url=${encodedUrl}`,
+    `https://api.allorigins.win/raw?url=${encodedUrl}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodedUrl}`
   ];
+  if (isLocalDevOrigin()) {
+    proxies.push(`https://corsproxy.io/?${encodedUrl}`);
+  }
 
   const controllers = proxies.map(() => new AbortController());
-  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 5000);
+  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 6500);
   timer.unref?.();
 
   try {
@@ -3092,10 +3214,10 @@ async function fetchWithCorsFallback(url, asText = false) {
         const res = await fetch(candidate, { signal: controllers[idx].signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const payload = asText ? await res.text() : await res.json();
-        if (asText && typeof payload === 'string' && payload.length < 35 && /rate limit|error/i.test(payload)) {
-          throw new Error('Proxy rate-limited');
+        if (isInvalidCorsProxyPayload(payload, asText, cleanUrl)) {
+          throw new Error('Invalid or rate-limited proxy payload');
         }
-        // Cancel the slower proxy once the winner finishes
+        // Cancel slower sibling proxies only after validating the winning payload
         controllers.forEach((c, i) => {
           if (i !== idx) c.abort();
         });
@@ -3368,7 +3490,7 @@ async function getRedgifsTempToken() {
   }
   try {
     const res = await fetchWithTimeout('https://api.redgifs.com/v2/auth/temporary', 3500);
-    if (res.ok) {
+    if (res && res.ok) {
       const data = await res.json();
       if (data?.token) {
         cachedRedgifsToken = data.token;
@@ -3377,16 +3499,18 @@ async function getRedgifsTempToken() {
       }
     }
   } catch {
-    // fallback to CORS proxy if direct temporary auth is blocked
-    try {
-      const data = await fetchWithCorsFallback('https://api.redgifs.com/v2/auth/temporary', false);
-      if (data?.token) {
-        cachedRedgifsToken = data.token;
-        cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
-        return cachedRedgifsToken;
-      }
-    } catch {}
+    // Direct temporary auth threw (CORS/network); fall through to CORS proxy fallback below
   }
+
+  try {
+    const data = await fetchWithCorsFallback('https://api.redgifs.com/v2/auth/temporary', false);
+    if (data?.token) {
+      cachedRedgifsToken = data.token;
+      cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+      return cachedRedgifsToken;
+    }
+  } catch {}
+
   return null;
 }
 
@@ -3505,6 +3629,91 @@ function getSubredditNicheQuery(rawSubreddit) {
     .trim();
 }
 
+function calcEpornerBase36Hash(hexHash) {
+  const h = String(hexHash || '').trim();
+  if (!/^[0-9a-f]{32}$/i.test(h)) return null;
+  let out = '';
+  for (let i = 0; i < 32; i += 8) {
+    out += parseInt(h.slice(i, i + 8), 16).toString(36);
+  }
+  return out;
+}
+
+async function resolveEpornerStreamsFromEmbedHtml(pageHtml, videoId = null, embedUrl = '') {
+  const htmlStr = String(pageHtml || '');
+  const directStreams = extractVideoUrlsFromHtml(htmlStr, embedUrl).filter(
+    (u) => !/^https?:\/\/gvideo\.eporner\.com\//i.test(u)
+  );
+  if (directStreams.length > 0) {
+    return directStreams;
+  }
+
+  const hashMatch = htmlStr.match(/["']?hash["']?\s*[:=]\s*["']([0-9a-f]{32})["']/i);
+  if (!hashMatch?.[1]) return [];
+
+  let resolvedId = videoId ? String(videoId).trim() : '';
+  if (!resolvedId) {
+    const htmlVidMatch = htmlStr.match(/["']?vid["']?\s*[:=]\s*["']([a-zA-Z0-9]+)["']/i);
+    const urlVidMatch = String(embedUrl || '').match(
+      /eporner\.com\/(?:embed\/|video-|hd-porn\/)([a-zA-Z0-9]+)/i
+    );
+    resolvedId = htmlVidMatch?.[1] || urlVidMatch?.[1] || '';
+  }
+  if (!resolvedId) return [];
+
+  const base36Hash = calcEpornerBase36Hash(hashMatch[1]);
+  if (!base36Hash) return [];
+
+  try {
+    const xhrUrl = `https://www.eporner.com/xhr/video/${encodeURIComponent(
+      resolvedId
+    )}?hash=${encodeURIComponent(base36Hash)}&device=generic&domain=www.eporner.com&fallback=false`;
+    const xhrData = await fetchWithCorsFallback(xhrUrl, false);
+    const sourcesObj = xhrData?.sources;
+    if (!sourcesObj || typeof sourcesObj !== 'object') return [];
+
+    const rankedMp4s = [];
+    if (sourcesObj.mp4 && typeof sourcesObj.mp4 === 'object') {
+      for (const [label, entry] of Object.entries(sourcesObj.mp4)) {
+        const src = typeof entry === 'string' ? entry : entry?.src;
+        if (
+          typeof src === 'string' &&
+          /^https?:\/\//i.test(src) &&
+          !/^https?:\/\/gvideo\.eporner\.com\//i.test(src)
+        ) {
+          const l = `${label} ${src}`.toLowerCase();
+          let score = 50;
+          if (l.includes('720p')) score = 100;
+          else if (l.includes('1080p')) score = 95;
+          else if (l.includes('480p')) score = 80;
+          else if (l.includes('360p')) score = 70;
+          else if (l.includes('2160p') || l.includes('1440p') || l.includes('4k')) score = 65;
+          rankedMp4s.push({ src, score });
+        }
+      }
+      rankedMp4s.sort((a, b) => b.score - a.score);
+    }
+
+    const hlsUrls = [];
+    if (sourcesObj.hls) {
+      if (typeof sourcesObj.hls === 'string' && /^https?:\/\//i.test(sourcesObj.hls)) {
+        hlsUrls.push(sourcesObj.hls);
+      } else if (typeof sourcesObj.hls === 'object') {
+        for (const entry of Object.values(sourcesObj.hls)) {
+          const src = typeof entry === 'string' ? entry : entry?.src;
+          if (typeof src === 'string' && /^https?:\/\//i.test(src)) {
+            hlsUrls.push(src);
+          }
+        }
+      }
+    }
+
+    return [...new Set([...rankedMp4s.map((m) => m.src), ...hlsUrls])];
+  } catch {
+    return [];
+  }
+}
+
 // Native-CORS 18+ direct .mp4 fetcher using Eporner JSON API v2 + real embed stream extraction (no guessed URLs)
 async function fetchDirectEpornerVideos(
   rawQuery,
@@ -3551,7 +3760,11 @@ async function fetchDirectEpornerVideos(
   if (videos.length === 0) return [];
 
   const results = [];
-  const slice = videos.slice(0, Math.min(6, Math.max(3, limit)));
+  const maxBatch = Math.min(6, Math.max(3, limit));
+  const slice =
+    videos.length <= maxBatch
+      ? videos
+      : [...videos.slice(0, 2), ...shuffleArray(videos.slice(2)).slice(0, maxBatch - 2)];
 
   await Promise.allSettled(
     slice.map(async (v) => {
@@ -3563,7 +3776,7 @@ async function fetchDirectEpornerVideos(
       if (!chosenStream && tryEmbedScrape !== false) {
         try {
           const pageHtml = await fetchWithCorsFallback(embedUrl, true);
-          const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
+          const streams = await resolveEpornerStreamsFromEmbedHtml(pageHtml, v.id, embedUrl);
           const mp4Streams = streams.filter((u) => /\.mp4(\?|$)/i.test(u));
           chosenStream =
             mp4Streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
@@ -3632,6 +3845,17 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     }
   };
 
+  const fetchRedgifsWithTimeout = async (targetUrl, reqHeaders) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    timer.unref?.();
+    try {
+      return await fetch(targetUrl, { headers: reqHeaders, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   try {
     const token = await getRedgifsTempToken();
     const headers = token ? { Authorization: `Bearer ${token}` } : {};
@@ -3640,7 +3864,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     const searchUrl = `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(
       cleanKw
     )}&order=trending&count=${limit}`;
-    const res = await fetch(searchUrl, { headers });
+    const res = await fetchRedgifsWithTimeout(searchUrl, headers);
     if (res.ok) {
       const data = await res.json();
       appendGifsFromList(data?.gifs);
@@ -3658,7 +3882,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       }
       const settled = await Promise.allSettled(
         fallbackUrls.map(async (u) => {
-          const r = await fetch(u, { headers });
+          const r = await fetchRedgifsWithTimeout(u, headers);
           if (r.ok) return await r.json();
           return null;
         })
@@ -4402,7 +4626,10 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
   const pageTitle = titleMatch?.[1]?.replace(/\s+/g, ' ')?.trim() || null;
 
-  const extractedUrls = extractVideoUrlsFromHtml(rawText, trimmed);
+  let extractedUrls = extractVideoUrlsFromHtml(rawText, trimmed);
+  if (extractedUrls.length === 0 && rawText && /eporner\.com\//i.test(trimmed)) {
+    extractedUrls = await resolveEpornerStreamsFromEmbedHtml(rawText, null, trimmed);
+  }
   const results = [];
   let idx = 0;
 
@@ -5594,7 +5821,7 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
               if (isHttpsUpgradeProbe) {
                 const h = getHostnameSafe(cleanUrl);
                 if (h) httpOnlyHosts.add(h);
-              } else if (lastStatus === 404 || lastStatus === 410) {
+              } else if (lastStatus === 410 || (!isProxyCandidate && lastStatus === 404)) {
                 break;
               }
               continue;
@@ -5605,7 +5832,7 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
             const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
 
             if (isBinary) {
-              if (ct.includes('text/html')) {
+              if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain')) {
                 if (isHttpsUpgradeProbe) {
                   const h = getHostnameSafe(cleanUrl);
                   if (h) httpOnlyHosts.add(h);
@@ -6513,7 +6740,11 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
     for (const target of scrapeTargets) {
       try {
         const html = await fetchWithCorsFallback(target, true);
-        const extracted = extractVideoUrlsFromHtml(html, target).filter(isUsableRescueUrl);
+        let rawExtracted = extractVideoUrlsFromHtml(html, target);
+        if (rawExtracted.length === 0 && /eporner\.com\//i.test(target)) {
+          rawExtracted = await resolveEpornerStreamsFromEmbedHtml(html, null, target);
+        }
+        const extracted = rawExtracted.filter(isUsableRescueUrl);
         if (extracted.length > 0) {
           const mp4First = [
             ...extracted.filter((u) => /\.mp4(\?|$)/i.test(u)),
@@ -6576,6 +6807,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
                 if (
                   !upCt.includes('text/html') &&
                   !upCt.includes('application/json') &&
+                  !upCt.includes('text/plain') &&
                   (upCt.startsWith('video/') || upCt === 'application/octet-stream' || VIDEO_EXT_END_REGEX.test(upgradedHttps.split('?')[0]))
                 ) {
                   try {
@@ -6593,10 +6825,18 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
           }
         }
 
-        const proxyUrls = [
-          `https://corsproxy.io/?${encodeURIComponent(hotlinkTarget)}`,
-          `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(hotlinkTarget)}`
-        ];
+        const encodedHotlinkTarget = encodeURIComponent(hotlinkTarget);
+        const proxyUrls = isLocalDevOrigin()
+          ? [
+              `https://corsproxy.io/?${encodedHotlinkTarget}`,
+              `https://api.cors.lol/?url=${encodedHotlinkTarget}`,
+              `https://api.codetabs.com/v1/proxy?quest=${encodedHotlinkTarget}`
+            ]
+          : [
+              `https://api.cors.lol/?url=${encodedHotlinkTarget}`,
+              `https://api.codetabs.com/v1/proxy?quest=${encodedHotlinkTarget}`,
+              `https://corsproxy.io/?${encodedHotlinkTarget}`
+            ];
 
         for (const proxyUrl of proxyUrls) {
           const proxyController = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -6606,7 +6846,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
             const pRes = proxyController
               ? await fetch(proxyUrl, { signal: proxyController.signal })
               : await fetch(proxyUrl);
-            if (pRes && (pRes.status === 404 || pRes.status === 410)) {
+            if (pRes && pRes.status === 410) {
               break;
             }
             if (pRes && pRes.ok) {
@@ -6615,6 +6855,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
               if (
                 !ct.includes('text/html') &&
                 !ct.includes('application/json') &&
+                !ct.includes('text/plain') &&
                 (ct.startsWith('video/') || ct === 'application/octet-stream' || VIDEO_EXT_END_REGEX.test(cleanPath))
               ) {
                 const salvaged = await readBoundedProxyBlobOrStream(
@@ -9008,6 +9249,12 @@ if (typeof module !== 'undefined' && module.exports) {
     clearPlaybackStartupWatchdog,
     recordDeadStreamUrl,
     rescueDeadVideoStream,
+    isLocalDevOrigin,
+    isInvalidCorsProxyPayload,
+    fetchWithCorsFallback,
+    getRedgifsTempToken,
+    calcEpornerBase36Hash,
+    resolveEpornerStreamsFromEmbedHtml,
     unwrapProxyTargetUrl,
     buildHttpsMediaProxyCandidates,
     createHttpsProxyHlsLoaderClass,
@@ -9049,6 +9296,10 @@ if (typeof module !== 'undefined' && module.exports) {
       deadUrls
     }),
     setAppState: (patch = {}) => {
+      if (patch.resetRedgifsToken) {
+        cachedRedgifsToken = null;
+        cachedRedgifsTokenExpiry = 0;
+      }
       if (Array.isArray(patch.sources)) {
         sources = patch.sources;
         sourceSelectionGeneration++;
