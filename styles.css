@@ -1449,6 +1449,77 @@ input:checked + .slider:before {
   font-weight: 600;
 }
 
+/* Full-Screen App Passcode Gate Overlay */
+body.app-locked .app-container {
+  visibility: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.app-lock-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: radial-gradient(circle at 50% 25%, #111827 0%, #090d16 75%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--safe-top) + 20px) calc(var(--safe-right) + 20px) calc(var(--safe-bottom) + 20px) calc(var(--safe-left) + 20px);
+}
+
+.app-lock-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 22px;
+  padding: 28px 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+}
+
+.app-lock-icon {
+  font-size: 2.4rem;
+  line-height: 1;
+}
+
+.app-lock-title {
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: var(--text-main);
+}
+
+.app-lock-subtitle {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.app-lock-form {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.app-lock-pin-input {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.45em;
+  padding: 12px 14px;
+}
+
+.app-lock-submit-btn {
+  width: 100%;
+  padding: 12px 16px;
+  font-size: 0.95rem;
+}
+
 .modal-mode-row {
   border-bottom: none;
   padding: 2px 0;

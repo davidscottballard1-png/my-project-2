@@ -7,6 +7,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   <meta name="apple-mobile-web-app-title" content="ReelVault" />
   <meta name="theme-color" content="#090d16" />
+  <meta name="robots" content="noindex, nofollow" />
   <title>ReelVault — Random Video Puller &amp; Downloader</title>
   <link rel="manifest" href="./manifest.json" />
   <link rel="icon" type="image/svg+xml" href="./icon.svg" />
@@ -18,9 +19,39 @@
   <link rel="preconnect" href="https://v.redd.it" crossorigin />
   <link rel="dns-prefetch" href="https://www.reddit.com" />
   <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
-  <link rel="stylesheet" href="./styles.css?v=14" />
+  <link rel="stylesheet" href="./styles.css?v=15" />
 </head>
-<body>
+<body class="app-locked">
+  <!-- Full-Screen Passcode Gate Overlay -->
+  <div id="appLockOverlay" class="app-lock-overlay" role="dialog" aria-modal="true" aria-labelledby="appLockTitle">
+    <div class="app-lock-card">
+      <div class="app-lock-icon" aria-hidden="true">🔒</div>
+      <h2 id="appLockTitle" class="app-lock-title">ReelVault Locked</h2>
+      <p class="app-lock-subtitle">Enter your 4-digit passcode to access ReelVault.</p>
+      <form id="appLockForm" class="app-lock-form" autocomplete="off">
+        <input
+          type="password"
+          id="appLockPinInput"
+          inputmode="numeric"
+          pattern="[0-9]*"
+          maxlength="4"
+          placeholder="••••"
+          class="pin-input app-lock-pin-input"
+          aria-label="Enter 4-Digit Passcode"
+          autocomplete="off"
+          autofocus
+        />
+        <p id="appLockError" class="pin-error hidden" role="alert">Incorrect passcode. Please try again.</p>
+        <button type="submit" id="appLockUnlockBtn" class="btn-primary app-lock-submit-btn">
+          🔓 Unlock ReelVault
+        </button>
+        <button type="button" id="appLockBiometricBtn" class="btn-outline-full hidden">
+          🔓 Unlock with FaceID / TouchID
+        </button>
+      </form>
+    </div>
+  </div>
+
   <div class="app-container">
     <!-- Top Header -->
     <header class="app-header" id="appHeader" title="Triple-tap header anytime for instant Panic Safe Mode">
@@ -49,6 +80,9 @@
           title="Toggle 18+ Adult Content"
         >
           🔞 18+ Off
+        </button>
+        <button id="lockAppBtn" type="button" class="icon-btn" title="Lock App Now" aria-label="Lock App Now">
+          🔒
         </button>
         <button id="installGuideBtn" class="icon-btn" title="Install on iPhone" aria-label="Install on iPhone">
           📲
@@ -777,6 +811,6 @@
     </div>
   </div>
 
-  <script src="./app.js?v=14"></script>
+  <script src="./app.js?v=15"></script>
 </body>
 </html>
