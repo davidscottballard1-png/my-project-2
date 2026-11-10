@@ -13,6 +13,13 @@ const {
   extractCandidateWebPagesFromSearchHtml,
   searchOpenWebVideos,
   searchFreeTubeSites,
+  isPeerTubeSource,
+  isPeerTubeExplicitlyEnabled,
+  pullFromSource,
+  pullRandomVideos,
+  runContinuousPullCycle,
+  startContinuousBackgroundPuller,
+  stopContinuousBackgroundPuller,
   searchInternetArchive,
   handleVideoPlaybackError,
   parseM3u8Manifest,
@@ -1150,6 +1157,246 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         settings.formatMode = origFormatMode;
       }
     });
+
+    it('should NOT query PeerTube unless a PeerTube source is enabled or #engPeerTube is checked, and should route dedicated presets to their target networks', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origSources = getAppState().sources;
+
+      try {
+        settings.allowNsfw = true;
+        setAppState({
+          sources: [
+            {
+              id: 'src-nsfw-redgifs',
+              type: 'keyword',
+              value: 'redgifs',
+              label: '🔞 RedGIFs HD Trending',
+              enabled: true,
+              isNsfw: true
+            }
+          ]
+        });
+
+        // Ensure #engPeerTube is unchecked
+        const prevDoc = globalThis.document;
+        globalThis.document = {
+          getElementById: (id) => (id === 'engPeerTube' ? { checked: false } : null)
+        };
+
+        assert.strictEqual(isPeerTubeExplicitlyEnabled(), false, 'PeerTube should be disabled when not selected');
+
+        const queriedUrls = [];
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          queriedUrls.push(u);
+
+          if (u.includes('sepiasearch.org')) {
+            return {
+              ok: true,
+              json: async () => ({
+                data: [
+                  {
+                    uuid: 'pt-123',
+                    name: 'PeerTube Clip',
+                    account: { host: 'peertube.example.org' }
+                  }
+                ]
+              })
+            };
+          }
+          if (u.includes('peertube.example.org/api/v1/videos/pt-123')) {
+            return {
+              ok: true,
+              json: async () => ({
+                name: 'PeerTube Clip',
+                files: [{ fileDownloadUrl: 'https://peertube.example.org/static/pt-123.mp4', size: 1000000 }]
+              })
+            };
+          }
+          if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+            return { ok: true, json: async () => ({ token: 'tok' }) };
+          }
+          // Simulate trending returning empty so 'redgifs' preset exercises the fallback to order=best / Reddit
+          if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=trending')) {
+            return { ok: true, json: async () => ({ gifs: [] }) };
+          }
+          if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=best')) {
+            return {
+              ok: true,
+              json: async () => ({
+                gifs: [
+                  {
+                    id: 'rgbest1',
+                    duration: 14,
+                    tags: ['Trending'],
+                    urls: { hd: 'https://thumbs4.redgifs.com/RgBest1.mp4' }
+                  }
+                ]
+              })
+            };
+          }
+          if (u.includes('reddit.com/search.json')) {
+            return {
+              ok: true,
+              json: async () => ({
+                data: {
+                  children: [
+                    {
+                      data: {
+                        id: 'rd1',
+                        title: 'Reddit Clip',
+                        over_18: true,
+                        url_overridden_by_dest: 'https://i.redd.it/reddit_clip.mp4'
+                      }
+                    }
+                  ]
+                }
+              })
+            };
+          }
+          return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+        };
+
+        // 1. Pulling from RedGIFs preset must NOT call SepiaSearch / PeerTube
+        const rgResults = await pullFromSource({
+          id: 'src-nsfw-redgifs',
+          type: 'keyword',
+          value: 'redgifs',
+          label: '🔞 RedGIFs HD Trending',
+          isNsfw: true
+        });
+        assert.ok(
+          !queriedUrls.some((u) => u.includes('sepiasearch.org')),
+          'RedGIFs preset must not query SepiaSearch / PeerTube'
+        );
+        assert.ok(
+          rgResults.some((item) => item.videoUrl === 'https://thumbs4.redgifs.com/RgBest1.mp4'),
+          'RedGIFs preset should return RedGIFs HD stream (including order=best fallback for trending)'
+        );
+        assert.ok(
+          rgResults.some((item) => item.videoUrl === 'https://i.redd.it/reddit_clip.mp4'),
+          'pullFromSource should wait for and interleave the second engine instead of cutting off after the first engine'
+        );
+
+        // 2. Pulling from general keyword when PeerTube is not enabled must NOT call SepiaSearch / PeerTube
+        queriedUrls.length = 0;
+        await pullFromSource({
+          id: 'custom-kw-1',
+          type: 'keyword',
+          value: 'amateur clips',
+          label: 'Amateur Clips',
+          isNsfw: true
+        });
+        assert.ok(
+          !queriedUrls.some((u) => u.includes('sepiasearch.org')),
+          'General keyword source must not query PeerTube when PeerTube is not enabled'
+        );
+
+        // 3. Pulling explicitly from a PeerTube source SHOULD query SepiaSearch / PeerTube
+        queriedUrls.length = 0;
+        const ptResults = await pullFromSource({
+          id: 'dir-fed-peertube',
+          type: 'keyword',
+          value: 'peertube nsfw adult',
+          label: 'PeerTube Federated 18+',
+          isNsfw: true
+        });
+        assert.ok(
+          queriedUrls.some((u) => u.includes('sepiasearch.org')),
+          'Explicit PeerTube source should query SepiaSearch / PeerTube'
+        );
+        assert.strictEqual(ptResults.length, 1);
+        assert.strictEqual(ptResults[0].videoUrl, 'https://peertube.example.org/static/pt-123.mp4');
+
+        globalThis.document = prevDoc;
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({ sources: origSources });
+      }
+    });
+
+    it('should wait until all active sources and engines finish pulling and continuously top up the queue in round-robin order', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origPrebuffer = settings.prebuffer;
+      const origState = getAppState();
+
+      try {
+        settings.allowNsfw = false;
+        settings.prebuffer = true;
+
+        // Configure 3 distinct active subreddit sources to verify all 3 are pulled (not capped at 2)
+        setAppState({
+          sources: [
+            { id: 's1', type: 'subreddit', value: 'subOne', label: 'r/subOne', enabled: true, isNsfw: false },
+            { id: 's2', type: 'subreddit', value: 'subTwo', label: 'r/subTwo', enabled: true, isNsfw: false },
+            { id: 's3', type: 'subreddit', value: 'subThree', label: 'r/subThree', enabled: true, isNsfw: false }
+          ],
+          videoQueue: [],
+          currentIndex: -1
+        });
+
+        const pulledSubs = new Set();
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          const m = u.match(/reddit\.com\/r\/([^/]+)\//i);
+          if (m?.[1]) {
+            const sub = m[1];
+            pulledSubs.add(sub);
+            return {
+              ok: true,
+              json: async () => ({
+                data: {
+                  children: [
+                    {
+                      data: {
+                        id: `${sub}-1`,
+                        title: `${sub} clip 1`,
+                        over_18: false,
+                        url_overridden_by_dest: `https://cdn.example.org/${sub}-1.mp4`
+                      }
+                    },
+                    {
+                      data: {
+                        id: `${sub}-2`,
+                        title: `${sub} clip 2`,
+                        over_18: false,
+                        url_overridden_by_dest: `https://cdn.example.org/${sub}-2.mp4`
+                      }
+                    }
+                  ]
+                }
+              })
+            };
+          }
+          return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+        };
+
+        await pullRandomVideos(1);
+        assert.strictEqual(pulledSubs.size, 3, 'pullRandomVideos should wait for all 3 active sources to pull');
+
+        // Continuous pull cycle should top up the queue from remaining unseen items across active sources
+        const added = await runContinuousPullCycle();
+        assert.ok(added > 0 || getAppState().videoQueue.length >= 2, 'Continuous puller should append unseen videos to the queue');
+
+        assert.strictEqual(startContinuousBackgroundPuller(), true);
+        stopContinuousBackgroundPuller();
+      } finally {
+        stopContinuousBackgroundPuller();
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.prebuffer = origPrebuffer;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
   });
 });
+
+
 

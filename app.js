@@ -1358,6 +1358,7 @@ function toggleDirectorySource(dirIdOrValue) {
   }
 
   saveSources();
+  syncQueueAfterSourceChange();
   if (typeof document !== 'undefined') {
     if (document.getElementById('sourcesList')) renderSourcesList();
     if (document.getElementById('adultDirectoryList')) renderAdultDirectory();
@@ -1392,6 +1393,7 @@ function enableAllDirectorySources() {
   }
   if (addedOrEnabled > 0) {
     saveSources();
+    syncQueueAfterSourceChange();
   }
   if (typeof document !== 'undefined') {
     if (document.getElementById('sourcesList')) renderSourcesList();
@@ -1413,6 +1415,7 @@ function disableAllDirectorySources() {
   }
   if (disabledCount > 0) {
     saveSources();
+    syncQueueAfterSourceChange();
   }
   if (typeof document !== 'undefined') {
     if (document.getElementById('sourcesList')) renderSourcesList();
@@ -1453,6 +1456,7 @@ function enableDirectoryCategory(categoryName) {
   }
   if (addedOrEnabled > 0) {
     saveSources();
+    syncQueueAfterSourceChange();
   }
   if (typeof document !== 'undefined') {
     if (document.getElementById('sourcesList')) renderSourcesList();
@@ -1565,13 +1569,64 @@ function renderAdultDirectory(filterOverride) {
       : `<p class="muted-center">No 18+ directory sources match "${escapeHtml(rawQuery)}".</p>`;
 }
 
+function isPeerTubeVideoItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (String(item.id || '').startsWith('pt-')) return true;
+  if (/\bpeertube\b/i.test(String(item.sourceName || ''))) return true;
+  return false;
+}
+
+function syncQueueAfterSourceChange() {
+  sourcePoolCache.clear();
+  const ptEnabled = isPeerTubeExplicitlyEnabled();
+  const active = getEffectiveActiveSources();
+
+  if (!ptEnabled && videoQueue.some((item) => isPeerTubeVideoItem(item))) {
+    const currentItem = videoQueue[currentIndex];
+    const wasPlayingPt = isPeerTubeVideoItem(currentItem);
+    videoQueue = videoQueue.filter((item) => !isPeerTubeVideoItem(item));
+    if (videoQueue.length === 0) {
+      currentIndex = -1;
+    } else if (currentIndex >= videoQueue.length) {
+      currentIndex = videoQueue.length - 1;
+    }
+    if (wasPlayingPt && typeof document !== 'undefined') {
+      const videoEl = document.getElementById('mainVideo');
+      if (videoEl) {
+        try {
+          videoEl.pause?.();
+          videoEl.src = '';
+          videoEl.load?.();
+        } catch {}
+      }
+      if (videoQueue.length === 0) {
+        document.getElementById('playerEmpty')?.classList.remove('hidden');
+      }
+      updatePlayerUI();
+    }
+  }
+
+  if (active.length === 0) {
+    stopContinuousBackgroundPuller();
+    if (currentIndex >= 0 && videoQueue.length > currentIndex + 1) {
+      videoQueue = videoQueue.slice(0, currentIndex + 1);
+      if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
+        updatePlayerUI();
+      }
+    }
+  }
+}
+
 // Return the active sources filtered by Safe Mode vs 18+ Only Mode (no Mixed Mode)
 function getEffectiveActiveSources() {
   if (!settings.allowNsfw) {
     return sources.filter((s) => s.enabled && !s.isNsfw);
   }
-  const strictSources = sources.filter((s) => s.enabled && s.isNsfw);
-  return strictSources.length > 0 ? strictSources : structuredClone(ADULT_PRESET_SOURCES);
+  const hasAnyNsfwSources = sources.some((s) => s && s.isNsfw);
+  if (!hasAnyNsfwSources) {
+    return structuredClone(ADULT_PRESET_SOURCES);
+  }
+  return sources.filter((s) => s.enabled && s.isNsfw);
 }
 
 // 4-Digit PIN & WebAuthn FaceID / TouchID Lock Helpers
@@ -1986,6 +2041,9 @@ function restorePlaybackState() {
 
     if (!settings.allowNsfw) {
       restoredQueue = restoredQueue.filter((item) => !isItemNsfw(item));
+    }
+    if (!isPeerTubeExplicitlyEnabled()) {
+      restoredQueue = restoredQueue.filter((item) => !isPeerTubeVideoItem(item));
     }
     if (restoredQueue.length === 0) return false;
 
@@ -2765,12 +2823,12 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       appendGifsFromList(data?.gifs);
     }
 
-    // 2. Niche/creator keywords often have 0 clips in 'trending' but many in 'best' or user creator feeds
-    if (results.length === 0 && cleanKw.toLowerCase() !== 'trending') {
+    // 2. Niche/creator keywords (or when trending returns 0) fall back to 'best' and creator feeds
+    if (results.length === 0) {
       const fallbackUrls = [
         `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(cleanKw)}&order=best&count=${limit}`
       ];
-      if (/^[a-zA-Z0-9_.-]{3,30}$/.test(cleanKw)) {
+      if (cleanKw.toLowerCase() !== 'trending' && /^[a-zA-Z0-9_.-]{3,30}$/.test(cleanKw)) {
         fallbackUrls.push(
           `https://api.redgifs.com/v2/users/${encodeURIComponent(cleanKw.toLowerCase())}/search?order=new&count=${limit}`
         );
@@ -2793,11 +2851,14 @@ async function searchRedgifsVideos(keyword, limit = 6) {
   }
 
   // 3. Fallback: if RedGIFs API returned 0 results or was blocked, search Reddit's index of redgifs.com links
-  if (results.length === 0 && cleanKw.toLowerCase() !== 'trending') {
+  if (results.length === 0) {
     try {
+      const isTrendingDefault = cleanKw.toLowerCase() === 'trending';
+      const redditQuery = isTrendingDefault ? 'site:redgifs.com' : `site:redgifs.com ${cleanKw}`;
+      const redditSort = isTrendingDefault ? 'hot' : 'relevance';
       const rgRedditUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-        `site:redgifs.com ${cleanKw}`
-      )}&type=link&sort=relevance&include_over_18=1&limit=20&raw_json=1`;
+        redditQuery
+      )}&type=link&sort=${redditSort}&include_over_18=1&limit=20&raw_json=1`;
       const json = await fetchWithCorsFallback(rgRedditUrl, false);
       const fallbackItems = extractRedditVideosFromListing(json, `RedGIFs (${cleanKw})`, true);
       results.push(...fallbackItems.slice(0, limit));
@@ -3930,11 +3991,146 @@ async function searchFreeTubeSites(keyword, limit = 6) {
 const sourcePoolCache = new Map();
 const SOURCE_CACHE_TTL_MS = 180_000;
 
-function getSourceCacheKey(source) {
-  return `${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}`;
+function isPeerTubeSource(src) {
+  if (!src || typeof src !== 'object') return false;
+  const hay = `${src.id || ''} ${src.value || ''} ${src.label || ''} ${src.engine || ''}`;
+  return /\bpeertube\b/i.test(hay);
 }
 
-// Pull videos from a single source object with fast-first resolution & background pool caching
+function isPeerTubeExplicitlyEnabled(targetSource = null) {
+  if (isPeerTubeSource(targetSource)) {
+    return true;
+  }
+  if (typeof document !== 'undefined') {
+    const ptCheck = document.getElementById('engPeerTube');
+    if (ptCheck && ptCheck.checked === true) {
+      return true;
+    }
+  }
+  return sources.some(
+    (s) =>
+      s &&
+      s.enabled &&
+      (settings.allowNsfw ? Boolean(s.isNsfw) : !s.isNsfw) &&
+      isPeerTubeSource(s)
+  );
+}
+
+// Route dedicated presets (RedGIFs, NASA, Prelinger, Vintage/Archive, Fediverse, Free Tube, PeerTube)
+// to their actual target networks, and only include PeerTube on general keywords when explicitly enabled
+function buildKeywordEnginePromises(source, isStrictNsfw) {
+  const rawVal = String(source?.value || '').trim();
+  const hay = `${source?.id || ''} ${rawVal} ${source?.label || ''} ${source?.engine || ''}`.toLowerCase();
+  const peerTubeAllowed = isPeerTubeExplicitlyEnabled(source);
+
+  // 1. Dedicated PeerTube source
+  if (isPeerTubeSource(source)) {
+    const ptQuery = rawVal.replace(/\bpeertube\b/gi, '').trim() || (isStrictNsfw ? 'nsfw' : 'video');
+    return [searchPeerTubeVideos(ptQuery, 6)];
+  }
+
+  // 2. Dedicated RedGIFs preset or niche source
+  if (/^dir-rg-|^src-nsfw-redgifs|\bredgifs\b/.test(hay)) {
+    return [
+      searchRedgifsVideos(rawVal, 6),
+      searchRedditVideosByKeyword(rawVal)
+    ];
+  }
+
+  // 3. Dedicated NASA Space & Science preset (Safe Mode)
+  if (!isStrictNsfw && (/^src-kw-space|\bnasa\b/.test(hay))) {
+    return [
+      searchNasaVideos(rawVal, 5),
+      searchInternetArchive(rawVal, 4),
+      searchWikimediaVideos(rawVal, 4)
+    ];
+  }
+
+  // 4. Dedicated Prelinger & Vintage Cartoons preset (Safe Mode)
+  if (!isStrictNsfw && (/^src-kw-vintage|\bprelinger\b/.test(hay))) {
+    return [
+      searchPrelingerArchives(rawVal, 5),
+      searchInternetArchive(rawVal, 5)
+    ];
+  }
+
+  // 5. Dedicated Lemmy & Mastodon Fediverse preset
+  if (/^dir-fed-lemmy|\b(?:lemmy|fediverse|mastodon)\b/.test(hay)) {
+    return [
+      searchFediverseVideos(rawVal),
+      searchRedditVideosByKeyword(rawVal)
+    ];
+  }
+
+  // 6. Dedicated Free Tube / Full-Length Tube / Vintage 18+ Archive presets
+  if (/^dir-tube-|^src-nsfw-tube-hd|^src-nsfw-romantic|^src-nsfw-vintage|^dir-fed-archive/.test(hay)) {
+    const tubePromises = [
+      searchFreeTubeSites(rawVal, 6),
+      searchOpenWebVideos(rawVal, 5),
+      searchRedgifsVideos(rawVal, 5),
+      searchRedditVideosByKeyword(rawVal)
+    ];
+    if (/\b(?:vintage|archive|burlesque|classic)\b/.test(hay)) {
+      tubePromises.push(searchInternetArchive(rawVal, 4));
+    }
+    return tubePromises;
+  }
+
+  // 7. General keyword source or custom keyword search
+  if (isStrictNsfw) {
+    const nsfwEngines = [
+      searchRedgifsVideos(rawVal, 5),
+      searchFreeTubeSites(rawVal, 5),
+      searchOpenWebVideos(rawVal, 5),
+      searchRedditVideosByKeyword(rawVal)
+    ];
+    if (peerTubeAllowed) {
+      nsfwEngines.push(searchPeerTubeVideos(rawVal, 4));
+    }
+    return nsfwEngines;
+  }
+
+  const safeEngines = [
+    searchWikimediaVideos(rawVal, 5),
+    searchNasaVideos(rawVal, 3),
+    searchRedditVideosByKeyword(rawVal),
+    searchInternetArchive(rawVal, 5),
+    searchPrelingerArchives(rawVal, 2),
+    searchFediverseVideos(rawVal),
+    searchFreeTubeSites(rawVal, 4),
+    searchOpenWebVideos(rawVal, 5)
+  ];
+  if (peerTubeAllowed) {
+    safeEngines.push(searchPeerTubeVideos(rawVal, 4));
+  }
+  return safeEngines;
+}
+
+function getSourceCacheKey(source) {
+  const ptFlag = isPeerTubeExplicitlyEnabled(source) ? 'pt1' : 'pt0';
+  return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}`;
+}
+
+function interleaveVideoBuckets(buckets) {
+  const combined = [];
+  const seenInPool = new Set();
+  const validBuckets = (Array.isArray(buckets) ? buckets : []).filter(
+    (b) => Array.isArray(b) && b.length > 0
+  );
+  const maxLen = validBuckets.reduce((m, b) => Math.max(m, b.length), 0);
+  for (let i = 0; i < maxLen; i++) {
+    for (const bucket of validBuckets) {
+      const item = bucket[i];
+      if (item?.videoUrl && !seenInPool.has(item.videoUrl)) {
+        seenInPool.add(item.videoUrl);
+        combined.push(item);
+      }
+    }
+  }
+  return combined;
+}
+
+// Pull videos from a single source object, waiting until all target engines finish pulling
 async function pullFromSource(source) {
   const cacheKey = getSourceCacheKey(source);
   const cached = sourcePoolCache.get(cacheKey);
@@ -3965,83 +4161,45 @@ async function pullFromSource(source) {
     return items;
   }
 
-  // Default: 'keyword' -> race open engines + open web & tube crawlers in parallel
-  const combined = [];
-  const cacheRecord = { items: combined, timestamp: Date.now() };
-  sourcePoolCache.set(cacheKey, cacheRecord);
-
+  // Default: 'keyword' -> wait until all target engines finish pulling and interleave results
   const isStrictNsfw = Boolean(settings.allowNsfw || source.isNsfw);
-  const enginePromises = isStrictNsfw
-    ? [
-        searchRedgifsVideos(source.value, 5),
-        searchFreeTubeSites(source.value, 5),
-        searchOpenWebVideos(source.value, 5),
-        searchRedditVideosByKeyword(source.value),
-        searchPeerTubeVideos(source.value, 4)
-      ]
-    : [
-        searchWikimediaVideos(source.value, 5),
-        searchNasaVideos(source.value, 3),
-        searchRedditVideosByKeyword(source.value),
-        searchInternetArchive(source.value, 5),
-        searchPrelingerArchives(source.value, 2),
-        searchPeerTubeVideos(source.value, 4),
-        searchFediverseVideos(source.value),
-        searchFreeTubeSites(source.value, 4),
-        searchOpenWebVideos(source.value, 5)
-      ];
+  const enginePromises = buildKeywordEnginePromises(source, isStrictNsfw);
 
-  return new Promise((resolve) => {
-    let remaining = enginePromises.length;
-    let resolved = false;
-    let graceTimer = null;
+  if (enginePromises.length === 0) {
+    return [];
+  }
 
-    const finish = () => {
-      if (resolved) return;
-      resolved = true;
-      if (graceTimer) clearTimeout(graceTimer);
-      resolve([...combined]);
-    };
+  const settled = await Promise.allSettled(enginePromises);
+  const engineBuckets = [];
 
-    for (const p of enginePromises) {
-      Promise.resolve(p)
-        .then((items) => {
-          if (Array.isArray(items) && items.length > 0) {
-            if (isStrictNsfw) {
-              items.forEach((item) => {
-                if (item) item.isNsfw = true;
-              });
-            }
-            combined.push(...items);
-            cacheRecord.timestamp = Date.now();
-            // Give fast/medium engines a 750ms window after first result (or 350ms once >=3 videos arrive)
-            // so a single marginal result never cuts off Reddit, Archive.org, Open Web, or RedGIFs keyword hits
-            if (!resolved) {
-              if (combined.length >= 3) {
-                if (graceTimer) clearTimeout(graceTimer);
-                graceTimer = setTimeout(finish, 350);
-                graceTimer.unref?.();
-              } else if (!graceTimer) {
-                graceTimer = setTimeout(finish, 750);
-                graceTimer.unref?.();
-              }
-            }
-          }
-        })
-        .catch(() => {})
-        .finally(() => {
-          remaining--;
-          if (remaining === 0) {
-            finish();
-          }
+  for (const res of settled) {
+    if (res.status === 'fulfilled' && Array.isArray(res.value) && res.value.length > 0) {
+      const items = res.value;
+      if (isStrictNsfw) {
+        items.forEach((item) => {
+          if (item) item.isNsfw = true;
         });
+      }
+      engineBuckets.push(items);
     }
-  });
+  }
+
+  const combined = interleaveVideoBuckets(engineBuckets);
+  if (combined.length > 0) {
+    sourcePoolCache.set(cacheKey, { items: combined, timestamp: Date.now() });
+  }
+  return combined;
 }
 
 // ==========================================
-// PLAYER, BACKGROUND PRE-BUFFER & REELS MODE CONTROLLER
+// PLAYER, CONTINUOUS BACKGROUND PULLER & REELS MODE CONTROLLER
 // ==========================================
+
+const CONTINUOUS_QUEUE_TARGET_AHEAD = 12;
+const CONTINUOUS_PULL_INTERVAL_MS = 4500;
+let continuousPullTimer = null;
+let continuousPullPromise = null;
+let continuousSourceCursor = 0;
 
 function setPlayerLoading(isLoading, message = 'Pulling random video...') {
   const overlay = document.getElementById('playerLoading');
@@ -4075,38 +4233,106 @@ function getEffectivePlaybackUrl(videoItem) {
   return videoItem.videoUrl;
 }
 
-// Silently pre-buffer the next video in the queue and top up the queue in the background
-async function scheduleBackgroundQueuePrebuffer() {
-  if (!settings.prebuffer) {
-    document.getElementById('prebufferBadge')?.classList.add('hidden');
-    return;
+// Run one cycle of the continuous background puller across active sources in round-robin order
+async function runContinuousPullCycle() {
+  if (!settings.prebuffer) return 0;
+  if (continuousPullPromise) {
+    return await continuousPullPromise;
+  }
+  const effectiveSources = getEffectiveActiveSources();
+  if (effectiveSources.length === 0) return 0;
+
+  const remainingAhead = videoQueue.length - 1 - Math.max(0, currentIndex);
+  if (remainingAhead >= CONTINUOUS_QUEUE_TARGET_AHEAD) {
+    return 0;
   }
 
-  // 1. If fewer than 2 videos remain ahead of currentIndex, silently pull 2 more in the background
-  const remainingAhead = videoQueue.length - 1 - currentIndex;
-  const effectiveSources = getEffectiveActiveSources();
-  if (remainingAhead < 2 && !isBackgroundRefilling && effectiveSources.length > 0) {
-    isBackgroundRefilling = true;
+  isBackgroundRefilling = true;
+  continuousPullPromise = (async () => {
+    let addedCount = 0;
     try {
-      const randomSource = effectiveSources[Math.floor(Math.random() * effectiveSources.length)];
-      if (randomSource) {
-        const fetched = await pullFromSource(randomSource);
-        const fresh = fetched.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
-        const picks = fresh.sort(() => Math.random() - 0.5).slice(0, 2);
-        for (const p of picks) {
-          seenUrls.add(p.videoUrl);
-          videoQueue.push(p);
+      const batchSize = Math.min(2, effectiveSources.length);
+      const batchSources = [];
+      for (let i = 0; i < batchSize; i++) {
+        const idx = (continuousSourceCursor + i) % effectiveSources.length;
+        batchSources.push(effectiveSources[idx]);
+      }
+      continuousSourceCursor = (continuousSourceCursor + batchSize) % effectiveSources.length;
+
+      const settled = await Promise.allSettled(
+        batchSources.map((src) => pullFromSource(src))
+      );
+      const buckets = [];
+      for (const r of settled) {
+        if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
+          buckets.push(r.value);
         }
+      }
+
+      const interleaved = interleaveVideoBuckets(buckets);
+      const fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+      const picks = fresh.slice(0, 4);
+      for (const p of picks) {
+        seenUrls.add(p.videoUrl);
+        videoQueue.push(p);
+        addedCount++;
+      }
+
+      if (addedCount > 0 && typeof document !== 'undefined') {
         const queueEl = document.getElementById('queueCounter');
         if (queueEl && videoQueue.length > 0) {
-          queueEl.textContent = `Video ${currentIndex + 1} of ${videoQueue.length}`;
+          queueEl.textContent = `Video ${Math.max(0, currentIndex) + 1} of ${videoQueue.length}`;
         }
       }
     } catch {
       // silent background refill
     } finally {
       isBackgroundRefilling = false;
+      continuousPullPromise = null;
     }
+    return addedCount;
+  })();
+
+  return await continuousPullPromise;
+}
+
+function startContinuousBackgroundPuller() {
+  if (continuousPullTimer || !settings.prebuffer) return false;
+  continuousPullTimer = setInterval(() => {
+    if (!settings.prebuffer) {
+      stopContinuousBackgroundPuller();
+      return;
+    }
+    if (typeof document !== 'undefined' && document.hidden) return;
+    runContinuousPullCycle().catch(() => {});
+  }, CONTINUOUS_PULL_INTERVAL_MS);
+  continuousPullTimer.unref?.();
+  return true;
+}
+
+function stopContinuousBackgroundPuller() {
+  if (continuousPullTimer) {
+    clearInterval(continuousPullTimer);
+    continuousPullTimer = null;
+  }
+}
+
+// Silently pre-buffer the next video in the queue and continuously top up the queue in the background
+async function scheduleBackgroundQueuePrebuffer() {
+  if (!settings.prebuffer) {
+    stopContinuousBackgroundPuller();
+    document.getElementById('prebufferBadge')?.classList.add('hidden');
+    return;
+  }
+
+  if (typeof window !== 'undefined') {
+    startContinuousBackgroundPuller();
+  }
+
+  // 1. If fewer than 2 videos remain ahead of currentIndex, immediately run a background pull cycle
+  const remainingAhead = videoQueue.length - 1 - currentIndex;
+  if (remainingAhead < 2) {
+    await runContinuousPullCycle();
   }
 
   // 2. Warm up the next video in the queue using an offscreen <video preload="auto"> element
@@ -4120,18 +4346,20 @@ async function scheduleBackgroundQueuePrebuffer() {
   const nextUrl = getEffectivePlaybackUrl(nextItem);
   if (!nextUrl) return;
 
-  if (!prebufferVideoEl) {
+  if (!prebufferVideoEl && typeof document !== 'undefined' && typeof document.createElement === 'function') {
     prebufferVideoEl = document.createElement('video');
     prebufferVideoEl.muted = true;
     prebufferVideoEl.playsInline = true;
     prebufferVideoEl.preload = 'auto';
-    prebufferVideoEl.style.display = 'none';
-    document.body.appendChild(prebufferVideoEl);
+    if (prebufferVideoEl.style) {
+      prebufferVideoEl.style.display = 'none';
+    }
+    document.body?.appendChild?.(prebufferVideoEl);
   }
 
-  if (prebufferVideoEl.src !== nextUrl) {
+  if (prebufferVideoEl && prebufferVideoEl.src !== nextUrl) {
     prebufferVideoEl.src = nextUrl;
-    prebufferVideoEl.load();
+    prebufferVideoEl.load?.();
   }
   nextItem.isPrebuffered = true;
   prebufferBadge?.classList.remove('hidden');
@@ -4340,17 +4568,19 @@ function updatePlayerUI() {
   const reelsHudBadge = document.getElementById('reelsHudBadge');
   const reelsHudTitle = document.getElementById('reelsHudTitle');
 
-  queueEl.textContent =
-    videoQueue.length > 0
-      ? `Video ${currentIndex + 1} of ${videoQueue.length}`
-      : '0 in queue';
+  if (queueEl) {
+    queueEl.textContent =
+      videoQueue.length > 0
+        ? `Video ${currentIndex + 1} of ${videoQueue.length}`
+        : '0 in queue';
+  }
 
-  prevBtn.disabled = currentIndex <= 0;
+  if (prevBtn) prevBtn.disabled = currentIndex <= 0;
 
   const current = videoQueue[currentIndex];
   if (!current) {
-    savePhoneBtn.disabled = true;
-    saveVaultBtn.disabled = true;
+    if (savePhoneBtn) savePhoneBtn.disabled = true;
+    if (saveVaultBtn) saveVaultBtn.disabled = true;
     if (moreLikeBtn) moreLikeBtn.disabled = true;
     if (favCurrentBtn) {
       favCurrentBtn.disabled = true;
@@ -4369,8 +4599,8 @@ function updatePlayerUI() {
   }
 
   emptyEl?.classList.add('hidden');
-  savePhoneBtn.disabled = false;
-  saveVaultBtn.disabled = false;
+  if (savePhoneBtn) savePhoneBtn.disabled = false;
+  if (saveVaultBtn) saveVaultBtn.disabled = false;
   if (moreLikeBtn) moreLikeBtn.disabled = false;
   if (favCurrentBtn) {
     favCurrentBtn.disabled = false;
@@ -4401,8 +4631,8 @@ function updatePlayerUI() {
   }
 
   const fMeta = getFormatBadgeInfo(current);
-  titleEl.textContent = current.title || 'Untitled Video';
-  badgeEl.textContent = current.sourceName || 'Random Feed';
+  if (titleEl) titleEl.textContent = current.title || 'Untitled Video';
+  if (badgeEl) badgeEl.textContent = current.sourceName || 'Random Feed';
 
   if (reelsHudBadge) {
     reelsHudBadge.textContent = `${current.sourceName || 'Reel'} • ${fMeta.text}`;
@@ -4426,51 +4656,55 @@ function updatePlayerUI() {
     }
   }
 
-  if (current.pageUrl) {
-    origLink.href = current.pageUrl;
-    origLink.classList.remove('hidden');
-  } else {
-    origLink.classList.add('hidden');
+  if (origLink) {
+    if (current.pageUrl) {
+      origLink.href = current.pageUrl;
+      origLink.classList.remove('hidden');
+    } else {
+      origLink.classList.add('hidden');
+    }
   }
 
   const targetPlayUrl = getEffectivePlaybackUrl(current);
   const savedTime = getSavedPlaybackTime(current);
-  if (videoEl.src !== targetPlayUrl) {
-    videoEl.dataset.autoConvertAttempted = 'false';
-    videoEl.dataset.triedConvertedUrl = 'false';
-    if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
-      videoEl.muted = true;
-    }
-    videoEl.src = targetPlayUrl;
-    videoEl.load();
-    videoEl.playbackRate = settings.playbackSpeed || 1;
-    if (savedTime > 0) {
+  if (videoEl) {
+    if (videoEl.src !== targetPlayUrl) {
+      if (videoEl.dataset) {
+        videoEl.dataset.autoConvertAttempted = 'false';
+        videoEl.dataset.triedConvertedUrl = 'false';
+      }
+      if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
+        videoEl.muted = true;
+      }
+      videoEl.src = targetPlayUrl;
+      videoEl.load?.();
+      videoEl.playbackRate = settings.playbackSpeed || 1;
+      if (savedTime > 0) {
+        try {
+          videoEl.currentTime = savedTime;
+        } catch {}
+        videoEl.addEventListener?.(
+          'loadedmetadata',
+          () => {
+            try {
+              if (!videoEl.duration || savedTime < videoEl.duration - 0.5) {
+                videoEl.currentTime = savedTime;
+              }
+            } catch {}
+          },
+          { once: true }
+        );
+      }
+      if (settings.autoPlay) {
+        videoEl.play?.()?.catch?.(() => {
+          // iOS may require user tap if unmuted; user can tap play on controls
+        });
+      }
+    } else if (savedTime > 0 && (!videoEl.currentTime || Math.abs(videoEl.currentTime - savedTime) > 1.5)) {
       try {
         videoEl.currentTime = savedTime;
       } catch {}
-      videoEl.addEventListener?.(
-        'loadedmetadata',
-        () => {
-          try {
-            if (!videoEl.duration || savedTime < videoEl.duration - 0.5) {
-              videoEl.currentTime = savedTime;
-            }
-          } catch {}
-        },
-        { once: true }
-      );
     }
-    if (settings.autoPlay) {
-      videoEl.play().catch(() => {
-        // iOS may require user tap if unmuted; user can tap play on controls
-      });
-    }
-  } else if (savedTime > 0 && (!videoEl.currentTime || Math.abs(videoEl.currentTime - savedTime) > 1.5)) {
-    try {
-      videoEl.currentTime = savedTime;
-    } catch {}
-  }
-  if (videoEl) {
     videoEl.playbackRate = settings.playbackSpeed || 1;
   }
 
@@ -4639,19 +4873,19 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         return;
       }
 
-      const pickedSources = [...activeSources]
-        .sort(() => Math.random() - 0.5)
-        .slice(0, Math.min(2, activeSources.length));
+      const shuffledSources = [...activeSources].sort(() => Math.random() - 0.5);
 
       const results = await Promise.allSettled(
-        pickedSources.map((src) => pullFromSource(src))
+        shuffledSources.map((src) => pullFromSource(src))
       );
 
+      const sourceBuckets = [];
       for (const r of results) {
-        if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-          pool.push(...r.value);
+        if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
+          sourceBuckets.push(r.value);
         }
       }
+      pool = interleaveVideoBuckets(sourceBuckets);
     }
 
     let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
@@ -5992,6 +6226,7 @@ if (typeof document !== 'undefined') {
       if (src) {
         src.enabled = toggle.checked;
         saveSources();
+        syncQueueAfterSourceChange();
       }
       return;
     }
@@ -6000,6 +6235,7 @@ if (typeof document !== 'undefined') {
     if (delBtn) {
       sources = sources.filter((s) => s.id !== delBtn.dataset.id);
       saveSources();
+      syncQueueAfterSourceChange();
       renderSourcesList();
       showToast('Source removed');
     }
@@ -6012,6 +6248,7 @@ if (typeof document !== 'undefined') {
       }
     });
     saveSources();
+    syncQueueAfterSourceChange();
     renderSourcesList();
   });
 
@@ -6022,6 +6259,7 @@ if (typeof document !== 'undefined') {
       }
     });
     saveSources();
+    syncQueueAfterSourceChange();
     renderSourcesList();
   });
 
@@ -6380,7 +6618,16 @@ if (typeof module !== 'undefined' && module.exports) {
     extractCandidateWebPagesFromSearchHtml,
     searchOpenWebVideos,
     searchFreeTubeSites,
+    isPeerTubeSource,
+    isPeerTubeExplicitlyEnabled,
+    buildKeywordEnginePromises,
+    interleaveVideoBuckets,
     pullFromSource,
+    pullRandomVideos,
+    runContinuousPullCycle,
+    startContinuousBackgroundPuller,
+    stopContinuousBackgroundPuller,
+    scheduleBackgroundQueuePrebuffer,
     parseM3u8Manifest,
     downloadAndAssembleM3u8Stream,
     escapeHtml,
