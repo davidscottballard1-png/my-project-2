@@ -336,6 +336,92 @@ let isBackgroundRefilling = false;
 let prebufferVideoEl = null;
 let cachedRedgifsToken = null;
 let cachedRedgifsTokenExpiry = 0;
+const httpOnlyHosts = new Set();
+
+function isSecurePageOrigin() {
+  return (
+    typeof window !== 'undefined' &&
+    Boolean(window.location) &&
+    String(window.location.protocol || '').toLowerCase() === 'https:'
+  );
+}
+
+function unwrapProxyTargetUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  let current = rawUrl.trim();
+  for (let depth = 0; depth < 3; depth++) {
+    let next = null;
+    if (/^https?:\/\/corsproxy\.io\/\?/i.test(current)) {
+      const qIdx = current.indexOf('?');
+      const encoded = qIdx >= 0 ? current.slice(qIdx + 1) : '';
+      try {
+        next = decodeURIComponent(encoded);
+      } catch {
+        next = encoded;
+      }
+    } else if (/^https?:\/\/api\.codetabs\.com\/v1\/proxy\?quest=/i.test(current)) {
+      try {
+        next = new URL(current).searchParams.get('quest');
+      } catch {}
+    } else if (/^https?:\/\/api\.cors\.lol\/\?url=/i.test(current)) {
+      try {
+        next = new URL(current).searchParams.get('url');
+      } catch {}
+    } else if (/^https?:\/\/api\.allorigins\.win\/raw\?url=/i.test(current)) {
+      try {
+        next = new URL(current).searchParams.get('url');
+      } catch {}
+    }
+    if (next && /^https?:\/\//i.test(next) && next !== current) {
+      current = next.trim();
+    } else {
+      break;
+    }
+  }
+  return current;
+}
+
+function getHostnameSafe(urlStr) {
+  try {
+    return new URL(urlStr).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function buildHttpsMediaProxyCandidates(rawUrl, opts = {}) {
+  const cleanUrl = unwrapProxyTargetUrl(rawUrl);
+  if (!cleanUrl) return [];
+  const forceProxy = Boolean(opts?.forceProxy);
+  const includeTextProxies = Boolean(opts?.includeTextProxies);
+  const isInsecureHttp = /^http:\/\//i.test(cleanUrl);
+  const secureOrigin = isSecurePageOrigin();
+  const candidates = [];
+
+  if (isInsecureHttp && secureOrigin) {
+    if (!forceProxy) {
+      const host = getHostnameSafe(cleanUrl);
+      if (!host || !httpOnlyHosts.has(host)) {
+        candidates.push(cleanUrl.replace(/^http:\/\//i, 'https://'));
+      }
+    }
+  } else if (!forceProxy) {
+    candidates.push(cleanUrl);
+  }
+
+  if (/^https?:\/\//i.test(cleanUrl)) {
+    candidates.push(`https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`);
+    candidates.push(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`);
+    if (includeTextProxies) {
+      candidates.push(`https://api.cors.lol/?url=${encodeURIComponent(cleanUrl)}`);
+      candidates.push(`https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`);
+    }
+  } else if (candidates.length === 0) {
+    candidates.push(cleanUrl);
+  }
+
+  return [...new Set(candidates)];
+}
 
 // ==========================================
 // FORMAT DETECTION & AUTO-CONVERSION HELPERS
@@ -346,7 +432,8 @@ function detectVideoFormat(urlOrName, fallbackExt = 'mp4') {
   if (!urlOrName || typeof urlOrName !== 'string') {
     return fallback;
   }
-  const clean = urlOrName.trim().split('?')[0].split('#')[0].toLowerCase();
+  const unwrapped = unwrapProxyTargetUrl(urlOrName) || urlOrName;
+  const clean = unwrapped.trim().split('?')[0].split('#')[0].toLowerCase();
   const match = clean.match(VIDEO_EXT_END_REGEX);
   if (match && match[1]) {
     const ext = match[1].toLowerCase();
@@ -742,19 +829,21 @@ async function transcodeBlobWithMediaRecorder(sourceBlob, onProgress) {
 // Fetch video bytes with CORS proxy fallback, hard connection timeout, and live progress
 async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progressLabel = 'Downloading video...') {
   let response = null;
-  const candidateUrls = [
-    targetUrl,
-    `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`
-  ];
+  const cleanTarget = unwrapProxyTargetUrl(targetUrl) || targetUrl;
+  const isInsecureHttpTarget = /^http:\/\//i.test(cleanTarget);
+  const candidateUrls = buildHttpsMediaProxyCandidates(cleanTarget);
 
   for (const url of candidateUrls) {
+    const isHttpsUpgradeProbe =
+      isInsecureHttpTarget && /^https:\/\//i.test(url) && !/corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(url);
+    const timeoutMs = isHttpsUpgradeProbe ? 2500 : 8000;
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
     const timer = controller
       ? setTimeout(() => {
           try {
             controller.abort();
           } catch {}
-        }, 8000)
+        }, timeoutMs)
       : null;
     timer?.unref?.();
     try {
@@ -763,13 +852,27 @@ async function fetchVideoBlobWithProgress(targetUrl, mimeType, onProgress, progr
       if (res && res.ok) {
         const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
         if (ct.includes('text/html')) {
+          if (isHttpsUpgradeProbe) {
+            const h = getHostnameSafe(cleanTarget);
+            if (h) httpOnlyHosts.add(h);
+          }
           continue;
         }
         response = res;
         break;
       }
+      if (isHttpsUpgradeProbe) {
+        const h = getHostnameSafe(cleanTarget);
+        if (h) httpOnlyHosts.add(h);
+      } else if (res && (res.status === 404 || res.status === 410)) {
+        break;
+      }
     } catch {
       if (timer) clearTimeout(timer);
+      if (isHttpsUpgradeProbe) {
+        const h = getHostnameSafe(cleanTarget);
+        if (h) httpOnlyHosts.add(h);
+      }
       // try next candidate
     }
   }
@@ -1051,11 +1154,17 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
   if (assembledHls) {
     const hlsExt = assembledHls.ext || 'mp4';
     const hlsMime = assembledHls.mime || (hlsExt === 'ts' ? 'video/mp2t' : 'video/mp4');
+    if (hlsExt === 'mp4' && rawBlob) {
+      videoItem.convertedBlob = rawBlob;
+      if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+        videoItem.convertedBlobUrl = URL.createObjectURL(rawBlob);
+      }
+    }
     return {
       blob: rawBlob,
       ext: hlsExt,
       mime: hlsMime,
-      wasConverted: false
+      wasConverted: hlsExt === 'mp4'
     };
   }
 
@@ -2340,6 +2449,8 @@ function sanitizeVideoItemForStorage(videoItem) {
   delete copy.convertedBlobUrl;
   delete copy.offlineObjectUrl;
   delete copy._rehydratingOfflineBlob;
+  delete copy._streamRescueAttempted;
+  delete copy._hlsProxyFailed;
   return copy;
 }
 
@@ -2951,19 +3062,24 @@ async function fetchWithTimeout(url, timeoutMs = 4500) {
 
 // Fetch helper with parallel CORS proxy race for Reddit / third-party pages
 async function fetchWithCorsFallback(url, asText = false) {
-  try {
-    const directRes = await fetchWithTimeout(url, 3500);
-    if (directRes.ok) {
-      return asText ? await directRes.text() : await directRes.json();
+  const cleanUrl = unwrapProxyTargetUrl(url) || url;
+  const skipDirectMixedContent = isSecurePageOrigin() && /^http:\/\//i.test(cleanUrl);
+  if (!skipDirectMixedContent) {
+    try {
+      const directRes = await fetchWithTimeout(cleanUrl, 3500);
+      if (directRes.ok) {
+        return asText ? await directRes.text() : await directRes.json();
+      }
+    } catch {
+      // Direct fetch blocked by CORS or timed out; race CORS proxies in parallel
     }
-  } catch {
-    // Direct fetch blocked by CORS or timed out; race CORS proxies in parallel
   }
 
   const proxies = [
-    `https://api.cors.lol/?url=${encodeURIComponent(url)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+    `https://api.cors.lol/?url=${encodeURIComponent(cleanUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
+    `https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`
   ];
 
   const controllers = proxies.map(() => new AbortController());
@@ -4988,6 +5104,7 @@ function getEffectivePlaybackUrl(videoItem) {
     return videoItem.offlineObjectUrl;
   }
   if (videoItem.convertedBlobUrl) return videoItem.convertedBlobUrl;
+  if (videoItem.proxiedStreamUrl) return videoItem.proxiedStreamUrl;
 
   const ext = (videoItem.format || detectVideoFormat(videoItem.videoUrl).ext).toLowerCase();
   const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
@@ -5340,6 +5457,330 @@ async function pullMoreLikeThis(videoItem = videoQueue[currentIndex]) {
   return query;
 }
 
+const HLS_JS_CDN_URL = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js';
+let hlsEngineLoadingPromise = null;
+let activeHlsState = null;
+
+function detachActiveHlsPlayer(targetVideoEl = null) {
+  if (!activeHlsState) return;
+  const state = activeHlsState;
+  activeHlsState = null;
+  try {
+    state.hls?.destroy?.();
+  } catch {}
+  const el = targetVideoEl || state.videoEl;
+  if (el && typeof el._prevDisableRemotePlayback === 'boolean') {
+    el.disableRemotePlayback = el._prevDisableRemotePlayback;
+    delete el._prevDisableRemotePlayback;
+  }
+}
+
+async function loadHlsJsEngine() {
+  if (globalThis.Hls) return globalThis.Hls;
+  if (typeof window !== 'undefined' && window.Hls) return window.Hls;
+  if (
+    typeof document === 'undefined' ||
+    typeof document.createElement !== 'function' ||
+    !document.head ||
+    typeof document.head.appendChild !== 'function'
+  ) {
+    return null;
+  }
+  if (hlsEngineLoadingPromise) return hlsEngineLoadingPromise;
+
+  hlsEngineLoadingPromise = (async () => {
+    let timer = null;
+    try {
+      await Promise.race([
+        loadScriptOnce(HLS_JS_CDN_URL),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('HLS engine load timed out')), 4500);
+          timer.unref?.();
+        })
+      ]);
+      return globalThis.Hls || (typeof window !== 'undefined' ? window.Hls : null) || null;
+    } catch {
+      hlsEngineLoadingPromise = null;
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  })();
+
+  return hlsEngineLoadingPromise;
+}
+
+// Custom hls.js Loader that routes HTTP-only and hotlink-blocked manifests, keys, init headers & segments over HTTPS proxies
+function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
+  const forceProxy = Boolean(loaderOpts?.forceProxy);
+
+  return class HttpsProxyHlsLoader {
+    constructor() {
+      this.controller = null;
+      this.stats = {
+        aborted: false,
+        loaded: 0,
+        retry: 0,
+        total: 0,
+        chunkCount: 0,
+        bwEstimate: 0,
+        loading: { start: 0, first: 0, end: 0 },
+        parsing: { start: 0, end: 0 },
+        buffering: { start: 0, first: 0, end: 0 }
+      };
+    }
+
+    destroy() {
+      this.abort();
+    }
+
+    abort() {
+      this.stats.aborted = true;
+      try {
+        this.controller?.abort?.();
+      } catch {}
+    }
+
+    load(context, _config, callbacks) {
+      const targetUrl = context?.url || '';
+      const isBinary = context?.responseType === 'arraybuffer';
+      const hasByteRange =
+        Number.isFinite(context?.rangeStart) &&
+        Number.isFinite(context?.rangeEnd) &&
+        context.rangeEnd > context.rangeStart;
+
+      this.stats.aborted = false;
+      const startNow = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      this.stats.loading.start = startNow;
+
+      (async () => {
+        const cleanUrl = unwrapProxyTargetUrl(targetUrl) || targetUrl;
+        const isInsecureHttp = /^http:\/\//i.test(cleanUrl);
+        const candidates = buildHttpsMediaProxyCandidates(cleanUrl, {
+          forceProxy,
+          includeTextProxies: !isBinary
+        });
+
+        let lastStatus = 0;
+
+        for (const candidateUrl of candidates) {
+          if (this.stats.aborted) return;
+
+          const isProxyCandidate = /corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(candidateUrl);
+          const isHttpsUpgradeProbe = isInsecureHttp && !isProxyCandidate && /^https:\/\//i.test(candidateUrl);
+          const timeoutMs = isHttpsUpgradeProbe ? 2000 : 8000;
+
+          const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+          this.controller = controller;
+          const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+          timer?.unref?.();
+
+          try {
+            const fetchInit = {};
+            if (controller) fetchInit.signal = controller.signal;
+            // Avoid custom Range headers on third-party CORS proxies to prevent OPTIONS preflight rejections; slice buffer below instead
+            if (hasByteRange && !isProxyCandidate) {
+              fetchInit.headers = {
+                Range: `bytes=${context.rangeStart}-${context.rangeEnd - 1}`
+              };
+            }
+
+            const res = await fetch(candidateUrl, fetchInit);
+            if (timer) clearTimeout(timer);
+            if (this.stats.aborted) return;
+
+            lastStatus = res?.status || 0;
+            if (!res || !res.ok) {
+              if (isHttpsUpgradeProbe) {
+                const h = getHostnameSafe(cleanUrl);
+                if (h) httpOnlyHosts.add(h);
+              } else if (lastStatus === 404 || lastStatus === 410) {
+                break;
+              }
+              continue;
+            }
+
+            const firstNow = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+            this.stats.loading.first = firstNow;
+            const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
+
+            if (isBinary) {
+              if (ct.includes('text/html')) {
+                if (isHttpsUpgradeProbe) {
+                  const h = getHostnameSafe(cleanUrl);
+                  if (h) httpOnlyHosts.add(h);
+                }
+                continue;
+              }
+              let buf = await res.arrayBuffer();
+              if (this.stats.aborted) return;
+              if (!buf || buf.byteLength === 0) continue;
+              if (hasByteRange && res.status === 200 && buf.byteLength >= context.rangeEnd) {
+                buf = buf.slice(context.rangeStart, context.rangeEnd);
+              }
+              const endNow = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+              this.stats.loading.end = endNow;
+              this.stats.loaded = buf.byteLength;
+              this.stats.total = buf.byteLength;
+              this.stats.chunkCount = 1;
+              // Preserve original context.url so hls.js resolves all relative segments/keys against the true upstream directory
+              callbacks?.onSuccess?.({ url: targetUrl, data: buf }, this.stats, context, res);
+              return;
+            } else {
+              const text = await res.text();
+              if (this.stats.aborted) return;
+              if (!text || ct.includes('text/html') || !/#EXTM3U|#EXT-X-|#EXTINF/i.test(text)) {
+                if (isHttpsUpgradeProbe) {
+                  const h = getHostnameSafe(cleanUrl);
+                  if (h) httpOnlyHosts.add(h);
+                }
+                continue;
+              }
+              const endNow = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+              this.stats.loading.end = endNow;
+              this.stats.loaded = text.length;
+              this.stats.total = text.length;
+              this.stats.chunkCount = 1;
+              callbacks?.onSuccess?.({ url: targetUrl, data: text }, this.stats, context, res);
+              return;
+            }
+          } catch {
+            if (timer) clearTimeout(timer);
+            if (isHttpsUpgradeProbe) {
+              const h = getHostnameSafe(cleanUrl);
+              if (h) httpOnlyHosts.add(h);
+            }
+          }
+        }
+
+        if (!this.stats.aborted) {
+          callbacks?.onError?.(
+            { code: lastStatus || 0, text: 'HLS HTTPS proxy load failed' },
+            context,
+            null,
+            this.stats
+          );
+        }
+      })();
+    }
+  };
+}
+
+// Stream HTTP-only or blocked multi-part .m3u8 playlists via hls.js (ManagedMediaSource / MediaSource), with snippet-stitch fallback
+async function startProxiedHlsPlayback(videoEl, videoItem, m3u8Url, opts = {}) {
+  if (!videoEl || !videoItem || !m3u8Url) return false;
+  const cleanM3u8 = unwrapProxyTargetUrl(m3u8Url) || m3u8Url;
+
+  if (
+    activeHlsState &&
+    activeHlsState.videoEl === videoEl &&
+    activeHlsState.sourceUrl === cleanM3u8 &&
+    activeHlsState.item === videoItem
+  ) {
+    return true;
+  }
+
+  detachActiveHlsPlayer(videoEl);
+
+  const HlsClass = await loadHlsJsEngine();
+  if (videoQueue[currentIndex] !== videoItem) return false;
+
+  if (HlsClass && typeof HlsClass.isSupported === 'function' && HlsClass.isSupported()) {
+    const LoaderClass = createHttpsProxyHlsLoaderClass({ forceProxy: Boolean(opts?.forceProxy) });
+    const hls = new HlsClass({
+      loader: LoaderClass,
+      enableWorker: true,
+      lowLatencyMode: false,
+      backBufferLength: 30,
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60
+    });
+
+    if (typeof videoEl._prevDisableRemotePlayback !== 'boolean') {
+      videoEl._prevDisableRemotePlayback = Boolean(videoEl.disableRemotePlayback);
+    }
+    // Required by WebKit on iPhone Safari so ManagedMediaSource attaches cleanly
+    videoEl.disableRemotePlayback = true;
+
+    const state = {
+      hls,
+      videoEl,
+      sourceUrl: cleanM3u8,
+      item: videoItem,
+      recoveredMediaError: false,
+      retriedNetwork: false
+    };
+    activeHlsState = state;
+
+    const manifestParsedEvent = HlsClass.Events?.MANIFEST_PARSED || 'hlsManifestParsed';
+    const errorEvent = HlsClass.Events?.ERROR || 'hlsError';
+
+    hls.on(manifestParsedEvent, () => {
+      if (activeHlsState !== state || videoQueue[currentIndex] !== videoItem) return;
+      videoEl.playbackRate = settings.playbackSpeed || 1;
+      const savedTime = typeof opts?.savedTime === 'number' ? opts.savedTime : getSavedPlaybackTime(videoItem);
+      if (savedTime > 0) {
+        try {
+          videoEl.currentTime = savedTime;
+        } catch {}
+      }
+      if (settings.autoPlay && !opts?.isLockedOverlay) {
+        videoEl.play?.()?.catch?.((err) => {
+          if (err?.name === 'NotAllowedError') clearPlaybackStartupWatchdog();
+        });
+      }
+    });
+
+    hls.on(errorEvent, (_evt, data) => {
+      if (activeHlsState !== state || !data?.fatal) return;
+      const mediaErrType = HlsClass.ErrorTypes?.MEDIA_ERROR || 'mediaError';
+      const netErrType = HlsClass.ErrorTypes?.NETWORK_ERROR || 'networkError';
+
+      if (data.type === mediaErrType && !state.recoveredMediaError && typeof hls.recoverMediaError === 'function') {
+        state.recoveredMediaError = true;
+        try {
+          hls.recoverMediaError();
+          return;
+        } catch {}
+      }
+      if (data.type === netErrType && !state.retriedNetwork && typeof hls.startLoad === 'function') {
+        state.retriedNetwork = true;
+        try {
+          hls.startLoad();
+          return;
+        } catch {}
+      }
+
+      detachActiveHlsPlayer(videoEl);
+      videoItem._hlsProxyFailed = true;
+      if (videoQueue[currentIndex] === videoItem && !isHandlingPlaybackError) {
+        handleVideoPlaybackError({ reason: 'hls-fatal' }).catch?.(() => {});
+      }
+    });
+
+    hls.loadSource(cleanM3u8);
+    hls.attachMedia(videoEl);
+
+    if (settings.autoPlay && !opts?.isLockedOverlay) {
+      armPlaybackStartupWatchdog(videoEl, videoItem, cleanM3u8);
+    } else {
+      clearPlaybackStartupWatchdog();
+    }
+    return true;
+  }
+
+  // Fallback for pre-iOS 17.1 devices without ManagedMediaSource: stitch .m3u8 segments over HTTPS proxy into a playable Blob
+  if (!videoItem.convertedBlobUrl && videoEl.dataset?.autoConvertAttempted !== 'true') {
+    if (videoEl.dataset) videoEl.dataset.autoConvertAttempted = 'true';
+    const stitchedOk = await convertCurrentVideoForPlayer(videoItem);
+    if (stitchedOk) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function updatePlayerUI() {
   const videoEl = document.getElementById('mainVideo');
   const titleEl = document.getElementById('videoTitle');
@@ -5402,6 +5843,7 @@ function updatePlayerUI() {
     convertNowBtn?.classList.add('hidden');
     if (videoEl) {
       clearPlaybackStartupWatchdog();
+      detachActiveHlsPlayer(videoEl);
       try {
         videoEl.pause?.();
       } catch {}
@@ -5499,7 +5941,42 @@ function updatePlayerUI() {
     current._rehydratingOfflineBlob && !(current.offlineBlob instanceof Blob)
   );
   if (videoEl && !awaitingOfflineRehydrate) {
-    if (videoEl.src !== targetPlayUrl) {
+    const currentExt = (current.format || detectVideoFormat(current.videoUrl).ext).toLowerCase();
+    const shouldUseManagedHls =
+      currentExt === 'm3u8' &&
+      !current._hlsProxyFailed &&
+      !current.convertedBlobUrl &&
+      !(current.offlineBlob instanceof Blob) &&
+      (Boolean(current._forceProxiedHls) ||
+        (isSecurePageOrigin() && /^http:\/\//i.test(targetPlayUrl)) ||
+        (typeof videoEl.canPlayType === 'function' &&
+          !videoEl.canPlayType('application/vnd.apple.mpegurl') &&
+          !videoEl.canPlayType('application/x-mpegURL')));
+
+    if (shouldUseManagedHls) {
+      if (
+        !activeHlsState ||
+        activeHlsState.videoEl !== videoEl ||
+        activeHlsState.item !== current ||
+        activeHlsState.sourceUrl !== (unwrapProxyTargetUrl(targetPlayUrl) || targetPlayUrl)
+      ) {
+        if (videoEl.dataset) {
+          videoEl.dataset.autoConvertAttempted = 'false';
+          videoEl.dataset.triedConvertedUrl = 'false';
+          videoEl.dataset.streamRescueAttempted = current._streamRescueAttempted ? 'true' : 'false';
+        }
+        if ((current.isNsfw || current.over_18 || settings.allowNsfw) && settings.autoMuteNsfw) {
+          videoEl.muted = true;
+        }
+        startProxiedHlsPlayback(videoEl, current, targetPlayUrl, {
+          forceProxy: Boolean(current._forceProxiedHls),
+          savedTime,
+          isLockedOverlay
+        }).catch?.(() => {});
+      }
+      videoEl.playbackRate = settings.playbackSpeed || 1;
+    } else if (videoEl.src !== targetPlayUrl) {
+      detachActiveHlsPlayer(videoEl);
       if (videoEl.dataset) {
         videoEl.dataset.autoConvertAttempted = 'false';
         videoEl.dataset.triedConvertedUrl = 'false';
@@ -5706,8 +6183,114 @@ function recordDeadStreamUrl(url, originSourceId = null) {
 
 const STREAM_RESCUE_TIMEOUT_MS = 3500;
 const PROXY_BLOB_SALVAGE_MAX_BYTES = 25 * 1024 * 1024;
+const PROXY_BLOB_READ_WINDOW_MS = 1500;
 
-// Attempt to salvage the exact video when its initial CDN URL expired, was cache-purged, or hotlink-blocked
+// Read small clips into an in-memory Blob, or immediately switch to progressive HTTPS streaming if >25 MB or chunked-large
+async function readBoundedProxyBlobOrStream(res, fallbackMime, maxBytes = PROXY_BLOB_SALVAGE_MAX_BYTES, maxReadMs = PROXY_BLOB_READ_WINDOW_MS) {
+  const declaredLen = Number(res.headers?.get?.('content-length')) || 0;
+  if (declaredLen > maxBytes) {
+    try {
+      await res.body?.cancel?.();
+    } catch {}
+    return { mode: 'stream' };
+  }
+
+  const reader = typeof res.body?.getReader === 'function' ? res.body.getReader() : null;
+  if (reader) {
+    const chunks = [];
+    let received = 0;
+    const startedAt = Date.now();
+    try {
+      while (true) {
+        const remainingMs = maxReadMs - (Date.now() - startedAt);
+        if (remainingMs <= 0) {
+          try {
+            await reader.cancel();
+          } catch {}
+          return { mode: 'stream' };
+        }
+        let readTimer = null;
+        const step = await Promise.race([
+          reader.read(),
+          new Promise((resolve) => {
+            readTimer = setTimeout(() => resolve({ timedOut: true }), remainingMs);
+            readTimer.unref?.();
+          })
+        ]);
+        if (readTimer) clearTimeout(readTimer);
+        if (step?.timedOut) {
+          try {
+            await reader.cancel();
+          } catch {}
+          return { mode: 'stream' };
+        }
+        if (step.done) break;
+        const chunk = step.value;
+        if (chunk) {
+          received += chunk.byteLength || chunk.length || 0;
+          if (received > maxBytes) {
+            chunks.length = 0;
+            try {
+              await reader.cancel();
+            } catch {}
+            return { mode: 'stream' };
+          }
+          chunks.push(chunk);
+        }
+      }
+    } catch {
+      try {
+        await reader.cancel();
+      } catch {}
+      return { mode: 'stream' };
+    }
+
+    if (received > 1024) {
+      const blob = new Blob(chunks, { type: fallbackMime || 'video/mp4' });
+      if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+        const blobUrl = URL.createObjectURL(blob);
+        if (blobUrl) return { mode: 'blob', blobUrl };
+      }
+    }
+    return null;
+  }
+
+  if (typeof res.blob === 'function') {
+    let blobTimer = null;
+    try {
+      const rawBlob = await Promise.race([
+        res.blob(),
+        new Promise((resolve) => {
+          blobTimer = setTimeout(() => resolve('__TIMEOUT__'), maxReadMs);
+          blobTimer.unref?.();
+        })
+      ]);
+      if (rawBlob === '__TIMEOUT__') {
+        return { mode: 'stream' };
+      }
+      if (rawBlob && rawBlob.size > maxBytes) {
+        return { mode: 'stream' };
+      }
+      if (rawBlob && rawBlob.size > 1024) {
+        const typedBlob = rawBlob.type?.startsWith('video/')
+          ? rawBlob
+          : new Blob([rawBlob], { type: fallbackMime || 'video/mp4' });
+        if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+          const blobUrl = URL.createObjectURL(typedBlob);
+          if (blobUrl) return { mode: 'blob', blobUrl };
+        }
+      }
+    } catch {
+      return { mode: 'stream' };
+    } finally {
+      if (blobTimer) clearTimeout(blobTimer);
+    }
+  }
+
+  return null;
+}
+
+// Attempt to salvage the exact video when its initial CDN URL expired, was cache-purged, HTTP-only, or hotlink-blocked
 async function rescueDeadVideoStream(videoItem, opts = {}) {
   if (!videoItem || typeof videoItem !== 'object') return null;
   if (videoItem._streamRescueAttempted) return null;
@@ -5715,10 +6298,13 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
 
   const pageUrl = typeof videoItem.pageUrl === 'string' ? videoItem.pageUrl.trim() : '';
   const origUrl = typeof videoItem.originalUrl === 'string' ? videoItem.originalUrl.trim() : '';
+  const rawVideoUrl = typeof videoItem.videoUrl === 'string' ? videoItem.videoUrl.trim() : '';
+  const isInsecureHttpStream = /^http:\/\//i.test(rawVideoUrl);
   const itemId = String(videoItem.id || '');
   const hasOriginHint =
     Boolean(pageUrl) ||
-    /redgifs\.com/i.test(`${origUrl} ${videoItem.videoUrl || ''}`) ||
+    isInsecureHttpStream ||
+    /redgifs\.com/i.test(`${origUrl} ${rawVideoUrl}`) ||
     /^(?:rg|masto|pt|ep)-/i.test(itemId);
 
   if (!hasOriginHint) return null;
@@ -5745,7 +6331,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
   const workPromise = (async () => {
     // 1. RedGIFs: clear stale bearer token and mint fresh signed HD/SD stream URLs
     const rgId =
-      extractRedgifsId(pageUrl || origUrl || videoItem.videoUrl || '') ||
+      extractRedgifsId(pageUrl || origUrl || rawVideoUrl) ||
       (itemId.startsWith('rg-') ? itemId.slice(3) : null);
     if (rgId) {
       cachedRedgifsToken = null;
@@ -5876,7 +6462,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
     // 5. Archive.org item metadata: switch to an alternate non-private MP4/MOV derivative in the same item
     const iaMatch =
       pageUrl.match(/archive\.org\/details\/([^/?#]+)/i) ||
-      String(videoItem.videoUrl || '').match(/archive\.org\/download\/([^/?#]+)\//i);
+      rawVideoUrl.match(/archive\.org\/download\/([^/?#]+)\//i);
     if (iaMatch?.[1] && pageUrl) {
       try {
         const iaId = iaMatch[1];
@@ -5943,49 +6529,112 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
       } catch {}
     }
 
-    // 7. Hotlink / Referer block bypass: if <video> failed fast (not timeout), pull bytes via CORS proxy into a local blob: URL
-    const hotlinkTarget = videoItem.videoUrl;
+    // 7. Hotlink / Referer / Strictly HTTP-only bypass:
+    //    - Multi-part .m3u8 streams on HTTP-only or hotlink-blocked servers -> stream via HTTPS-proxied HLS engine
+    //    - Small clips (<=25 MB) -> in-memory blob: URL
+    //    - Large videos (>25 MB, unlimited size) -> progressive HTTPS proxy stream URL (zero RAM freeze!)
+    const hotlinkTarget = unwrapProxyTargetUrl(rawVideoUrl) || rawVideoUrl;
     if (
-      opts?.reason !== 'timeout' &&
-      typeof URL !== 'undefined' &&
-      typeof URL.createObjectURL === 'function' &&
+      (opts?.reason !== 'timeout' || isInsecureHttpStream) &&
       typeof hotlinkTarget === 'string' &&
       /^https?:\/\//i.test(hotlinkTarget) &&
       !/^https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/[^?]+$/i.test(hotlinkTarget) &&
       !/^https?:\/\/gvideo\.eporner\.com\//i.test(hotlinkTarget)
     ) {
-      const proxyController = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const proxyTimer = proxyController ? setTimeout(() => proxyController.abort(), 2500) : null;
-      proxyTimer?.unref?.();
-      try {
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(hotlinkTarget)}`;
-        const pRes = proxyController
-          ? await fetch(proxyUrl, { signal: proxyController.signal })
-          : await fetch(proxyUrl);
-        if (pRes && pRes.ok) {
-          const ct = String(pRes.headers?.get?.('content-type') || '').toLowerCase();
-          const len = Number(pRes.headers?.get?.('content-length')) || 0;
-          if (
-            !ct.includes('text/html') &&
-            !ct.includes('application/json') &&
-            (ct.startsWith('video/') || ct === 'application/octet-stream' || /\.mp4(\?|$)/i.test(hotlinkTarget)) &&
-            (len === 0 || len <= PROXY_BLOB_SALVAGE_MAX_BYTES) &&
-            typeof pRes.blob === 'function'
-          ) {
-            const rawBlob = await pRes.blob();
-            if (rawBlob && rawBlob.size > 1024 && rawBlob.size <= PROXY_BLOB_SALVAGE_MAX_BYTES) {
-              const typedBlob = rawBlob.type?.startsWith('video/')
-                ? rawBlob
-                : new Blob([rawBlob], { type: 'video/mp4' });
-              const blobUrl = URL.createObjectURL(typedBlob);
-              if (blobUrl) {
-                return { blobUrl };
+      const targetFmt = detectVideoFormat(hotlinkTarget, videoItem.format || 'mp4');
+
+      // 7A. Multi-part HLS (.m3u8) on strictly HTTP-only or Referer-blocked hosts
+      if (targetFmt.ext === 'm3u8') {
+        try {
+          const manifestPreview = await fetchWithCorsFallback(hotlinkTarget, true);
+          if (typeof manifestPreview === 'string' && /#EXTM3U|#EXT-X-|#EXTINF/i.test(manifestPreview)) {
+            return {
+              useProxiedHls: true,
+              videoUrl: hotlinkTarget,
+              format: 'm3u8'
+            };
+          }
+        } catch {}
+      } else {
+        // 7B. Direct video file: if HTTP-only, first check whether direct HTTPS upgrade works
+        if (isInsecureHttpStream) {
+          const host = getHostnameSafe(hotlinkTarget);
+          const upgradedHttps = hotlinkTarget.replace(/^http:\/\//i, 'https://');
+          if (!deadUrls.has(upgradedHttps) && (!host || !httpOnlyHosts.has(host))) {
+            const upController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const upTimer = upController ? setTimeout(() => upController.abort(), 1400) : null;
+            upTimer?.unref?.();
+            try {
+              const upRes = await fetch(
+                upgradedHttps,
+                upController
+                  ? { headers: { Range: 'bytes=0-1' }, signal: upController.signal }
+                  : { headers: { Range: 'bytes=0-1' } }
+              );
+              if (upRes && upRes.ok) {
+                const upCt = String(upRes.headers?.get?.('content-type') || '').toLowerCase();
+                if (
+                  !upCt.includes('text/html') &&
+                  !upCt.includes('application/json') &&
+                  (upCt.startsWith('video/') || upCt === 'application/octet-stream' || VIDEO_EXT_END_REGEX.test(upgradedHttps.split('?')[0]))
+                ) {
+                  try {
+                    await upRes.body?.cancel?.();
+                  } catch {}
+                  return { videoUrl: upgradedHttps, format: targetFmt.ext };
+                }
               }
+              if (host) httpOnlyHosts.add(host);
+            } catch {
+              if (host) httpOnlyHosts.add(host);
+            } finally {
+              if (upTimer) clearTimeout(upTimer);
             }
           }
         }
-      } catch {} finally {
-        if (proxyTimer) clearTimeout(proxyTimer);
+
+        const proxyUrls = [
+          `https://corsproxy.io/?${encodeURIComponent(hotlinkTarget)}`,
+          `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(hotlinkTarget)}`
+        ];
+
+        for (const proxyUrl of proxyUrls) {
+          const proxyController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+          const proxyTimer = proxyController ? setTimeout(() => proxyController.abort(), 2500) : null;
+          proxyTimer?.unref?.();
+          try {
+            const pRes = proxyController
+              ? await fetch(proxyUrl, { signal: proxyController.signal })
+              : await fetch(proxyUrl);
+            if (pRes && (pRes.status === 404 || pRes.status === 410)) {
+              break;
+            }
+            if (pRes && pRes.ok) {
+              const ct = String(pRes.headers?.get?.('content-type') || '').toLowerCase();
+              const cleanPath = hotlinkTarget.split('?')[0].split('#')[0];
+              if (
+                !ct.includes('text/html') &&
+                !ct.includes('application/json') &&
+                (ct.startsWith('video/') || ct === 'application/octet-stream' || VIDEO_EXT_END_REGEX.test(cleanPath))
+              ) {
+                const salvaged = await readBoundedProxyBlobOrStream(
+                  pRes,
+                  targetFmt.mime || 'video/mp4',
+                  PROXY_BLOB_SALVAGE_MAX_BYTES,
+                  PROXY_BLOB_READ_WINDOW_MS
+                );
+                if (salvaged?.mode === 'blob' && salvaged.blobUrl) {
+                  return { blobUrl: salvaged.blobUrl };
+                }
+                if (salvaged?.mode === 'stream') {
+                  return { proxiedStreamUrl: proxyUrl, format: targetFmt.ext };
+                }
+              }
+            }
+          } catch {} finally {
+            if (proxyTimer) clearTimeout(proxyTimer);
+          }
+        }
       }
     }
 
@@ -6029,6 +6678,7 @@ async function handleVideoPlaybackError(opts = {}) {
     ) {
       if (current.videoUrl) recordDeadStreamUrl(current.videoUrl);
       if (videoEl.dataset) videoEl.dataset.triedConvertedUrl = 'true';
+      detachActiveHlsPlayer(videoEl);
       videoEl.src = current.convertedUrl;
       videoEl.load?.();
       armPlaybackStartupWatchdog(videoEl, current, current.convertedUrl);
@@ -6060,7 +6710,7 @@ async function handleVideoPlaybackError(opts = {}) {
     if (current.videoUrl) recordDeadStreamUrl(current.videoUrl);
     if (current.convertedUrl) recordDeadStreamUrl(current.convertedUrl);
 
-    // 2.5. Live Stream Rescue (~3.5s cap): re-mint fresh signed URLs from pageUrl/API or salvage hotlink-blocked bytes
+    // 2.5. Live Stream Rescue (~3.5s cap): re-mint fresh signed URLs, attach HTTPS-proxied HLS, or stream/salvage via HTTPS proxy
     if (!current._streamRescueAttempted && videoEl.dataset?.streamRescueAttempted !== 'true') {
       if (videoEl.dataset) videoEl.dataset.streamRescueAttempted = 'true';
       const rescued = await rescueDeadVideoStream(current, opts);
@@ -6073,7 +6723,24 @@ async function handleVideoPlaybackError(opts = {}) {
           }
           return true;
         }
+        if (rescued.useProxiedHls) {
+          if (current.videoUrl) deadUrls.delete(current.videoUrl);
+          current._forceProxiedHls = true;
+          const hlsStarted = await startProxiedHlsPlayback(
+            videoEl,
+            current,
+            rescued.videoUrl || current.videoUrl,
+            { forceProxy: true }
+          );
+          if (hlsStarted) {
+            consecutiveErrorSkips = 0;
+            savePlaybackState();
+            showToast('Streaming .M3U8 via HTTPS proxy — playing now!');
+            return true;
+          }
+        }
         if (rescued.blobUrl) {
+          if (current.videoUrl) deadUrls.delete(current.videoUrl);
           if (
             current.convertedBlobUrl &&
             current.convertedBlobUrl !== rescued.blobUrl &&
@@ -6086,6 +6753,7 @@ async function handleVideoPlaybackError(opts = {}) {
           }
           current.convertedBlobUrl = rescued.blobUrl;
           current.isAutoConverted = true;
+          detachActiveHlsPlayer(videoEl);
           clearPlaybackStartupWatchdog();
           videoEl.src = rescued.blobUrl;
           videoEl.load?.();
@@ -6097,15 +6765,51 @@ async function handleVideoPlaybackError(opts = {}) {
           showToast('Recovered blocked stream — playing now!');
           return true;
         }
+        if (rescued.proxiedStreamUrl) {
+          if (current.videoUrl) deadUrls.delete(current.videoUrl);
+          current.proxiedStreamUrl = rescued.proxiedStreamUrl;
+          if (rescued.format) {
+            current.format = rescued.format;
+          }
+          detachActiveHlsPlayer(videoEl);
+          videoEl.src = rescued.proxiedStreamUrl;
+          videoEl.load?.();
+          armPlaybackStartupWatchdog(videoEl, current, rescued.proxiedStreamUrl);
+          if (settings.autoPlay) {
+            videoEl.play?.()?.catch?.((err) => {
+              if (err?.name === 'NotAllowedError') clearPlaybackStartupWatchdog();
+            });
+          }
+          savePlaybackState();
+          showToast('Streaming via HTTPS proxy — playing now!');
+          return true;
+        }
         if (rescued.videoUrl) {
           current.videoUrl = rescued.videoUrl;
           current.convertedUrl = rescued.convertedUrl || null;
+          current.proxiedStreamUrl = null;
           if (rescued.format) {
             current.format = rescued.format;
           }
           if (videoEl.dataset) {
             videoEl.dataset.triedConvertedUrl = rescued.convertedUrl ? 'false' : 'true';
           }
+          if (
+            rescued.format === 'm3u8' &&
+            isSecurePageOrigin() &&
+            /^http:\/\//i.test(rescued.videoUrl)
+          ) {
+            current._forceProxiedHls = true;
+            const hlsStarted = await startProxiedHlsPlayback(videoEl, current, rescued.videoUrl, {
+              forceProxy: true
+            });
+            if (hlsStarted) {
+              savePlaybackState();
+              showToast('Refreshed .M3U8 stream — playing now!');
+              return true;
+            }
+          }
+          detachActiveHlsPlayer(videoEl);
           videoEl.src = rescued.videoUrl;
           videoEl.load?.();
           armPlaybackStartupWatchdog(videoEl, current, rescued.videoUrl);
@@ -6181,6 +6885,7 @@ async function handleVideoPlaybackError(opts = {}) {
     }
 
     // Clear stale broken frame before pulling a fresh clip
+    detachActiveHlsPlayer(videoEl);
     try {
       videoEl.pause?.();
       if (typeof videoEl.removeAttribute === 'function') {
@@ -8303,6 +9008,11 @@ if (typeof module !== 'undefined' && module.exports) {
     clearPlaybackStartupWatchdog,
     recordDeadStreamUrl,
     rescueDeadVideoStream,
+    unwrapProxyTargetUrl,
+    buildHttpsMediaProxyCandidates,
+    createHttpsProxyHlsLoaderClass,
+    startProxiedHlsPlayback,
+    detachActiveHlsPlayer,
     isStaleOrDisallowedRestoredItem,
     upgradeUnsignedRedgifsItems,
     setNsfwPin,
@@ -8353,6 +9063,7 @@ if (typeof module !== 'undefined' && module.exports) {
       }
       if (Array.isArray(patch.videoQueue)) {
         clearPlaybackStartupWatchdog();
+        detachActiveHlsPlayer();
         const nextSet = new Set(patch.videoQueue);
         revokeVideoItemBlobUrls(videoQueue.filter((item) => !nextSet.has(item)));
         videoQueue = patch.videoQueue;
@@ -8361,6 +9072,7 @@ if (typeof module !== 'undefined' && module.exports) {
         if (patch.videoQueue.length === 0) {
           seenUrls.clear();
           deadUrls.clear();
+          httpOnlyHosts.clear();
           if (!patch.playbackPositions) {
             playbackPositions = {};
           }

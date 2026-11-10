@@ -2811,6 +2811,406 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('should progressively stream >25 MB (500 MB) and chunked-large HTTP-only videos via HTTPS proxy without buffering into RAM', async () => {
+      const {
+        getEffectivePlaybackUrl,
+        unwrapProxyTargetUrl,
+        detectVideoFormat
+      } = require('../app.js');
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+      const prevWin = globalThis.window;
+
+      let bodyCancelled = false;
+      let blobCalled = false;
+      let chunkReaderCancelled = false;
+
+      const mockVideoEl = {
+        src: 'http://legacy-cinema.example/films/feature_500mb.mp4',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.window = { location: { protocol: 'https:', href: 'https://davidscottballard1-png.github.io/my-project-2/' } };
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        // Simulate strictly HTTP-only host: direct HTTPS port 443 refuses connection
+        if (u.startsWith('https://legacy-cinema.example/')) {
+          throw new Error('ECONNREFUSED port 443');
+        }
+        if (u.startsWith('https://corsproxy.io/?')) {
+          const decoded = decodeURIComponent(u.slice('https://corsproxy.io/?'.length));
+          if (decoded.endsWith('feature_500mb.mp4')) {
+            return {
+              ok: true,
+              status: 200,
+              headers: {
+                get: (h) => {
+                  if (h.toLowerCase() === 'content-type') return 'video/mp4';
+                  if (h.toLowerCase() === 'content-length') return String(500 * 1024 * 1024); // 500 MB
+                  return null;
+                }
+              },
+              body: {
+                cancel: async () => {
+                  bodyCancelled = true;
+                }
+              },
+              blob: async () => {
+                blobCalled = true;
+                throw new Error('Must NOT buffer 500 MB into JS RAM');
+              }
+            };
+          }
+          if (decoded.endsWith('chunked_live_100mb.mp4')) {
+            let chunksSent = 0;
+            const tenMbChunk = new Uint8Array(10 * 1024 * 1024);
+            return {
+              ok: true,
+              status: 200,
+              headers: {
+                get: (h) => (h.toLowerCase() === 'content-type' ? 'video/mp4' : null) // No Content-Length!
+              },
+              body: {
+                getReader: () => ({
+                  read: async () => {
+                    chunksSent++;
+                    return { done: false, value: tenMbChunk };
+                  },
+                  cancel: async () => {
+                    chunkReaderCancelled = true;
+                  }
+                })
+              }
+            };
+          }
+        }
+        return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        const bigHttpClip = {
+          id: 'http-500mb',
+          title: '500 MB HTTP-Only Feature Film',
+          videoUrl: 'http://legacy-cinema.example/films/feature_500mb.mp4',
+          format: 'mp4'
+        };
+        setAppState({ videoQueue: [bigHttpClip], currentIndex: 0 });
+
+        // Simulate Safari Mixed-Content port-443 autoupgrade timeout
+        const recovered = await handleVideoPlaybackError({ reason: 'timeout' });
+        assert.strictEqual(recovered, true, '500 MB HTTP-only video should be rescued even after port-443 timeout');
+        assert.strictEqual(bodyCancelled, true, 'Fetch body must be cancelled immediately so 0 MB is buffered in JS RAM');
+        assert.strictEqual(blobCalled, false, 'res.blob() must never be called on >25 MB streams');
+        assert.strictEqual(
+          mockVideoEl.src,
+          'https://corsproxy.io/?http%3A%2F%2Flegacy-cinema.example%2Ffilms%2Ffeature_500mb.mp4',
+          'Player should progressively stream directly from HTTPS proxy URL'
+        );
+        assert.strictEqual(
+          bigHttpClip.videoUrl,
+          'http://legacy-cinema.example/films/feature_500mb.mp4',
+          'Canonical videoUrl must remain unwrapped for downloads/Vault'
+        );
+        assert.strictEqual(getEffectivePlaybackUrl(bigHttpClip), mockVideoEl.src);
+        assert.strictEqual(unwrapProxyTargetUrl(mockVideoEl.src), bigHttpClip.videoUrl);
+        assert.strictEqual(detectVideoFormat(mockVideoEl.src).ext, 'mp4');
+        assert.strictEqual(getAppState().deadUrls.has(bigHttpClip.videoUrl), false, 'Rescued URL must not stay blacklisted');
+
+        // Also verify chunked stream (no Content-Length) exceeding 25 MB aborts reader and switches to progressive stream
+        const chunkedClip = {
+          id: 'http-chunked-100mb',
+          title: 'Chunked HTTP Stream',
+          videoUrl: 'http://legacy-cinema.example/films/chunked_live_100mb.mp4',
+          format: 'mp4'
+        };
+        const chunkRescued = await rescueDeadVideoStream(chunkedClip);
+        assert.ok(chunkRescued?.proxiedStreamUrl, 'Chunked stream >25 MB should switch to progressive HTTPS stream URL');
+        assert.strictEqual(chunkReaderCancelled, true, 'Stream reader must cancel as soon as bytes exceed 25 MB cap');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        globalThis.window = prevWin;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should stream multi-part .m3u8 playlists (including relative & byte-range segments) from strictly http://-only servers via HttpsProxyHlsLoader & ManagedMediaSource', async () => {
+      const {
+        createHttpsProxyHlsLoaderClass,
+        startProxiedHlsPlayback,
+        detachActiveHlsPlayer
+      } = require('../app.js');
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevWin = globalThis.window;
+      const prevHls = globalThis.Hls;
+
+      const requestedUrls = [];
+      globalThis.window = { location: { protocol: 'https:', href: 'https://davidscottballard1-png.github.io/my-project-2/' } };
+
+      const samplePlaylist = ['#EXTM3U', '#EXT-X-VERSION:4', '#EXTINF:6.0,', 'seg001.ts', '#EXT-X-ENDLIST'].join('\n');
+      const fullSegmentBytes = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80]);
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        requestedUrls.push(u);
+        if (u.startsWith('http://')) {
+          throw new Error('Mixed Content blocked by Safari!');
+        }
+        if (u.startsWith('https://legacy-hls.example/')) {
+          throw new Error('Port 443 TLS unsupported on strictly HTTP-only host');
+        }
+        if (u.includes(encodeURIComponent('http://legacy-hls.example/live/channel.m3u8'))) {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'application/vnd.apple.mpegurl' : null) },
+            text: async () => samplePlaylist
+          };
+        }
+        if (u.includes(encodeURIComponent('http://legacy-hls.example/live/seg001.ts'))) {
+          return {
+            ok: true,
+            status: 200,
+            headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'video/mp2t' : null) },
+            arrayBuffer: async () => fullSegmentBytes.buffer.slice(0)
+          };
+        }
+        return { ok: false, status: 404, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0) };
+      };
+
+      let attachedMediaEl = null;
+      let loadedSourceUrl = null;
+      let destroyedCount = 0;
+
+      class MockHls {
+        static isSupported() {
+          return true;
+        }
+        constructor(config) {
+          this.config = config;
+          this.handlers = {};
+        }
+        on(evt, fn) {
+          this.handlers[evt] = fn;
+        }
+        loadSource(src) {
+          loadedSourceUrl = src;
+        }
+        attachMedia(el) {
+          attachedMediaEl = el;
+          if (this.handlers.hlsManifestParsed) {
+            this.handlers.hlsManifestParsed();
+          }
+        }
+        destroy() {
+          destroyedCount++;
+        }
+      }
+      MockHls.Events = { MANIFEST_PARSED: 'hlsManifestParsed', ERROR: 'hlsError' };
+      MockHls.ErrorTypes = { MEDIA_ERROR: 'mediaError', NETWORK_ERROR: 'networkError' };
+      globalThis.Hls = MockHls;
+
+      try {
+        // 1. Verify HttpsProxyHlsLoader preserves upstream HTTP context.url and slices byte-ranges over HTTPS proxy
+        const LoaderClass = createHttpsProxyHlsLoaderClass({ forceProxy: false });
+        const manifestLoader = new LoaderClass();
+        const manifestResult = await new Promise((resolve, reject) => {
+          manifestLoader.load(
+            { url: 'http://legacy-hls.example/live/channel.m3u8', responseType: 'text' },
+            {},
+            { onSuccess: (res) => resolve(res), onError: (err) => reject(new Error(err.text)) }
+          );
+        });
+        assert.strictEqual(
+          manifestResult.url,
+          'http://legacy-hls.example/live/channel.m3u8',
+          'Loader must report original upstream URL so relative segment paths resolve against http://legacy-hls.example/live/'
+        );
+        assert.ok(manifestResult.data.includes('seg001.ts'));
+
+        const segLoader = new LoaderClass();
+        const segResult = await new Promise((resolve, reject) => {
+          segLoader.load(
+            {
+              url: 'http://legacy-hls.example/live/seg001.ts',
+              responseType: 'arraybuffer',
+              rangeStart: 2,
+              rangeEnd: 6
+            },
+            {},
+            { onSuccess: (res) => resolve(res), onError: (err) => reject(new Error(err.text)) }
+          );
+        });
+        assert.deepStrictEqual(
+          Array.from(new Uint8Array(segResult.data)),
+          [30, 40, 50, 60],
+          'Byte-range HLS segments must be sliced accurately when proxy returns HTTP 200'
+        );
+        assert.strictEqual(
+          requestedUrls.some((u) => u.startsWith('http://')),
+          false,
+          'Zero raw http:// requests may be issued from an https: origin'
+        );
+
+        // 2. Verify startProxiedHlsPlayback attaches ManagedMediaSource with disableRemotePlayback = true and cleans up
+        const mockVideoEl = {
+          src: '',
+          disableRemotePlayback: false,
+          playbackRate: 1,
+          dataset: {},
+          play: () => Promise.resolve(),
+          pause() {}
+        };
+        const hlsItem = {
+          id: 'http-m3u8-live',
+          title: 'HTTP-Only Live Stream',
+          videoUrl: 'http://legacy-hls.example/live/channel.m3u8',
+          format: 'm3u8'
+        };
+        setAppState({ videoQueue: [hlsItem], currentIndex: 0 });
+
+        const started = await startProxiedHlsPlayback(mockVideoEl, hlsItem, hlsItem.videoUrl, { forceProxy: true });
+        assert.strictEqual(started, true);
+        assert.strictEqual(loadedSourceUrl, 'http://legacy-hls.example/live/channel.m3u8');
+        assert.strictEqual(attachedMediaEl, mockVideoEl);
+        assert.strictEqual(
+          mockVideoEl.disableRemotePlayback,
+          true,
+          'disableRemotePlayback must be enabled for iPhone Safari ManagedMediaSource attachment'
+        );
+
+        detachActiveHlsPlayer(mockVideoEl);
+        assert.strictEqual(destroyedCount, 1);
+        assert.strictEqual(mockVideoEl.disableRemotePlayback, false, 'disableRemotePlayback must restore on detach');
+      } finally {
+        clearPlaybackStartupWatchdog();
+        detachActiveHlsPlayer();
+        globalThis.fetch = origFetch;
+        globalThis.window = prevWin;
+        globalThis.Hls = prevHls;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('should fallback to stitching HTTP-only multi-part fMP4 .m3u8 segments over HTTPS proxy on pre-iOS 17.1 devices without ManagedMediaSource', async () => {
+      const origFetch = globalThis.fetch;
+      const origState = getAppState();
+      const prevDoc = globalThis.document;
+      const prevWin = globalThis.window;
+      const prevHls = globalThis.Hls;
+
+      delete globalThis.Hls;
+      globalThis.window = { location: { protocol: 'https:', href: 'https://davidscottballard1-png.github.io/my-project-2/' } };
+
+      const mockVideoEl = {
+        src: 'http://old-vod.example/hls/stream.m3u8',
+        readyState: 0,
+        currentTime: 0,
+        dataset: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        load() {},
+        pause() {},
+        play: () => Promise.resolve(),
+        removeAttribute(attr) {
+          if (attr === 'src') this.src = '';
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => (id === 'mainVideo' ? mockVideoEl : null),
+        querySelector: () => null
+      };
+
+      const fmp4Manifest = [
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-MAP:URI="init.mp4"',
+        '#EXTINF:4.0,',
+        'part1.m4s',
+        '#EXTINF:4.0,',
+        'part2.m4s',
+        '#EXT-X-ENDLIST'
+      ].join('\n');
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.startsWith('http://') || u.startsWith('https://old-vod.example/')) {
+          throw new Error('HTTP-only server');
+        }
+        if (u.includes(encodeURIComponent('http://old-vod.example/hls/stream.m3u8'))) {
+          return new Response(fmp4Manifest, { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' } });
+        }
+        if (u.includes(encodeURIComponent('http://old-vod.example/hls/init.mp4'))) {
+          return new Response(new Uint8Array(600).fill(1), { status: 200, headers: { 'content-type': 'video/mp4' } });
+        }
+        if (u.includes(encodeURIComponent('http://old-vod.example/hls/part1.m4s'))) {
+          return new Response(new Uint8Array(600).fill(2), { status: 200, headers: { 'content-type': 'video/iso.segment' } });
+        }
+        if (u.includes(encodeURIComponent('http://old-vod.example/hls/part2.m4s'))) {
+          return new Response(new Uint8Array(600).fill(3), { status: 200, headers: { 'content-type': 'video/iso.segment' } });
+        }
+        return new Response('', { status: 404 });
+      };
+
+      try {
+        const httpM3u8Clip = {
+          id: 'http-fmp4-m3u8',
+          title: 'HTTP-Only Multi-Part fMP4 HLS',
+          videoUrl: 'http://old-vod.example/hls/stream.m3u8',
+          format: 'm3u8'
+        };
+        setAppState({ videoQueue: [httpM3u8Clip], currentIndex: 0 });
+
+        const recovered = await handleVideoPlaybackError();
+        assert.strictEqual(recovered, true, 'Pre-iOS 17.1 device without Hls/MMS should stitch fMP4 .m3u8 over HTTPS proxy');
+        assert.strictEqual(
+          mockVideoEl.src.startsWith('blob:'),
+          true,
+          'Stitched fMP4 HLS segments should play via local video/mp4 blob: URL'
+        );
+      } finally {
+        clearPlaybackStartupWatchdog();
+        globalThis.fetch = origFetch;
+        globalThis.document = prevDoc;
+        globalThis.window = prevWin;
+        globalThis.Hls = prevHls;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
   });
 });
 
