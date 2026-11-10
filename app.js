@@ -2406,13 +2406,13 @@ async function fetchWithCorsFallback(url, asText = false) {
   }
 
   const proxies = [
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `https://api.cors.lol/?url=${encodeURIComponent(url)}`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
   ];
 
   const controllers = proxies.map(() => new AbortController());
-  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 5500);
+  const timer = setTimeout(() => controllers.forEach((c) => c.abort()), 5000);
   timer.unref?.();
 
   try {
@@ -2421,6 +2421,9 @@ async function fetchWithCorsFallback(url, asText = false) {
         const res = await fetch(candidate, { signal: controllers[idx].signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const payload = asText ? await res.text() : await res.json();
+        if (asText && typeof payload === 'string' && payload.length < 35 && /rate limit|error/i.test(payload)) {
+          throw new Error('Proxy rate-limited');
+        }
         // Cancel the slower proxy once the winner finishes
         controllers.forEach((c, i) => {
           if (i !== idx) c.abort();
@@ -2778,6 +2781,144 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
   return null;
 }
 
+const SUBREDDIT_NICHE_QUERY_MAP = {
+  nsfw: 'popular hd',
+  nsfw_gif: 'short tease hd',
+  realgirls: 'amateur girl solo',
+  amateur: 'amateur homemade',
+  gonewild: 'amateur solo tease',
+  sensual: 'sensual romantic',
+  couplesgonewild: 'amateur couple romantic',
+  gwcouples: 'real couple homemade',
+  nsfwcosplay: 'cosplay',
+  altgonewild: 'goth alt',
+  fitnakedgirls: 'fitness athletic girl',
+  thick: 'curvy thick',
+  petitegonewild: 'petite cute',
+  palegirls: 'pale skin girl',
+  redheads: 'redhead',
+  latinas: 'latina'
+};
+
+function getSubredditNicheQuery(rawSubreddit) {
+  const clean = String(rawSubreddit || '')
+    .replace(/^\/?r\//i, '')
+    .trim();
+  if (!clean) return 'amateur hd';
+  if (clean.includes('+')) {
+    const parts = clean
+      .split('+')
+      .map((p) => p.trim().toLowerCase())
+      .filter(Boolean);
+    const chosen = parts[Math.floor(Math.random() * parts.length)] || 'nsfw';
+    return SUBREDDIT_NICHE_QUERY_MAP[chosen] || chosen;
+  }
+  const lower = clean.toLowerCase();
+  if (SUBREDDIT_NICHE_QUERY_MAP[lower]) {
+    return SUBREDDIT_NICHE_QUERY_MAP[lower];
+  }
+  return clean
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+}
+
+// Native-CORS 18+ direct .mp4 fallback using Eporner JSON API v2 (Access-Control-Allow-Origin: *) + gvideo CDN
+async function fetchDirectEpornerVideos(
+  rawQuery,
+  limit = 6,
+  customSourceLabel = null,
+  orderOverride = null,
+  tryEmbedScrape = false
+) {
+  if (!settings.allowNsfw || !isFormatAllowedBySettings('mp4')) return [];
+  const cleaned = String(rawQuery || '')
+    .replace(/\b(?:redgifs|peertube|lemmy|fediverse|mastodon|reddit|nsfw:yes|site:[^\s]+|18\+)\b/gi, ' ')
+    .replace(/[^\w\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const primaryQuery = cleaned && cleaned.toLowerCase() !== 'trending' ? cleaned : 'popular hd';
+  const epOrder =
+    orderOverride || (settings.tubeDurationFilter === 'long' ? 'longest' : 'most-popular');
+
+  const queryCandidates = [primaryQuery];
+  const words = primaryQuery.split(' ').filter((w) => w.length >= 3);
+  if (words.length > 1) {
+    queryCandidates.push(words[0]);
+  }
+  if (!queryCandidates.includes('amateur hd')) {
+    queryCandidates.push('amateur hd');
+  }
+
+  let videos = [];
+  for (const qCandidate of queryCandidates) {
+    try {
+      const epApiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(
+        qCandidate
+      )}&per_page=${Math.max(6, limit * 2)}&thumbsize=medium&order=${epOrder}&format=json`;
+      const data = await fetchWithCorsFallback(epApiUrl, false);
+      if (Array.isArray(data?.videos) && data.videos.length > 0) {
+        videos = data.videos;
+        break;
+      }
+    } catch {
+      // try next candidate query
+    }
+  }
+
+  if (videos.length === 0) return [];
+
+  const results = [];
+  const slice = videos.slice(0, Math.max(3, limit));
+
+  await Promise.allSettled(
+    slice.map(async (v, idx) => {
+      if (!v?.id) return;
+      const directCdnMp4 = `https://gvideo.eporner.com/${v.id}/${v.id}.mp4`;
+      const embedUrl = v.embed || `https://www.eporner.com/embed/${v.id}/`;
+      let chosenStream = null;
+
+      if (tryEmbedScrape && idx < 3) {
+        try {
+          const pageHtml = await fetchWithCorsFallback(embedUrl, true);
+          const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
+          chosenStream =
+            streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
+            streams.find((u) => /\.mp4(\?|$)/i.test(u)) ||
+            streams[0] ||
+            null;
+        } catch {
+          chosenStream = null;
+        }
+      }
+
+      const finalStream = chosenStream || directCdnMp4;
+      const normalized = normalizeAndAutoRewriteVideoUrl(finalStream);
+      if (!normalized || !isFormatAllowedBySettings(normalized.format)) return;
+
+      results.push({
+        id: `ep-${v.id}`,
+        title: v.title || 'Free Tube 18+ Video',
+        videoUrl: normalized.videoUrl,
+        originalUrl: normalized.originalUrl,
+        convertedUrl:
+          normalized.convertedUrl || (finalStream !== directCdnMp4 ? directCdnMp4 : null),
+        format: normalized.format,
+        duration: Number(v.length_sec) || 0,
+        isHd:
+          /720|1080|hd/i.test(finalStream) ||
+          Boolean(v.hd) ||
+          !chosenStream,
+        isNsfw: true,
+        sourceName: customSourceLabel || `Free Tube (${rawQuery || '18+'})`,
+        pageUrl: v.url || embedUrl
+      });
+    })
+  );
+
+  return results;
+}
+
 async function searchRedgifsVideos(keyword, limit = 6) {
   if (!settings.allowNsfw) return [];
   const results = [];
@@ -2797,7 +2938,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
         title: `RedGIFs HD — ${tagLabel}`,
         videoUrl: mp4Url,
         originalUrl: mp4Url,
-        convertedUrl: null,
+        convertedUrl: mp4Url.replace(/^https?:\/\/thumbs\d*\.redgifs\.com\//i, 'https://media.redgifs.com/'),
         format: 'mp4',
         duration: Number(g.duration) || 0,
         tags: Array.isArray(g.tags) ? g.tags.slice(0, 6) : [],
@@ -2867,6 +3008,22 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     }
   }
 
+  // 4. Native-CORS fallback when both api.redgifs.com and www.reddit.com are blocked by browser CORS
+  if (results.length === 0) {
+    try {
+      const epFallback = await fetchDirectEpornerVideos(
+        cleanKw,
+        limit,
+        `RedGIFs (${cleanKw})`,
+        'shortest',
+        false
+      );
+      results.push(...epFallback.slice(0, limit));
+    } catch {
+      // ignore fallback error
+    }
+  }
+
   const filtered = filterAndSortTubeResults(results);
   return filtered.length > 0 ? filtered : filterAndSortTubeResults(results, 'all', settings.tubeQualityFilter);
 }
@@ -2909,6 +3066,7 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
       null;
 
     const candidateDirectUrl = mediaPost.url_overridden_by_dest || mediaPost.url;
+    let redgifsMediaFallbackUrl = null;
     if (!rawVideoUrl && typeof candidateDirectUrl === 'string') {
       if (DIRECT_VIDEO_URL_REGEX.test(candidateDirectUrl)) {
         rawVideoUrl = candidateDirectUrl;
@@ -2923,13 +3081,18 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
           /https?:\/\/(?:thumbs\d*|media|i)\.redgifs\.com\/(?:i\/)?([a-zA-Z0-9_-]+?)(?:-poster|-mobile|-size_restricted|-large)?\.(?:jpg|png|gif|mp4|webm)/i
         );
         if (thumbSlugMatch?.[1]) {
-          const hostPrefixMatch = String(oembedThumb).match(/^(https?:\/\/thumbs\d*\.redgifs\.com)\//i);
-          const cdnHost = hostPrefixMatch?.[1] || 'https://thumbs4.redgifs.com';
+          const hostPrefixMatch = String(oembedThumb).match(
+            /^(https?:\/\/(?:thumbs\d*|media)\.redgifs\.com)\//i
+          );
+          const cdnHost = hostPrefixMatch?.[1] || 'https://media.redgifs.com';
           rawVideoUrl = `${cdnHost}/${thumbSlugMatch[1]}.mp4`;
+          if (/^https?:\/\/thumbs\d*\.redgifs\.com$/i.test(cdnHost)) {
+            redgifsMediaFallbackUrl = `https://media.redgifs.com/${thumbSlugMatch[1]}.mp4`;
+          }
         } else {
           const rgId = extractRedgifsId(candidateDirectUrl);
           if (rgId) {
-            rawVideoUrl = `https://thumbs4.redgifs.com/${rgId}.mp4`;
+            rawVideoUrl = `https://media.redgifs.com/${rgId}.mp4`;
           }
         }
       }
@@ -2963,7 +3126,7 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         title: post.title || 'Reddit Video Clip',
         videoUrl: normalized.videoUrl,
         originalUrl: normalized.originalUrl,
-        convertedUrl: normalized.convertedUrl,
+        convertedUrl: normalized.convertedUrl || redgifsMediaFallbackUrl,
         format: normalized.format,
         isAutoConverted: normalized.isAutoConverted,
         isNsfw: Boolean(post.over_18 || settings.allowNsfw),
@@ -2987,10 +3150,21 @@ async function fetchSubredditVideos(subreddit) {
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
   const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`;
 
-  const json = await fetchWithCorsFallback(url, false);
-  const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
-  if (extracted.length > 0) return extracted;
-  return extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
+  try {
+    const json = await fetchWithCorsFallback(url, false);
+    const extracted = extractRedditVideosFromListing(json, `r/${cleanSub}`);
+    if (extracted.length > 0) return extracted;
+    const sfwOrAll = extractRedditVideosFromListing(json, `r/${cleanSub}`, true);
+    if (sfwOrAll.length > 0) return sfwOrAll;
+  } catch {
+    // Fall through to native-CORS fallback when Reddit blocks CORS/proxies
+  }
+
+  if (settings.allowNsfw) {
+    const nicheQuery = getSubredditNicheQuery(cleanSub);
+    return await fetchDirectEpornerVideos(nicheQuery, 6, `r/${cleanSub}`, null, false);
+  }
+  return [];
 }
 
 async function searchRedditVideosByKeyword(keyword) {
@@ -3020,23 +3194,25 @@ async function searchRedditVideosByKeyword(keyword) {
   // 1. Global Reddit keyword search
   tasks.push(
     (async () => {
-      const searchUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-        effectiveQuery
-      )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
-      const json = await fetchWithCorsFallback(searchUrl, false);
-      let items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`);
-      if (items.length === 0 && isStrict) {
-        // Fallback if 'nsfw:yes' or strict post.over_18 filter excluded matching keyword posts
-        items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`, true);
-        if (items.length === 0 && effectiveQuery !== rawKw) {
-          const plainUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-            rawKw
-          )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
-          const plainJson = await fetchWithCorsFallback(plainUrl, false);
-          items = extractRedditVideosFromListing(plainJson, `Reddit (${rawKw})`, true);
+      try {
+        const searchUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+          effectiveQuery
+        )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+        const json = await fetchWithCorsFallback(searchUrl, false);
+        let items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`);
+        if (items.length === 0 && isStrict) {
+          // Fallback if 'nsfw:yes' or strict post.over_18 filter excluded matching keyword posts
+          items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`, true);
+          if (items.length === 0 && effectiveQuery !== rawKw) {
+            const plainUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+              rawKw
+            )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+            const plainJson = await fetchWithCorsFallback(plainUrl, false);
+            items = extractRedditVideosFromListing(plainJson, `Reddit (${rawKw})`, true);
+          }
         }
-      }
-      addUnique(items);
+        addUnique(items);
+      } catch {}
     })()
   );
 
@@ -3067,6 +3243,14 @@ async function searchRedditVideosByKeyword(keyword) {
   }
 
   await Promise.allSettled(tasks);
+
+  if (results.length === 0 && settings.allowNsfw) {
+    try {
+      const epFallback = await fetchDirectEpornerVideos(rawKw, 6, `Reddit (${rawKw})`, null, false);
+      addUnique(epFallback);
+    } catch {}
+  }
+
   return results;
 }
 
@@ -3475,7 +3659,12 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     }
   }
 
-  const rawText = await fetchWithCorsFallback(trimmed, true);
+  let rawText = '';
+  try {
+    rawText = await fetchWithCorsFallback(trimmed, true);
+  } catch {
+    rawText = '';
+  }
   const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
   const pageTitle = titleMatch?.[1]?.replace(/\s+/g, ' ')?.trim() || null;
 
@@ -3502,7 +3691,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   }
 
   // If this watch page embeds its player inside an <iframe> and yielded no direct video URLs yet, scan the iframe src
-  if (results.length === 0 && typeof rawText === 'string') {
+  if (results.length === 0 && typeof rawText === 'string' && rawText.length > 0) {
     const iframeLinks = [];
     const iframeRegex = /<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
     let im;
@@ -3541,7 +3730,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   }
 
   // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 3 watch pages
-  if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string') {
+  if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string' && rawText.length > 0) {
     const candidateLinks = [];
     const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
     let lm;
@@ -3597,6 +3786,25 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
         }
       }
     }
+  }
+
+  // Native-CORS fallback for 18+ tube URLs (e.g. FullTaboo.tv, PornOne) when HTML proxy scraping is blocked
+  if (allowSubpageCrawl && results.length === 0 && settings.allowNsfw) {
+    try {
+      const parsed = new URL(trimmed);
+      const qParam = parsed.searchParams.get('s') || parsed.searchParams.get('q') || '';
+      const isFullTaboo = /fulltaboo/i.test(parsed.hostname);
+      const fallbackQuery = qParam.trim() || (isFullTaboo ? 'taboo full' : 'popular hd');
+      const fallbackOrder = isFullTaboo ? 'longest' : null;
+      const fallbackItems = await fetchDirectEpornerVideos(
+        fallbackQuery,
+        5,
+        customLabel || parsed.hostname,
+        fallbackOrder,
+        false
+      );
+      results.push(...fallbackItems);
+    } catch {}
   }
 
   return results;
@@ -3879,46 +4087,17 @@ async function searchFreeTubeSites(keyword, limit = 6) {
 
   // B. When 18+ Adult Content is Enabled: Query Free 18+ Tube APIs & Public Tube Crawlers Exclusively
   if (settings.allowNsfw) {
-    // 1. Eporner Public Video JSON API v2 (Zero API Key) + Stream Extractor
+    // 1. Eporner Public Video JSON API v2 (Zero API Key, Native CORS + gvideo CDN + Embed Stream Extractor)
     tasks.push(
       (async () => {
-        const epOrder = settings.tubeDurationFilter === 'long' ? 'longest' : 'most-popular';
-        const epApiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(
-          keyword
-        )}&per_page=6&thumbsize=medium&order=${epOrder}&format=json`;
-        const data = await fetchWithCorsFallback(epApiUrl, false);
-        const videos = Array.isArray(data?.videos) ? data.videos.slice(0, 3) : [];
-
-        await Promise.allSettled(
-          videos.map(async (v) => {
-            if (!v?.id) return;
-            const embedUrl = v.embed || `https://www.eporner.com/embed/${v.id}/`;
-            const pageHtml = await fetchWithCorsFallback(embedUrl, true);
-            const streams = extractVideoUrlsFromHtml(pageHtml, embedUrl);
-            const bestStream =
-              streams.find((u) => /(?:1080p|720p).*\.mp4(\?|$)/i.test(u)) ||
-              streams.find((u) => /\.mp4(\?|$)/i.test(u)) ||
-              streams[0];
-            if (!bestStream) return;
-
-            const normalized = normalizeAndAutoRewriteVideoUrl(bestStream);
-            if (!normalized || !isFormatAllowedBySettings(normalized.format)) return;
-
-            results.push({
-              id: `ep-${v.id}`,
-              title: v.title || 'Free Tube 18+ Video',
-              videoUrl: normalized.videoUrl,
-              originalUrl: normalized.originalUrl,
-              convertedUrl: normalized.convertedUrl,
-              format: normalized.format,
-              duration: Number(v.length_sec) || 0,
-              isHd: /720|1080|hd/i.test(bestStream) || Boolean(v.hd),
-              isNsfw: true,
-              sourceName: `Free Tube (${keyword})`,
-              pageUrl: v.url || embedUrl
-            });
-          })
+        const epItems = await fetchDirectEpornerVideos(
+          keyword,
+          limit,
+          `Free Tube (${keyword})`,
+          null,
+          true
         );
+        results.push(...epItems);
       })()
     );
 
@@ -4351,6 +4530,8 @@ async function scheduleBackgroundQueuePrebuffer() {
     prebufferVideoEl.muted = true;
     prebufferVideoEl.playsInline = true;
     prebufferVideoEl.preload = 'auto';
+    prebufferVideoEl.referrerPolicy = 'no-referrer';
+    prebufferVideoEl.setAttribute?.('referrerpolicy', 'no-referrer');
     if (prebufferVideoEl.style) {
       prebufferVideoEl.style.display = 'none';
     }
@@ -4873,19 +5054,49 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         return;
       }
 
-      const shuffledSources = [...activeSources].sort(() => Math.random() - 0.5);
-
-      const results = await Promise.allSettled(
-        shuffledSources.map((src) => pullFromSource(src))
-      );
-
+      const MAX_FOREGROUND_SOURCE_BATCH = 6;
+      const totalActive = activeSources.length;
       const sourceBuckets = [];
-      for (const r of results) {
-        if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
-          sourceBuckets.push(r.value);
+      let inspectedCount = 0;
+      let waveCount = 0;
+
+      while (inspectedCount < totalActive && waveCount < 3) {
+        const batchSize = Math.min(MAX_FOREGROUND_SOURCE_BATCH, totalActive - inspectedCount);
+        const waveSources = [];
+        for (let i = 0; i < batchSize; i++) {
+          const idx = (continuousSourceCursor + i) % totalActive;
+          waveSources.push(activeSources[idx]);
+        }
+        continuousSourceCursor = (continuousSourceCursor + batchSize) % totalActive;
+        inspectedCount += batchSize;
+        waveCount++;
+
+        const shuffledWave = [...waveSources].sort(() => Math.random() - 0.5);
+        const results = await Promise.allSettled(
+          shuffledWave.map((src) => pullFromSource(src))
+        );
+
+        for (const r of results) {
+          if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
+            sourceBuckets.push(r.value);
+          }
+        }
+
+        const candidatePool = interleaveVideoBuckets(sourceBuckets);
+        const unseenInWave = candidatePool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+        if (unseenInWave.length >= Math.max(1, count)) {
+          break;
         }
       }
+
       pool = interleaveVideoBuckets(sourceBuckets);
+
+      if (pool.length === 0 && settings.allowNsfw) {
+        try {
+          const fallbackSeed = activeSources[0]?.value || 'popular hd';
+          pool = await fetchDirectEpornerVideos(fallbackSeed, 6, activeSources[0]?.label || '18+ HD Feed', null, false);
+        } catch {}
+      }
     }
 
     let fresh = pool.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
@@ -6608,13 +6819,17 @@ if (typeof module !== 'undefined' && module.exports) {
     searchWikimediaVideos,
     extractRedgifsId,
     resolveRedgifsUrlToMp4,
+    getSubredditNicheQuery,
+    fetchDirectEpornerVideos,
     searchRedgifsVideos,
     filterAndSortTubeResults,
     extractRedditVideosFromListing,
+    fetchSubredditVideos,
     searchRedditVideosByKeyword,
     searchPeerTubeVideos,
     searchFediverseVideos,
     extractVideoUrlsFromHtml,
+    scanUrlForVideos,
     extractCandidateWebPagesFromSearchHtml,
     searchOpenWebVideos,
     searchFreeTubeSites,

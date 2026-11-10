@@ -6,10 +6,12 @@ const {
   STORAGE_KEYS,
   settings,
   extractRedditVideosFromListing,
+  fetchSubredditVideos,
   searchRedditVideosByKeyword,
   searchRedgifsVideos,
   searchWikimediaVideos,
   extractVideoUrlsFromHtml,
+  scanUrlForVideos,
   extractCandidateWebPagesFromSearchHtml,
   searchOpenWebVideos,
   searchFreeTubeSites,
@@ -1395,8 +1397,108 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('should reliably pull 18+ videos when Lemmy, PeerTube, and Vintage are disabled and Reddit/RedGIFs block CORS', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origPrebuffer = settings.prebuffer;
+      const origState = getAppState();
+
+      settings.allowNsfw = true;
+      settings.prebuffer = false;
+
+      // Build 34 active 18+ sources (subreddits, RedGIFs niches, Free Tube, FullTaboo) with PeerTube, Lemmy, and Vintage disabled
+      const active34Sources = [];
+      for (let i = 1; i <= 30; i++) {
+        active34Sources.push({
+          id: `dir-sub-test-${i}`,
+          type: 'subreddit',
+          value: i % 2 === 0 ? 'RealGirls' : 'Amateur',
+          label: `r/TestSub${i}`,
+          enabled: true,
+          isNsfw: true
+        });
+      }
+      active34Sources.push(
+        { id: 'src-nsfw-redgifs', type: 'keyword', value: 'redgifs cosplay', label: 'Cosplay 18+', enabled: true, isNsfw: true },
+        { id: 'src-nsfw-tube-hd', type: 'keyword', value: 'amateur hd', label: 'Free Tube HD', enabled: true, isNsfw: true },
+        { id: 'src-nsfw-romantic', type: 'keyword', value: 'romantic sensual hd', label: 'Romantic HD', enabled: true, isNsfw: true },
+        { id: 'src-nsfw-fulltaboo', type: 'url', value: 'https://fulltaboo.tv/', label: 'FullTaboo.tv', enabled: true, isNsfw: true },
+        { id: 'dir-fed-lemmy', type: 'keyword', value: 'lemmy fediverse nsfw', label: 'Lemmy 18+', enabled: false, isNsfw: true },
+        { id: 'dir-fed-peertube', type: 'keyword', value: 'peertube nsfw adult', label: 'PeerTube 18+', enabled: false, isNsfw: true },
+        { id: 'src-nsfw-vintage', type: 'keyword', value: 'vintage erotica', label: 'Vintage 18+ Archive', enabled: false, isNsfw: true }
+      );
+
+      setAppState({ sources: active34Sources, videoQueue: [], currentIndex: -1 });
+
+      const calledUrls = [];
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        calledUrls.push(u);
+
+        // Simulate Eporner JSON API v2 succeeding with native CORS
+        if (u.includes('eporner.com/api/v2/video/search')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              videos: [
+                {
+                  id: 'epDirect101',
+                  title: 'Native CORS HD Stream 101',
+                  length_sec: 185,
+                  hd: true,
+                  url: 'https://www.eporner.com/video-epDirect101/',
+                  embed: 'https://www.eporner.com/embed/epDirect101/'
+                },
+                {
+                  id: 'epDirect202',
+                  title: 'Native CORS HD Stream 202',
+                  length_sec: 240,
+                  hd: true,
+                  url: 'https://www.eporner.com/video-epDirect202/',
+                  embed: 'https://www.eporner.com/embed/epDirect202/'
+                }
+              ]
+            })
+          };
+        }
+
+        // Simulate Reddit, RedGIFs, FullTaboo, and CORS proxies all returning 403/522
+        return { ok: false, status: 403, text: async () => 'Forbidden', json: async () => ({}) };
+      };
+
+      try {
+        const subItems = await fetchSubredditVideos('RealGirls');
+        assert.ok(subItems.length > 0, 'Subreddit pull should fall back to direct gvideo MP4 streams when Reddit blocks CORS');
+        assert.strictEqual(subItems[0].videoUrl, 'https://gvideo.eporner.com/epDirect101/epDirect101.mp4');
+
+        const rgItems = await searchRedgifsVideos('redgifs cosplay', 4);
+        assert.ok(rgItems.length > 0, 'RedGIFs pull should fall back to direct gvideo MP4 streams when RedGIFs/Reddit block CORS');
+
+        const ftItems = await scanUrlForVideos('https://fulltaboo.tv/', 'FullTaboo.tv', true);
+        assert.ok(ftItems.length > 0, 'FullTaboo.tv URL scan should fall back to direct gvideo MP4 streams when proxy fails');
+
+        await pullRandomVideos(1);
+        const stateAfter = getAppState();
+        assert.strictEqual(stateAfter.videoQueue.length, 1, 'Shuffle Random should populate videoQueue even when Reddit/RedGIFs/Proxies fail');
+        assert.strictEqual(stateAfter.videoQueue[0].videoUrl.startsWith('https://gvideo.eporner.com/'), true);
+        assert.strictEqual(
+          calledUrls.some((u) => u.includes('sepiasearch.org') || u.includes('lemmy') || u.includes('archive.org')),
+          false,
+          'Should never call PeerTube, Lemmy, or Archive.org when those sources are disabled'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        settings.prebuffer = origPrebuffer;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
   });
 });
-
-
 
