@@ -4683,17 +4683,14 @@ async function searchRedditVideosByKeyword(keyword) {
           effectiveQuery
         )}&type=link&sort=${randomSort}&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
         const json = await fetchWithCorsFallback(searchUrl, false);
-        let items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`);
-        if (items.length === 0 && isStrict) {
-          // Fallback if 'nsfw:yes' or strict post.over_18 filter excluded matching keyword posts
-          items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`, true);
-          if (items.length === 0 && effectiveQuery !== rawKw) {
-            const plainUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
-              rawKw
-            )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
-            const plainJson = await fetchWithCorsFallback(plainUrl, false);
-            items = extractRedditVideosFromListing(plainJson, `Reddit (${rawKw})`, true);
-          }
+        let items = extractRedditVideosFromListing(json, `Reddit (${rawKw})`, !isStrict);
+        if (items.length === 0 && isStrict && effectiveQuery !== rawKw) {
+          // Retry without 'nsfw:yes' operator while keeping strict over_18 !== false enforcement
+          const plainUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
+            rawKw
+          )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+          const plainJson = await fetchWithCorsFallback(plainUrl, false);
+          items = extractRedditVideosFromListing(plainJson, `Reddit (${rawKw})`, false);
         }
         addUnique(items);
       } catch {}
@@ -4711,7 +4708,7 @@ async function searchRedditVideosByKeyword(keyword) {
             cleanHandle
           )}/hot.json?limit=25&include_over_18=${nsfwFlag}&raw_json=1`;
           const subJson = await fetchWithCorsFallback(subUrl, false);
-          addUnique(extractRedditVideosFromListing(subJson, `r/${cleanHandle}`, true));
+          addUnique(extractRedditVideosFromListing(subJson, `r/${cleanHandle}`, !isStrict));
         } catch {}
       })(),
       (async () => {
@@ -4720,7 +4717,7 @@ async function searchRedditVideosByKeyword(keyword) {
             cleanHandle
           )}/submitted.json?limit=25&include_over_18=${nsfwFlag}&raw_json=1`;
           const userJson = await fetchWithCorsFallback(userUrl, false);
-          addUnique(extractRedditVideosFromListing(userJson, `u/${cleanHandle}`, true));
+          addUnique(extractRedditVideosFromListing(userJson, `u/${cleanHandle}`, !isStrict));
         } catch {}
       })()
     );
@@ -4741,21 +4738,7 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
   if (!res.ok) return [];
 
   const json = await res.json();
-  let data = Array.isArray(json?.data) ? json.data : [];
-
-  // If strict nsfw=true returned 0 matches on SepiaSearch, retry with nsfw=both
-  if (data.length === 0 && nsfwParam === 'true') {
-    try {
-      const bothUrl = `https://sepiasearch.org/api/v1/search/videos?search=${encodeURIComponent(
-        keyword
-      )}&count=12&nsfw=both&sort=-match`;
-      const bothRes = await fetchWithTimeout(bothUrl, 3500);
-      if (bothRes.ok) {
-        const bothJson = await bothRes.json();
-        data = Array.isArray(bothJson?.data) ? bothJson.data : [];
-      }
-    } catch {}
-  }
+  const data = Array.isArray(json?.data) ? json.data : [];
 
   if (!data.length) return [];
 
@@ -4765,6 +4748,7 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
   await Promise.all(
     picked.map(async (item) => {
       try {
+        if (settings.allowNsfw && item?.nsfw === false) return;
         const host = item?.account?.host || item?.channel?.host || (item?.url ? new URL(item.url).host : null);
         const uuid = item?.uuid || item?.shortUUID;
         if (!host || !uuid) return;
@@ -4776,6 +4760,7 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
         if (!detailRes.ok) return;
 
         const detail = await detailRes.json();
+        if (settings.allowNsfw && item?.nsfw !== true && detail?.nsfw === false) return;
         const directFiles = [
           ...(Array.isArray(detail?.files) ? detail.files : []),
           ...(Array.isArray(detail?.streamingPlaylists?.[0]?.files) ? detail.streamingPlaylists[0].files : [])
@@ -5109,11 +5094,24 @@ function safeDecodeURIComponent(str) {
 }
 
 const KNOWN_NSFW_DOMAIN_REGEX =
-  /(?:^|[./])(?:redgifs|eporner|fulltaboo|pornone|spankbang|xvideos|xhamster|pornhub|xnxx|youporn|tube8|tnaflix|chaturbate|stripchat)\./i;
+  /(?:^|[./])(?:redgifs|eporner|fulltaboo|pornone|spankbang|xvideos\d*|xv-cdn|xhamster\d*|xhcdn|pornhub|phncdn|xnxx\d*|youporn|ypncdn|tube8|tnaflix|txxx|porntrex|motherless|erome|beeg|thumbzilla|drtuber|sunporno|upornia|hclips|vjav|rule34video|iwara|heavy-r|4tube|porndig|hqporner|sxyprn|fapello|chaturbate|stripchat)\./i;
+
+const MAINSTREAM_SFW_HOST_CLIENT_REGEX =
+  /(?:^|\.)(?:youtube\.com|youtu\.be|youtube-nocookie\.com|googlevideo\.com|tiktok\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeo\.com|vimeocdn\.com|dailymotion\.com|dai\.ly|dmcdn\.net|twitch\.tv|jtvnw\.net|bilibili\.com|bilivideo\.com|wikimedia\.org|wikipedia\.org|archive\.org|nasa\.gov|pbs\.org|ted\.com|khanacademy\.org|bbc\.(?:com|co\.uk)|cnn\.com|nytimes\.com|reuters\.com|apnews\.com|espn\.com|netflix\.com|hulu\.com|disneyplus\.com|amazon\.com|pinterest\.com|linkedin\.com|facebook\.com|fb\.watch|instagram\.com)$/i;
 
 function isKnownNsfwUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
   return KNOWN_NSFW_DOMAIN_REGEX.test(rawUrl);
+}
+
+function isMainstreamSfwClientUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const host = new URL(rawUrl.trim()).hostname.replace(/^www\./i, '').toLowerCase();
+    return MAINSTREAM_SFW_HOST_CLIENT_REGEX.test(host);
+  } catch {
+    return false;
+  }
 }
 
 const CLOUD_DIRECT_EXTRACT_URL_REGEX =
@@ -5121,6 +5119,42 @@ const CLOUD_DIRECT_EXTRACT_URL_REGEX =
 
 const SINGLE_WATCH_URL_HINT_REGEX =
   /(?:\/watch\/|\/video[s/-]|\/v\/|\/post\/|\/reel\/|\bviewkey=)/i;
+
+function mapCloudExtractedItem(cItem, customLabel, fallbackUrl, pageTitle = null, markNsfw = false, index = 0) {
+  if (!cItem?.videoUrl) return null;
+  const fmt = detectVideoFormat(cItem.videoUrl, cItem.format || 'mp4').ext;
+  if (!isFormatAllowedBySettings(fmt)) return null;
+  const pageRef = cItem.pageUrl || cItem.originalUrl || fallbackUrl || '';
+  const needsCloudProxy =
+    Boolean(cItem.proxyRequired) ||
+    /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(cItem.videoUrl);
+  const proxiedStreamUrl =
+    needsCloudProxy && isCloudBackendConfigured()
+      ? buildCloudProxyUrl(cItem.videoUrl, pageRef)
+      : null;
+
+  const isAdult =
+    Boolean(markNsfw || cItem.isNsfw || Number(cItem.ageLimit) >= 18) ||
+    isKnownNsfwUrl(cItem.videoUrl) ||
+    isKnownNsfwUrl(pageRef);
+
+  return {
+    id: cItem.id || `cloud-${Date.now()}-${index}`,
+    title: cItem.title || pageTitle || 'Extracted Video',
+    videoUrl: cItem.videoUrl,
+    originalUrl: cItem.originalUrl || fallbackUrl || cItem.videoUrl,
+    convertedUrl: cItem.convertedUrl || null,
+    ...(proxiedStreamUrl ? { proxiedStreamUrl } : {}),
+    format: fmt,
+    isAutoConverted: false,
+    duration: Number(cItem.duration) || 0,
+    isHd: Boolean(cItem.isHd),
+    tags: Array.isArray(cItem.tags) ? cItem.tags : [],
+    ...(isAdult ? { isNsfw: true } : {}),
+    sourceName: cItem.sourceName || `${customLabel} (Cloud)`,
+    pageUrl: pageRef || cItem.videoUrl
+  };
+}
 
 async function fetchCloudExtractedItems(targetUrl, customLabel, pageTitle = null, markScannedNsfw = false) {
   if (!isCloudBackendConfigured() || !/^https?:\/\//i.test(targetUrl)) {
@@ -5136,24 +5170,15 @@ async function fetchCloudExtractedItems(targetUrl, customLabel, pageTitle = null
       const data = await res.json();
       if (data?.ok && Array.isArray(data.items)) {
         for (const cItem of data.items) {
-          if (!cItem?.videoUrl) continue;
-          const fmt = detectVideoFormat(cItem.videoUrl, cItem.format || 'mp4').ext;
-          if (!isFormatAllowedBySettings(fmt)) continue;
-          extracted.push({
-            id: cItem.id || `cloud-${Date.now()}-${extracted.length}`,
-            title: cItem.title || pageTitle || 'Extracted Video',
-            videoUrl: cItem.videoUrl,
-            originalUrl: cItem.originalUrl || targetUrl,
-            convertedUrl: cItem.convertedUrl || null,
-            format: fmt,
-            isAutoConverted: false,
-            duration: Number(cItem.duration) || 0,
-            isHd: Boolean(cItem.isHd),
-            tags: Array.isArray(cItem.tags) ? cItem.tags : [],
-            ...(markScannedNsfw || isKnownNsfwUrl(cItem.videoUrl) ? { isNsfw: true } : {}),
-            sourceName: cItem.sourceName || `${customLabel} (Cloud)`,
-            pageUrl: cItem.pageUrl || targetUrl
-          });
+          const mapped = mapCloudExtractedItem(
+            cItem,
+            customLabel,
+            targetUrl,
+            pageTitle,
+            markScannedNsfw,
+            extracted.length
+          );
+          if (mapped) extracted.push(mapped);
         }
       }
     }
@@ -5161,6 +5186,65 @@ async function fetchCloudExtractedItems(targetUrl, customLabel, pageTitle = null
     // Cloud extractor optional fallback
   }
   return extracted;
+}
+
+// 7B. Cloud Server Global Keyword Search (/search: yt-dlp + public web in Safe Mode; strictly 18+ adult web & tubes in 18+ Mode)
+async function searchCloudVideos(keyword, limit = 6) {
+  const cleanKw = String(keyword || '').trim();
+  if (!cleanKw || !isCloudBackendConfigured()) {
+    return [];
+  }
+  const strictNsfw = Boolean(settings.allowNsfw);
+  const safeLimit = Math.max(1, Math.min(12, Number(limit) || 6));
+  const results = [];
+  try {
+    const endpoint = `${cloudConfig.backendUrl}/search?q=${encodeURIComponent(
+      cleanKw
+    )}&nsfw=${strictNsfw ? '1' : '0'}&limit=${safeLimit}`;
+    const res = await fetchWithTimeout(endpoint, 16500, {
+      headers: { Authorization: `Bearer ${cloudConfig.apiKey}` }
+    });
+    if (res && res.ok) {
+      const data = await res.json();
+      if (data?.ok && Array.isArray(data.items)) {
+        for (const cItem of data.items) {
+          const mapped = mapCloudExtractedItem(
+            cItem,
+            `Cloud Web (${cleanKw})`,
+            cItem?.pageUrl || cItem?.originalUrl || '',
+            null,
+            strictNsfw,
+            results.length
+          );
+          if (!mapped) continue;
+          if (strictNsfw) {
+            if (
+              isMainstreamSfwClientUrl(mapped.pageUrl) ||
+              isMainstreamSfwClientUrl(mapped.originalUrl) ||
+              isMainstreamSfwClientUrl(mapped.videoUrl)
+            ) {
+              continue;
+            }
+            mapped.isNsfw = true;
+          } else {
+            if (
+              mapped.isNsfw ||
+              isKnownNsfwUrl(mapped.pageUrl) ||
+              isKnownNsfwUrl(mapped.originalUrl) ||
+              isKnownNsfwUrl(mapped.videoUrl)
+            ) {
+              continue;
+            }
+          }
+          results.push(mapped);
+        }
+      }
+    }
+  } catch {
+    // Optional cloud search engine
+  }
+  const filtered = filterAndSortTubeResults(results);
+  return filtered.length > 0 ? filtered : results.slice(0, safeLimit);
 }
 
 // 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
@@ -5418,13 +5502,28 @@ function extractCandidateWebPagesFromSearchHtml(rawHtml) {
     try {
       const parsed = new URL(u);
       if (!/^https?:$/i.test(parsed.protocol)) return false;
-      const host = parsed.hostname.toLowerCase();
-      // Exclude search engine internal domains, walled gardens without direct MP4s, and ad networks
+      const host = parsed.hostname.replace(/^www\./i, '').toLowerCase();
+      // Exclude search engine internal domains, paywalled apps, walled social feeds, and ad networks
       if (
-        /(?:duckduckgo\.com|google\.com|bing\.com|yahoo\.com|yandex\.|youtube\.com|youtu\.be|netflix\.com|hulu\.com|disneyplus\.com|facebook\.com|instagram\.com|tiktok\.com|pinterest\.com|linkedin\.com|amazon\.com|doubleclick|googlesyndication|exoclick|juicyads|trafficjunky)/i.test(
+        /(?:duckduckgo\.com|google\.com|bing\.com|yahoo\.com|yandex\.|netflix\.com|hulu\.com|disneyplus\.com|facebook\.com|fb\.watch|instagram\.com|pinterest\.com|linkedin\.com|amazon\.com|doubleclick|googlesyndication|exoclick|juicyads|trafficjunky)/i.test(
           host
         )
       ) {
+        return false;
+      }
+      // Browser-only mode cannot extract YouTube or TikTok streams without Cloud yt-dlp, and 18+ Mode never allows SFW platforms
+      if (
+        (!isCloudBackendConfigured() || settings.allowNsfw) &&
+        /(?:^|\.)(?:youtube\.com|youtu\.be|tiktok\.com)$/i.test(host)
+      ) {
+        return false;
+      }
+      // Strict 18+ Mode: reject all mainstream SFW video/reference/news sites so 18+ search stays strictly 18+
+      if (settings.allowNsfw && MAINSTREAM_SFW_HOST_CLIENT_REGEX.test(host)) {
+        return false;
+      }
+      // Safe Mode: reject known 18+ domains
+      if (!settings.allowNsfw && isKnownNsfwUrl(u)) {
         return false;
       }
       if (/\.(?:css|js|png|jpe?g|svg|ico|woff2?|ttf|xml|json|pdf)(\?|$)/i.test(parsed.pathname)) {
@@ -5466,7 +5565,7 @@ function extractCandidateWebPagesFromSearchHtml(rawHtml) {
   const videoWatchPriority = found.filter(
     (u) =>
       DIRECT_VIDEO_URL_REGEX.test(u) ||
-      /(?:\/video|\/watch|\/videos\/|\/v\/|\/embed\/|viewkey=|redgifs\.com|eporner\.com|fulltaboo\.tv|pornone\.com|spankbang\.com|xhamster\.com|xvideos\.com|streamable\.com|imgur\.com|catbox\.moe|dailymotion\.com|vimeo\.com|archive\.org)/i.test(
+      /(?:\/video|\/watch|\/shorts\/|\/videos\/|\/v\/|\/embed\/|viewkey=|redgifs\.com|eporner\.com|fulltaboo\.tv|pornone\.com|spankbang\.com|xhamster\.com|xvideos\.com|streamable\.com|imgur\.com|catbox\.moe|dailymotion\.com|vimeo\.com|youtube\.com|youtu\.be|tiktok\.com|archive\.org)/i.test(
         u
       )
   );
@@ -5490,15 +5589,14 @@ async function searchOpenWebVideos(keyword, limit = 6) {
 
   const tasks = [];
 
-  // A. DuckDuckGo Open-Web Video & Tube Search Crawler (SafeSearch Off kp=-2 when 18+ On, Strict kp=1 when Safe)
+  // A. DuckDuckGo Open-Web Video & Tube Search Crawler (Strictly 18+ kp=-2 adult query when 18+ On, Safe kp=1 when Safe)
   tasks.push(
     (async () => {
       try {
         const kp = settings.allowNsfw ? '-2' : '1';
-        const webQuery =
-          settings.allowNsfw && settings.nsfwMode === 'strict'
-            ? `${cleanKw} video (mp4 OR tube OR watch)`
-            : `${cleanKw} video (mp4 OR watch)`;
+        const webQuery = settings.allowNsfw
+          ? `${cleanKw} (porn OR xxx OR nsfw) video (mp4 OR tube OR watch)`
+          : `${cleanKw} video (mp4 OR watch)`;
         const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(webQuery)}&kp=${kp}`;
         const searchHtml = await fetchWithCorsFallback(ddgUrl, true);
         const candidates = extractCandidateWebPagesFromSearchHtml(searchHtml).slice(0, 4);
@@ -5511,8 +5609,13 @@ async function searchOpenWebVideos(keyword, limit = 6) {
             } catch {}
             const scanned = await scanUrlForVideos(pageUrl, hostLabel, true);
             for (const item of scanned.slice(0, 2)) {
-              if (settings.allowNsfw && settings.nsfwMode === 'strict') {
+              if (settings.allowNsfw) {
+                if (isMainstreamSfwClientUrl(item.pageUrl) || isMainstreamSfwClientUrl(item.videoUrl)) {
+                  continue;
+                }
                 item.isNsfw = true;
+              } else if (item.isNsfw || isKnownNsfwUrl(item.pageUrl) || isKnownNsfwUrl(item.videoUrl)) {
+                continue;
               }
               addResult(item);
             }
@@ -5531,13 +5634,17 @@ async function searchOpenWebVideos(keyword, limit = 6) {
       try {
         const nsfwFlag = settings.allowNsfw ? '1' : '0';
         const hostFilter = settings.allowNsfw
-          ? '(site:streamable.com OR site:imgur.com OR site:catbox.moe OR site:redgifs.com OR site:eporner.com OR url:.mp4 OR url:.webm)'
+          ? 'nsfw:yes (site:streamable.com OR site:imgur.com OR site:catbox.moe OR site:redgifs.com OR site:eporner.com OR url:.mp4 OR url:.webm)'
           : '(site:streamable.com OR site:imgur.com OR site:catbox.moe OR url:.mp4 OR url:.webm)';
         const extUrl = `https://www.reddit.com/search.json?q=${encodeURIComponent(
           `${cleanKw} ${hostFilter}`
         )}&type=link&sort=relevance&include_over_18=${nsfwFlag}&limit=25&raw_json=1`;
         const json = await fetchWithCorsFallback(extUrl, false);
-        const directItems = extractRedditVideosFromListing(json, `Open Web (${cleanKw})`, true);
+        const directItems = extractRedditVideosFromListing(
+          json,
+          `Open Web (${cleanKw})`,
+          !settings.allowNsfw
+        );
         directItems.forEach(addResult);
 
         // Also crawl up to 2 external video watch pages (e.g. streamable.com/abc or external tube pages) linked in results
@@ -5547,15 +5654,18 @@ async function searchOpenWebVideos(keyword, limit = 6) {
           const post = child?.data;
           if (!post) continue;
           if (post.over_18 && !settings.allowNsfw) continue;
+          if (settings.allowNsfw && post.over_18 === false) continue;
           const dest = post.url_overridden_by_dest || post.url;
           if (
             typeof dest === 'string' &&
             /^https?:\/\//i.test(dest) &&
             !DIRECT_VIDEO_URL_REGEX.test(dest) &&
-            !/(?:reddit\.com|redd\.it|redgifs\.com|youtube\.com|youtu\.be)/i.test(dest) &&
+            !/(?:reddit\.com|redd\.it|redgifs\.com)/i.test(dest) &&
+            !(settings.allowNsfw && isMainstreamSfwClientUrl(dest)) &&
+            !((!isCloudBackendConfigured() || settings.allowNsfw) && /(?:youtube\.com|youtu\.be|tiktok\.com)/i.test(dest)) &&
             externalPages.length < 2
           ) {
-            externalPages.push({ url: dest, title: post.title, over18: Boolean(post.over_18) });
+            externalPages.push({ url: dest, title: post.title, over18: Boolean(post.over_18 || settings.allowNsfw) });
           }
         }
 
@@ -5811,13 +5921,14 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
 
   // 7. Dedicated Free Tube / Full-Length Tube 18+ presets
   if (/^dir-tube-|^src-nsfw-tube-hd|^src-nsfw-romantic/.test(hay)) {
-    if (source?.id === 'dir-tube-vintage') {
-      return [
-        searchFreeTubeSites(rawVal, 8),
-        searchInternetArchive(rawVal, 6)
-      ];
+    const tubeTasks = [searchFreeTubeSites(rawVal, 8)];
+    if (isCloudBackendConfigured()) {
+      tubeTasks.push(searchCloudVideos(rawVal, 6));
     }
-    return [searchFreeTubeSites(rawVal, 8)];
+    if (source?.id === 'dir-tube-vintage') {
+      tubeTasks.push(searchInternetArchive(rawVal, 6));
+    }
+    return tubeTasks;
   }
 
   // 8. General keyword source or custom keyword search
@@ -5828,6 +5939,9 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
       searchOpenWebVideos(rawVal, 5),
       searchRedditVideosByKeyword(rawVal)
     ];
+    if (isCloudBackendConfigured()) {
+      nsfwEngines.unshift(searchCloudVideos(rawVal, 6));
+    }
     if (peerTubeAllowed) {
       nsfwEngines.push(searchPeerTubeVideos(rawVal, 4));
     }
@@ -5841,6 +5955,9 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
     searchFreeTubeSites(rawVal, 5),
     searchOpenWebVideos(rawVal, 5)
   ];
+  if (isCloudBackendConfigured()) {
+    safeEngines.unshift(searchCloudVideos(rawVal, 6));
+  }
   if (peerTubeAllowed) {
     safeEngines.push(searchPeerTubeVideos(rawVal, 4));
   }
@@ -5849,9 +5966,10 @@ function buildKeywordEnginePromises(source, isStrictNsfw) {
 
 function getSourceCacheKey(source) {
   const ptFlag = isPeerTubeExplicitlyEnabled(source) ? 'pt1' : 'pt0';
+  const cloudFlag = isCloudBackendConfigured() ? 'c1' : 'c0';
   const durFilter = settings.tubeDurationFilter || 'all';
   const qualFilter = settings.tubeQualityFilter || 'all';
-  return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}:${durFilter}:${qualFilter}`;
+  return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}:${cloudFlag}:${durFilter}:${qualFilter}`;
 }
 
 function interleaveVideoBuckets(buckets) {
@@ -7962,7 +8080,7 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
             : 'No 18+ videos returned right now. Try another 18+ source or keyword!'
         );
         setPlayerLoading(false);
-        return;
+        return [];
       }
       fresh = [...FALLBACK_VIDEOS];
     }
@@ -7976,20 +8094,27 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
     currentIndex = videoQueue.length - selected.length;
     updatePlayerUI();
 
-    if (count > 1) {
+    if (count > 1 && !customKeyword) {
       showToast(`Added ${selected.length} random videos to your queue!`);
+    } else if (customKeyword && selected.length > 0) {
+      showToast(
+        `🔍 Pulled ${selected.length} video${selected.length === 1 ? '' : 's'} for "${customKeyword}"`
+      );
     }
+    return selected;
   } catch {
     if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
-      return;
+      return [];
     }
     if (!settings.allowNsfw) {
       const fallbackItem = FALLBACK_VIDEOS[Math.floor(Math.random() * FALLBACK_VIDEOS.length)];
       videoQueue.push(fallbackItem);
       currentIndex = videoQueue.length - 1;
       updatePlayerUI();
+      return [fallbackItem];
     } else {
       showToast('Could not reach 18+ video feeds right now. Try again!');
+      return [];
     }
   } finally {
     setPlayerLoading(false);
@@ -8246,11 +8371,11 @@ async function pullSmartInputToPlayer(rawInput) {
     } finally {
       setPlayerLoading(false);
     }
-    return await pullRandomVideos(1, subName);
+    return await pullRandomVideos(6, subName);
   }
 
-  // 3. Standard keyword / topic search across active engines
-  return await pullRandomVideos(1, trimmed);
+  // 3. Standard keyword / topic search across active engines & public web
+  return await pullRandomVideos(6, trimmed);
 }
 
 function queueSearchResultsToPlayer(opts = {}) {
@@ -9261,13 +9386,19 @@ if (typeof document !== 'undefined') {
     if (/^https?:\/\//i.test(query)) {
       tasks.push(scanUrlForVideos(query, 'Scanned Link'));
     } else if (settings.allowNsfw) {
-      // 18+ Only Mode: exclude safe engines (Archive.org, Prelinger, Wikimedia, NASA, Fediverse)
+      // 18+ Only Mode: exclude safe engines (Archive.org, Prelinger, Wikimedia, NASA, Fediverse, YouTube)
+      if (isCloudBackendConfigured() && (useOpenWeb !== false || useTubeSites !== false)) {
+        tasks.push(searchCloudVideos(query, 8));
+      }
       if (useRedgifs !== false) tasks.push(searchRedgifsVideos(query, 6));
       if (useTubeSites !== false) tasks.push(searchFreeTubeSites(query, 6));
       if (useOpenWeb !== false || useTubeSites !== false) tasks.push(searchOpenWebVideos(query, 6));
       if (useReddit !== false) tasks.push(searchRedditVideosByKeyword(query));
       if (usePeerTube) tasks.push(searchPeerTubeVideos(query, 6));
     } else {
+      if (isCloudBackendConfigured() && (useOpenWeb || useTubeSites)) {
+        tasks.push(searchCloudVideos(query, 8));
+      }
       if (useArchive) tasks.push(searchInternetArchive(query, 6));
       if (usePrelinger) tasks.push(searchPrelingerArchives(query, 5));
       if (useWiki) tasks.push(searchWikimediaVideos(query, 8));
@@ -9282,12 +9413,25 @@ if (typeof document !== 'undefined') {
     const settled = await Promise.allSettled(tasks);
     const combined = [];
     const seenUrlsInSearch = new Set();
+    const isDirectUrlQuery = /^https?:\/\//i.test(query);
     for (const r of settled) {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
         for (const item of r.value) {
           if (item?.videoUrl && !seenUrlsInSearch.has(item.videoUrl)) {
             if (settings.allowNsfw) {
+              if (
+                !isDirectUrlQuery &&
+                (isMainstreamSfwClientUrl(item.pageUrl) || isMainstreamSfwClientUrl(item.videoUrl))
+              ) {
+                continue;
+              }
               item.isNsfw = true;
+            } else if (
+              item.isNsfw ||
+              isKnownNsfwUrl(item.pageUrl) ||
+              isKnownNsfwUrl(item.videoUrl)
+            ) {
+              continue;
             }
             seenUrlsInSearch.add(item.videoUrl);
             combined.push(item);
@@ -10090,6 +10234,9 @@ if (typeof module !== 'undefined' && module.exports) {
     searchPeerTubeVideos,
     searchFediverseVideos,
     extractVideoUrlsFromHtml,
+    isKnownNsfwUrl,
+    isMainstreamSfwClientUrl,
+    searchCloudVideos,
     scanUrlForVideos,
     extractCandidateWebPagesFromSearchHtml,
     searchOpenWebVideos,

@@ -311,6 +311,198 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
     );
     assert.strictEqual(bridge.isBlockedTextPayload(200, '<html><body><video src="a.mp4"></video></body></html>'), false);
   });
+
+  it('enforces strictly 18+ results in executeCloudKeywordSearch(isNsfw=true) with zero YouTube or SFW leaks', async () => {
+    let ytSearchCalled = false;
+    const seenSearchUrls = [];
+
+    const items = await bridge.executeCloudKeywordSearch(
+      'massage',
+      { isNsfw: true, limit: 6 },
+      {
+        assertSafeUrl: async (u) => new URL(u),
+        runYtDlpSearch: async () => {
+          ytSearchCalled = true;
+          return {};
+        },
+        fetchText: async (url) => {
+          seenSearchUrls.push(url);
+          if (url.includes('html.duckduckgo.com')) {
+            assert.ok(url.includes('kp=-2'), '18+ DuckDuckGo search must use kp=-2');
+            assert.ok(decodeURIComponent(url).includes('(porn OR xxx OR nsfw)'), '18+ DuckDuckGo query must scope to adult terms');
+            return `
+              <a href="https://www.youtube.com/watch?v=sfwMassage1">SFW YouTube</a>
+              <a href="https://vimeo.com/99887766">SFW Vimeo</a>
+              <a href="https://spatherapyblog.example.org/watch/shoulder-tips">Unlabeled SFW Spa Blog</a>
+              <a href="https://indieadult.example.org/watch/sensual-session">RTA Adult Studio</a>
+            `;
+          }
+          if (url.includes('xvideos.com/?k=')) {
+            return '<a href="/video.kthdf99/oil_clip_1080p">XV Hit</a>';
+          }
+          if (url.includes('spankbang.com/s/')) {
+            return '<a href="/9abcd/video/deep_studio_hd">SB Hit</a>';
+          }
+          if (url.includes('xhamster.com/search/')) {
+            return '';
+          }
+          if (url === 'https://www.xvideos.com/video.kthdf99/oil_clip_1080p') {
+            return '<html><head><title>XV 18+ Clip</title></head><body><script>html5player.setVideoUrlHigh("https://cdn77-vid.xv-cdn.com/videos/oil_1080p.mp4");</script></body></html>';
+          }
+          if (url === 'https://spatherapyblog.example.org/watch/shoulder-tips') {
+            // Purely safe physical therapy page without adult/RTA markers -> must be rejected!
+            return '<html><head><title>Physical Therapy Shoulder Routine</title></head><body><video src="https://spatherapyblog.example.org/media/routine.mp4"></video></body></html>';
+          }
+          if (url === 'https://indieadult.example.org/watch/sensual-session') {
+            return '<html><head><meta name="rating" content="RTA-5042-1996-1400-1577-RTA" /><title>Indie Studio Scene</title></head><body><video src="https://cdn.indieadult.example.org/scene_hd.mp4"></video></body></html>';
+          }
+          return '';
+        },
+        runYtDlpUrl: async (url) => {
+          if (url === 'https://spankbang.com/9abcd/video/deep_studio_hd') {
+            return {
+              id: 'sb9abcd',
+              title: 'SpankBang HD Scene',
+              webpage_url: url,
+              age_limit: 18,
+              duration: 420,
+              extractor_key: 'SpankBang',
+              formats: [
+                {
+                  url: 'https://vdownload.sb-cd.com/9abcd_720p.mp4',
+                  ext: 'mp4',
+                  vcodec: 'avc1.64001f',
+                  acodec: 'mp4a.40.2',
+                  height: 720
+                }
+              ]
+            };
+          }
+          throw new Error('No extractor');
+        }
+      }
+    );
+
+    assert.strictEqual(ytSearchCalled, false, 'ytsearch (YouTube) must NEVER run when 18+ Mode is ON');
+    assert.strictEqual(items.length, 3);
+    assert.ok(items.every((it) => it.isNsfw === true), 'Every 18+ search result must be marked isNsfw: true');
+    assert.ok(
+      !items.some((it) => /(?:youtube|vimeo|spatherapyblog)/i.test(`${it.pageUrl} ${it.videoUrl}`)),
+      'Zero SFW sites or unlabeled safe blogs may appear in 18+ search'
+    );
+    assert.ok(items.some((it) => it.videoUrl.includes('xv-cdn.com/videos/oil_1080p.mp4')));
+    assert.ok(items.some((it) => it.videoUrl.includes('sb-cd.com/9abcd_720p.mp4')));
+    assert.ok(items.some((it) => it.videoUrl.includes('cdn.indieadult.example.org/scene_hd.mp4')));
+  });
+
+  it('searches YouTube + safe public web in executeCloudKeywordSearch(isNsfw=false), flags IP-bound streams proxyRequired, and blocks 18+ leaks', async () => {
+    const items = await bridge.executeCloudKeywordSearch(
+      'synthwave',
+      { isNsfw: false, limit: 6 },
+      {
+        assertSafeUrl: async (u) => new URL(u),
+        runYtDlpSearch: async (q) => {
+          assert.strictEqual(q, 'synthwave');
+          return {
+            entries: [
+              {
+                id: 'yt_safe_1',
+                title: 'Neon Synthwave Live Visuals',
+                webpage_url: 'https://www.youtube.com/watch?v=yt_safe_1',
+                age_limit: 0,
+                duration: 195,
+                extractor_key: 'Youtube',
+                formats: [
+                  {
+                    url: 'https://rr2---sn-ab5l6nzy.googlevideo.com/videoplayback?expire=1999999999&ip=85.239.249.225&itag=18',
+                    ext: 'mp4',
+                    vcodec: 'avc1.42001E',
+                    acodec: 'mp4a.40.2',
+                    height: 360
+                  }
+                ]
+              },
+              {
+                id: 'yt_adult_blocked',
+                title: 'Age Restricted Video',
+                webpage_url: 'https://www.youtube.com/watch?v=yt_adult_blocked',
+                age_limit: 18,
+                duration: 90,
+                extractor_key: 'Youtube',
+                formats: [
+                  {
+                    url: 'https://rr4---sn-ab5l6nzy.googlevideo.com/videoplayback?ip=85.239.249.225&itag=18',
+                    ext: 'mp4',
+                    vcodec: 'avc1.42001E',
+                    acodec: 'mp4a.40.2',
+                    height: 360
+                  }
+                ]
+              }
+            ]
+          };
+        },
+        fetchText: async (url) => {
+          if (url.includes('html.duckduckgo.com')) {
+            assert.ok(url.includes('kp=1'), 'Safe DuckDuckGo search must use kp=1');
+            return `
+              <a href="https://vimeo.com/44556677">Vimeo Synthwave Short</a>
+              <a href="https://www.xvideos.com/video.bad1/adult_leak">Adult Leak</a>
+            `;
+          }
+          return '';
+        },
+        runYtDlpUrl: async (url) => {
+          if (url === 'https://vimeo.com/44556677') {
+            return {
+              id: 'vm44556677',
+              title: 'Vimeo Synthwave Short',
+              webpage_url: url,
+              age_limit: 0,
+              duration: 110,
+              extractor_key: 'Vimeo',
+              formats: [
+                {
+                  url: 'https://vod-progressive.akamaized.net/exp=1999999999/vimeo_synth_720p.mp4',
+                  ext: 'mp4',
+                  vcodec: 'avc1.64001f',
+                  acodec: 'mp4a.40.2',
+                  height: 720
+                }
+              ]
+            };
+          }
+          throw new Error('Unexpected URL');
+        }
+      }
+    );
+
+    assert.strictEqual(items.length, 2);
+    const ytItem = items.find((it) => it.id === 'cloud-yt_safe_1');
+    const vimeoItem = items.find((it) => it.id === 'cloud-vm44556677');
+    assert.ok(ytItem, 'Should include safe YouTube result');
+    assert.strictEqual(ytItem.proxyRequired, true, 'googlevideo.com IP-bound stream must set proxyRequired: true');
+    assert.ok(vimeoItem, 'Should include public web Vimeo result');
+    assert.strictEqual(vimeoItem.proxyRequired, false);
+    assert.ok(!items.some((it) => it.id === 'cloud-yt_adult_blocked' || /xvideos/i.test(it.pageUrl)));
+  });
+
+  it('validates API Secret Key and ?q= query parameter on GET /search endpoint', async () => {
+    const server = bridge.createBridgeServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    try {
+      const unauth = await fetch(`http://127.0.0.1:${port}/search?q=ocean`);
+      assert.strictEqual(unauth.status, 401);
+
+      const missingQ = await fetch(`http://127.0.0.1:${port}/search`, {
+        headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+      });
+      assert.strictEqual(missingQ.status, 400);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
 });
 
 describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
@@ -641,6 +833,146 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
     const queuedCount = app.queueSearchResultsToPlayer({ startReels: false });
     assert.strictEqual(queuedCount, 2);
     assert.strictEqual(app.getAppState().videoQueue.length, 2);
+  });
+
+  it('routes IP-bound YouTube streams via proxiedStreamUrl in Safe Mode and enforces strictly 18+ results across Cloud, Open Web & Reddit when 18+ is ON', async () => {
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+
+    // 1. Safe Mode: searchCloudVideos(?nsfw=0) wraps proxyRequired IP-bound streams while blocking adult leaks
+    app.settings.allowNsfw = false;
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = String(url);
+      if (u.startsWith('https://85-239-249-225.nip.io/search?')) {
+        assert.ok(u.includes('nsfw=0'));
+        assert.strictEqual(opts.headers?.Authorization, 'Bearer rv_secret_abc');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            items: [
+              {
+                id: 'cloud-yt-1',
+                title: 'Safe Public Web Documentary',
+                videoUrl: 'https://rr2---sn-ab5l6nzy.googlevideo.com/videoplayback?ip=85.239.249.225&itag=18',
+                originalUrl: 'https://www.youtube.com/watch?v=doc1',
+                pageUrl: 'https://www.youtube.com/watch?v=doc1',
+                format: 'mp4',
+                proxyRequired: true,
+                sourceName: 'Youtube (Cloud)'
+              },
+              {
+                id: 'cloud-bad-nsfw',
+                title: 'Adult Leak',
+                videoUrl: 'https://cdn.xvideos.com/leak.mp4',
+                pageUrl: 'https://www.xvideos.com/video1',
+                format: 'mp4',
+                isNsfw: true
+              }
+            ]
+          })
+        };
+      }
+      throw new Error(`Unexpected fetch: ${u}`);
+    };
+
+    const safeCloudHits = await app.searchCloudVideos('documentary', 6);
+    assert.strictEqual(safeCloudHits.length, 1);
+    assert.strictEqual(safeCloudHits[0].originalUrl, 'https://www.youtube.com/watch?v=doc1');
+    assert.ok(
+      app.getEffectivePlaybackUrl(safeCloudHits[0]).startsWith('https://85-239-249-225.nip.io/proxy?key=rv_secret_abc'),
+      'IP-bound googlevideo.com stream must play via Cloud /proxy on iPhone'
+    );
+
+    const sampleDdgHtml = `
+      <a href="https://www.youtube.com/watch?v=abc123">YouTube Watch</a>
+      <a href="https://vimeo.com/776655">Vimeo Watch</a>
+      <a href="https://www.xvideos.com/video.999/adult">XVideos Watch</a>
+    `;
+    const safeCandidatesWithCloud = app.extractCandidateWebPagesFromSearchHtml(sampleDdgHtml);
+    assert.ok(safeCandidatesWithCloud.includes('https://www.youtube.com/watch?v=abc123'));
+    assert.ok(!safeCandidatesWithCloud.some((u) => u.includes('xvideos.com')));
+
+    // 2. Strict 18+ Mode: rejects YouTube/Vimeo/SFW sites AND rejects over_18 === false Reddit posts
+    app.settings.allowNsfw = true;
+    const nsfwCandidates = app.extractCandidateWebPagesFromSearchHtml(sampleDdgHtml);
+    assert.ok(!nsfwCandidates.some((u) => u.includes('youtube.com') || u.includes('vimeo.com')));
+    assert.ok(nsfwCandidates.includes('https://www.xvideos.com/video.999/adult'));
+
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://85-239-249-225.nip.io/search?')) {
+        assert.ok(u.includes('nsfw=1'));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            items: [
+              {
+                id: 'cloud-sfw-leak',
+                title: 'SFW YouTube Leak',
+                videoUrl: 'https://rr1---sn.googlevideo.com/videoplayback?itag=18',
+                pageUrl: 'https://www.youtube.com/watch?v=sfw1',
+                format: 'mp4'
+              },
+              {
+                id: 'cloud-xv-strict',
+                title: 'Verified 18+ Scene',
+                videoUrl: 'https://cdn77-vid.xv-cdn.com/strict18.mp4',
+                pageUrl: 'https://www.xvideos.com/video.strict18/clip',
+                format: 'mp4',
+                isNsfw: true
+              }
+            ]
+          })
+        };
+      }
+      if (u.includes('reddit.com/search.json') || u.includes('reddit.com/r/') || u.includes('reddit.com/user/')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              children: [
+                {
+                  data: {
+                    id: 'sfw_post_1',
+                    title: 'Safe Yoga Tutorial',
+                    over_18: false,
+                    permalink: '/r/yoga/comments/sfw_post_1/',
+                    secure_media: {
+                      reddit_video: { fallback_url: 'https://v.redd.it/sfwyoga/CMAF_720.mp4', height: 720, duration: 30 }
+                    }
+                  }
+                },
+                {
+                  data: {
+                    id: 'nsfw_post_2',
+                    title: '18+ Verified Post',
+                    over_18: true,
+                    permalink: '/r/nsfw/comments/nsfw_post_2/',
+                    secure_media: {
+                      reddit_video: { fallback_url: 'https://v.redd.it/nsfw999/CMAF_720.mp4', height: 720, duration: 25 }
+                    }
+                  }
+                }
+              ]
+            }
+          })
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+    };
+
+    const strictCloudHits = await app.searchCloudVideos('yoga', 6);
+    assert.strictEqual(strictCloudHits.length, 1);
+    assert.strictEqual(strictCloudHits[0].id, 'cloud-xv-strict');
+    assert.strictEqual(strictCloudHits[0].isNsfw, true);
+
+    const strictRedditHits = await app.searchRedditVideosByKeyword('yoga');
+    assert.strictEqual(strictRedditHits.length, 1, 'over_18: false Reddit posts must never leak into 18+ keyword search');
+    assert.ok(strictRedditHits[0].videoUrl.includes('v.redd.it/nsfw999'));
   });
 });
 
