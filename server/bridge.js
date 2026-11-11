@@ -40,10 +40,10 @@ const BLOCKED_HOSTNAMES = new Set([
 ]);
 
 const BINARY_MEDIA_EXT_REGEX =
-  /\.(?:mp4|m4v|mov|webm|ogv|ogg|mkv|avi|mpeg|mpg|3gp|3g2|flv|f4v|wmv|ts|m2ts|m4s|aac|mp3|m4a)(?:[?#]|$)/i;
+  /\.(?:mp4|m4v|mov|webm|ogv|ogg|mkv|avi|mpeg|mpg|3gp|3g2|flv|f4v|wmv|ts|m2ts|m4s|aac|mp3|m4a|key)(?:[?#]|$)/i;
 
 const VIDEO_CDN_HOST_REGEX =
-  /(?:^|\.)(?:v\.redd\.it|redd\.it|media\.redgifs\.com|thumbs\d*\.redgifs\.com|(?:gvideo|s\d+|v\d+|vid[\w-]*)\.eporner\.com|googlevideo\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeocdn\.com|dmcdn\.net|xhcdn\.com|xv-cdn\.com|sb-cd\.com|phncdn\.com|ypncdn\.com|commondatastorage\.googleapis\.com|upload\.wikimedia\.org)$/i;
+  /(?:^|\.)(?:v\.redd\.it|redd\.it|media\.redgifs\.com|thumbs\d*\.redgifs\.com|(?:gvideo|s\d+|v\d+|vid[\w-]*)\.eporner\.com|googlevideo\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeocdn\.com|dmcdn\.net|xhcdn\.com|xv-cdn\.com|sb-cd\.com|phncdn\.com|ypncdn\.com|tnmr\.org|cloudwindow-route\.com|commondatastorage\.googleapis\.com|upload\.wikimedia\.org)$/i;
 
 const PROXY_FIRST_METADATA_HOST_REGEX = /(?:^|\.)(?:reddit\.com|redd\.it)$/i;
 
@@ -227,6 +227,8 @@ function buildUpstreamReferer(parsedUrl, rawRefererOverride = '') {
     return 'https://www.youtube.com/';
   }
   if (host.includes('bilibili.com') || host.endsWith('bilivideo.com')) return 'https://www.bilibili.com/';
+  if (host.endsWith('tnmr.org') || host.includes('luluvid.com')) return 'https://luluvid.com/';
+  if (host.endsWith('cloudwindow-route.com') || host.includes('voe.sx')) return 'https://voe.sx/';
   if (host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
   if (host.includes('pornone.com')) return 'https://pornone.com/';
   return `${parsedUrl.protocol}//${parsedUrl.host}/`;
@@ -767,7 +769,7 @@ function getHostnameClean(rawUrl) {
 
 function isIpBoundStreamUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
-  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|eporner\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
+  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|eporner\.com|tnmr\.org|cloudwindow-route\.com|luluvid\.com|voe\.sx|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
     rawUrl
   );
 }
@@ -1008,9 +1010,82 @@ async function fetchTextWithProxyFallback(targetUrl, timeoutMs = 9000) {
   }
 }
 
+function unpackDeanEdwardsPackerServer(rawText) {
+  if (!rawText || typeof rawText !== 'string' || !rawText.includes('eval(function(p,a,c,k,e,')) {
+    return '';
+  }
+  const encodeToken = (num, radix) => {
+    if (radix <= 36) return num.toString(radix);
+    const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let out = '';
+    let n = num;
+    do {
+      out = chars[n % radix] + out;
+      n = Math.floor(n / radix);
+    } while (n > 0);
+    return out;
+  };
+  const results = [];
+  const packerRegex =
+    /eval\(function\(p,a,c,k,e,(?:d|r)\)\{[\s\S]*?\}\(\s*(['"])((?:\\.|(?!\1)[\s\S])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\.|(?!\5)[\s\S])*)\5\.split\(['"]\|['"]\)/g;
+  let m;
+  let blocks = 0;
+  while ((m = packerRegex.exec(rawText)) !== null && blocks < 4) {
+    blocks++;
+    const radix = Number(m[3]);
+    const count = Number(m[4]);
+    if (!Number.isFinite(radix) || radix < 2 || radix > 62 || !Number.isFinite(count) || count <= 0 || count > 10000) {
+      continue;
+    }
+    const payload = m[2].replace(/\\(['"\\])/g, '$1');
+    const symtab = m[6].replace(/\\(['"\\])/g, '$1').split('|');
+    const dict = new Map();
+    for (let i = Math.min(count, symtab.length) - 1; i >= 0; i--) {
+      if (symtab[i]) dict.set(encodeToken(i, radix), symtab[i]);
+    }
+    results.push(payload.replace(/\b[0-9a-zA-Z]+\b/g, (tok) => (dict.has(tok) ? dict.get(tok) : tok)));
+  }
+  return results.join('\n');
+}
+
+function decodeVoeStreamsServer(rawText) {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const urls = [];
+  const jsonScriptRegex =
+    /<script[^>]+type=["']application\/json["'][^>]*>\s*\[\s*"([^"]{24,})"\s*\]\s*<\/script>/gi;
+  let m;
+  let count = 0;
+  while ((m = jsonScriptRegex.exec(rawText)) !== null && count < 4) {
+    count++;
+    try {
+      const rot = m[1].replace(/[a-zA-Z]/g, (c) => {
+        const base = c <= 'Z' ? 65 : 97;
+        return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+      });
+      const stripped = rot.replace(/@\$|\^\^|~@|%\?|\*~|!!|#&/g, '');
+      const step3 = Buffer.from(stripped, 'base64').toString('utf8');
+      if (!step3) continue;
+      let shifted = '';
+      for (let i = 0; i < step3.length; i++) {
+        shifted += String.fromCharCode(step3.charCodeAt(i) - 3);
+      }
+      const step5 = Buffer.from(shifted.split('').reverse().join(''), 'base64').toString('utf8');
+      const parsed = JSON.parse(step5);
+      for (const c of [parsed?.source, parsed?.direct_access_url, parsed?.hls, parsed?.mp4]) {
+        if (typeof c === 'string' && /^https?:\/\//i.test(c.trim())) {
+          urls.push(c.trim());
+        }
+      }
+    } catch {}
+  }
+  return urls;
+}
+
 function extractDirectStreamsFromHtmlServer(rawHtml, baseUrl) {
   if (!rawHtml || typeof rawHtml !== 'string') return [];
-  const normalized = rawHtml
+  const unpacked = unpackDeanEdwardsPackerServer(rawHtml);
+  const combined = unpacked ? `${rawHtml}\n${unpacked}` : rawHtml;
+  const normalized = combined
     .replace(/\\u002[fF]/g, '/')
     .replace(/\\\//g, '/')
     .replace(/&amp;/g, '&');
@@ -1024,7 +1099,11 @@ function extractDirectStreamsFromHtmlServer(rawHtml, baseUrl) {
     try {
       const abs = new URL(clean, baseUrl).href;
       if (!/^https?:\/\//i.test(abs) || seen.has(abs)) return;
-      if (/(?:preview|trailer|thumb|sprite|banner|preroll|adserver|exoclick|trafficjunky|juicyads)/i.test(abs)) {
+      if (
+        /(?:test-videos\.co\.uk|Big_Buck_Bunny_\d+_\d+s|preview|trailer|thumb|sprite|banner|preroll|adserver|exoclick|trafficjunky|juicyads|pemsrv|magsrv|tsyndicate)/i.test(
+          abs
+        )
+      ) {
         return;
       }
       if (/\.(?:mp4|m4v|mov|webm|m3u8)(?:[?#]|$)/i.test(abs)) {
@@ -1033,6 +1112,10 @@ function extractDirectStreamsFromHtmlServer(rawHtml, baseUrl) {
       }
     } catch {}
   };
+
+  for (const vUrl of decodeVoeStreamsServer(rawHtml)) {
+    addUrl(vUrl);
+  }
 
   // Explicit tube player setters (XVideos / XNXX / SpankBang / HTML5 sources / og:video)
   const playerSetterRegex =
@@ -2056,12 +2139,14 @@ async function handlePlexSaveRequest(req, res) {
 
   const rawUrl = toSafePrimitiveString(body.url).trim();
   const rawPageUrl = toSafePrimitiveString(body.pageUrl).trim();
+  const rawStreamReferer = toSafePrimitiveString(body.streamReferer).trim();
   const rawOriginalUrl = toSafePrimitiveString(body.originalUrl).trim();
 
   let safeReferer = '';
-  if (rawPageUrl) {
+  const preferredRefRaw = rawStreamReferer || rawPageUrl;
+  if (preferredRefRaw) {
     try {
-      const refUrl = await assertSafePublicUrl(rawPageUrl);
+      const refUrl = await assertSafePublicUrl(preferredRefRaw);
       safeReferer = refUrl.href;
     } catch {}
   }

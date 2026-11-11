@@ -3582,4 +3582,188 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       }
     });
   });
+
+  describe('FullTaboo.tv Solo Pulling, LuluVid/VOE Unpackers & Decoy Filtering', () => {
+    it('unpacks LuluVid Dean Edwards p,a,c,k,e,d scripts, follows VOE JS redirects + JSON ciphers while rejecting Big_Buck_Bunny decoys, and routes Cloud /proxy with streamReferer', async () => {
+      const {
+        unpackDeanEdwardsPacker,
+        decodeVoeEmbeddedStreams,
+        getEffectivePlaybackUrl,
+        getVideoRefererUrl,
+        setCloudBackendConfig,
+        clearCloudBackendConfig
+      } = require('../app.js');
+
+      // 1. Build realistic Dean Edwards p,a,c,k,e,d block (radix 36, matching LuluVid where literal digits 0 and 3 have empty symtab slots)
+      const packedLuluHtml = `<html><head><title>Watch ulndy0646pz7</title></head><body><script>eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\\\b'+c.toString(a)+'\\\\b','g'),k[c]);return p}('1("2").4({5:[{6:"7://8.9.a/b/c/d/e.f?t=g&i=0.3"}],h:"j.k"});',36,21,'|jwplayer|vplayer||setup|sources|file|https|zm8xui93brqn|tnmr|org|hls2|03193|ep123_h|master|m3u8|signedTok123|duration||892|86'.split('|')))</script></body></html>`;
+
+      const unpacked = unpackDeanEdwardsPacker(packedLuluHtml);
+      assert.ok(
+        unpacked.includes('https://zm8xui93brqn.tnmr.org/hls2/03193/ep123_h/master.m3u8?t=signedTok123&i=0.3'),
+        'unpackDeanEdwardsPacker must decode radix-36 packed jwplayer HLS stream without eval'
+      );
+
+      // 2. Build realistic VOE mirror HTML containing BOTH VOE's Big_Buck_Bunny honeypot decoy AND VOE's obfuscated <script type="application/json">
+      const encodeVoeCipher = (payloadObj) => {
+        const b1 = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64');
+        const rev = b1.split('').reverse().join('');
+        let plus3 = '';
+        for (let i = 0; i < rev.length; i++) {
+          plus3 += String.fromCharCode(rev.charCodeAt(i) + 3);
+        }
+        const b2 = Buffer.from(plus3, 'utf8').toString('base64');
+        const withMarkers = `${b2.slice(0, 4)}!!${b2.slice(4, 10)}@$${b2.slice(10)}`;
+        return withMarkers.replace(/[a-zA-Z]/g, (c) => {
+          const base = c <= 'Z' ? 65 : 97;
+          return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+        });
+      };
+
+      const voeCipher = encodeVoeCipher({
+        source: 'https://edge1.cloudwindow-route.com/engine/hls2-c/01/999/master.m3u8?t=voeTok&i=1.2.3.4',
+        direct_access_url: 'https://edge1.cloudwindow-route.com/engine/mp4/01/999.mp4?t=voeTok',
+        video_height: 720,
+        length: 945,
+        title: 'VOE Embedded Scene'
+      });
+
+      const voeMirrorHtml = `<html><head><title>Watch VOE</title></head><body>
+        <script>var source='https://test-videos.co.uk/vids/bigbuckbunny/mp4/av1/1080/Big_Buck_Bunny_1080_10s_5MB.mp4';</script>
+        <script type="application/json">["${voeCipher}"]</script>
+      </body></html>`;
+
+      const voeDecoded = decodeVoeEmbeddedStreams(voeMirrorHtml);
+      assert.strictEqual(voeDecoded.length, 2, 'decodeVoeEmbeddedStreams must extract HLS + MP4 URLs');
+      assert.ok(
+        !extractVideoUrlsFromHtml(voeMirrorHtml, 'https://susanexpectcare.com/e/voe999').some((u) =>
+          u.includes('Big_Buck_Bunny')
+        ),
+        'extractVideoUrlsFromHtml must reject VOE Big_Buck_Bunny anti-scraper honeypot decoy'
+      );
+
+      // 3. End-to-end FullTaboo solo pull across two-hop episode crawl -> iframe -> LuluVid & VOE JS redirect
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origState = getAppState();
+      try {
+        settings.allowNsfw = true;
+        setCloudBackendConfig('https://cloud.reelvault.example', 'rv-secret-key', true);
+        setAppState({
+          sources: [
+            {
+              id: 'src-nsfw-fulltaboo',
+              type: 'url',
+              value: 'https://fulltaboo.tv/',
+              label: '🔞 FullTaboo.tv Full-Length',
+              enabled: true,
+              isNsfw: true
+            }
+          ],
+          videoQueue: []
+        });
+
+        globalThis.fetch = async (reqUrl) => {
+          const raw = String(reqUrl);
+          const u = raw.startsWith('https://cloud.reelvault.example/proxy?')
+            ? new URL(raw).searchParams.get('url')
+            : raw;
+
+          if (u === 'https://fulltaboo.tv/') {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => `<html><body>
+                <a href="https://fulltaboo.tv/wp-json/">WP JSON</a>
+                <a href="https://fulltaboo.tv/tags-1011/">Tags</a>
+                <a href="https://fulltaboo.tv/dmca-2257/">DMCA</a>
+                <a href="https://fulltaboo.tv/sarah-lace-holiday-helper-1/">Episode 1</a>
+                <a href="https://fulltaboo.tv/leia-lovelyn-evening-story-2/">Episode 2</a>
+              </body></html>`
+            };
+          }
+          if (u === 'https://fulltaboo.tv/sarah-lace-holiday-helper-1/') {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => `<html><head>
+                <title>Sarah Lace &#8211; Holiday&#039;s Helper - Free Taboo porn videos</title>
+                <meta name="description" content="Watch for free in HD on Fulltaboo.tv" />
+              </head><body>
+                <iframe src="https://luluvid.com/e/ulndy0646pz7" allowfullscreen="true"></iframe>
+              </body></html>`
+            };
+          }
+          if (u === 'https://luluvid.com/e/ulndy0646pz7') {
+            return { ok: true, status: 200, text: async () => packedLuluHtml };
+          }
+          if (u === 'https://fulltaboo.tv/leia-lovelyn-evening-story-2/') {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => `<html><head>
+                <title>Leia Lovelyn - Evening Story - Free Taboo porn videos</title>
+              </head><body>
+                <iframe src="https://voe.sx/e/voe999" allowfullscreen="true"></iframe>
+              </body></html>`
+            };
+          }
+          if (u === 'https://voe.sx/e/voe999') {
+            return {
+              ok: true,
+              status: 200,
+              text: async () =>
+                `<html><head><script>window.location.href = 'https://susanexpectcare.com/e/voe999';</script></head></html>`
+            };
+          }
+          if (u === 'https://susanexpectcare.com/e/voe999') {
+            return { ok: true, status: 200, text: async () => voeMirrorHtml };
+          }
+          return { ok: false, status: 404, text: async () => '' };
+        };
+
+        await pullRandomVideos(2);
+        const queue = getAppState().videoQueue;
+        assert.strictEqual(queue.length, 2, 'FullTaboo solo pull should queue both LuluVid and VOE episodes');
+
+        const luluItem = queue.find((it) => it.videoUrl.includes('tnmr.org'));
+        const voeItem = queue.find((it) => it.videoUrl.includes('cloudwindow-route.com'));
+        assert.ok(luluItem, 'Must extract LuluVid HLS stream');
+        assert.ok(voeItem, 'Must extract VOE HLS stream across JS redirect');
+
+        assert.strictEqual(luluItem.title, "Sarah Lace – Holiday's Helper");
+        assert.strictEqual(luluItem.platform, 'fulltaboo');
+        assert.strictEqual(luluItem.pageUrl, 'https://fulltaboo.tv/sarah-lace-holiday-helper-1/');
+        assert.strictEqual(luluItem.streamReferer, 'https://luluvid.com/e/ulndy0646pz7');
+        assert.strictEqual(luluItem.duration, 893);
+        assert.strictEqual(luluItem.isHd, true);
+        assert.strictEqual(getVideoRefererUrl(luluItem), 'https://luluvid.com/e/ulndy0646pz7');
+
+        const luluPlayUrl = getEffectivePlaybackUrl(luluItem);
+        assert.ok(
+          luluPlayUrl.includes('referer=https%3A%2F%2Fluluvid.com%2Fe%2Fulndy0646pz7') &&
+            luluPlayUrl.includes('&hls=1'),
+          'Playback URL must proxy LuluVid HLS with embed host Referer and hls=1 manifest rewriting'
+        );
+
+        assert.strictEqual(voeItem.title, 'Leia Lovelyn - Evening Story');
+        assert.strictEqual(voeItem.platform, 'fulltaboo');
+        assert.strictEqual(voeItem.pageUrl, 'https://fulltaboo.tv/leia-lovelyn-evening-story-2/');
+        assert.strictEqual(voeItem.streamReferer, 'https://susanexpectcare.com/e/voe999');
+        assert.ok(
+          voeItem.convertedUrl && voeItem.convertedUrl.includes('.mp4'),
+          'VOE item should attach direct_access_url MP4 as convertedUrl fallback without duplicating episode'
+        );
+      } finally {
+        clearCloudBackendConfig();
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+  });
 });
+

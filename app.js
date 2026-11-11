@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v34';
+const APP_BUILD_VERSION = 'v35';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -507,6 +507,15 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
     unwrapProxyTargetUrl(fallbackTargetUrl || videoItem?.videoUrl || '') ||
     String(fallbackTargetUrl || videoItem?.videoUrl || '').trim();
 
+  const rawStreamRef = String(videoItem?.streamReferer || '').trim();
+  if (
+    rawStreamRef &&
+    /^https?:\/\//i.test(rawStreamRef) &&
+    !/\/proxy\?(?:.*&)?key=/i.test(rawStreamRef)
+  ) {
+    return rawStreamRef;
+  }
+
   const rawPage = String(videoItem?.pageUrl || '').trim();
   if (rawPage && /^https?:\/\//i.test(rawPage) && !/\/proxy\?(?:.*&)?key=/i.test(rawPage)) {
     return rawPage;
@@ -544,6 +553,8 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
   if (platform === 'youporn' || host.includes('youporn.com') || host.endsWith('ypncdn.com')) {
     return 'https://www.youporn.com/';
   }
+  if (host.endsWith('tnmr.org') || host.includes('luluvid.com')) return 'https://luluvid.com/';
+  if (host.endsWith('cloudwindow-route.com') || host.includes('voe.sx')) return 'https://voe.sx/';
   if (platform === 'fulltaboo' || host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
   if (platform === 'pornone' || host.includes('pornone.com')) return 'https://pornone.com/';
   if (platform === 'vimeo' || host.includes('vimeo.com') || host.endsWith('vimeocdn.com')) {
@@ -2295,6 +2306,10 @@ async function sendVideoToPlex(videoItem) {
     typeof videoItem.pageUrl === 'string' && /^https?:\/\//i.test(videoItem.pageUrl)
       ? videoItem.pageUrl
       : '';
+  const cleanStreamReferer =
+    typeof videoItem.streamReferer === 'string' && /^https?:\/\//i.test(videoItem.streamReferer)
+      ? videoItem.streamReferer
+      : '';
 
   if (!cleanMediaUrl && !cleanPageUrl) {
     showToast('Cannot send local-only blob without a public stream URL');
@@ -2315,6 +2330,7 @@ async function sendVideoToPlex(videoItem) {
         url: cleanMediaUrl,
         originalUrl: /^https?:\/\//i.test(cleanOrigUrl) ? cleanOrigUrl : '',
         pageUrl: cleanPageUrl,
+        ...(cleanStreamReferer ? { streamReferer: cleanStreamReferer } : {}),
         title: videoItem.title || 'ReelVault Clip',
         sourceName: videoItem.sourceName || 'ReelVault',
         isNsfw
@@ -3405,7 +3421,7 @@ function isStaleOrDisallowedRestoredItem(item, activeSources) {
     );
     if (!fedEnabled) return true;
   }
-  if (platform === 'fulltaboo' || /^FullTaboo/i.test(srcName)) {
+  if (platform === 'fulltaboo' || /\bFullTaboo/i.test(srcName)) {
     const ftEnabled = list.some((s) => /fulltaboo\.tv/i.test(String(s?.value || '')));
     if (!ftEnabled) return true;
   }
@@ -5418,12 +5434,222 @@ async function searchNasaVideos(keyword, limit = 4) {
   return results;
 }
 
+const DECOY_OR_AD_VIDEO_URL_REGEX =
+  /(?:test-videos\.co\.uk|Big_Buck_Bunny_\d+_\d+s|(?:^|[/.])(?:exoclick|trafficjunky|juicyads|pemsrv|magsrv|tsyndicate|realsrv|adsco\.re|popads|adserver)\b|\/preroll[/_.-])/i;
+
+function encodePackerBaseToken(num, radix) {
+  if (radix <= 36) return num.toString(radix);
+  const chars = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let out = '';
+  let n = num;
+  do {
+    out = chars[n % radix] + out;
+    n = Math.floor(n / radix);
+  } while (n > 0);
+  return out;
+}
+
+// Pure-JS token unpacker for Dean Edwards p,a,c,k,e,d player scripts (LuluVid / StreamWish / Filemoon — zero eval)
+function unpackDeanEdwardsPacker(rawText) {
+  if (!rawText || typeof rawText !== 'string' || !rawText.includes('eval(function(p,a,c,k,e,')) {
+    return '';
+  }
+  const results = [];
+  const packerRegex =
+    /eval\(function\(p,a,c,k,e,(?:d|r)\)\{[\s\S]*?\}\(\s*(['"])((?:\\.|(?!\1)[\s\S])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\.|(?!\5)[\s\S])*)\5\.split\(['"]\|['"]\)/g;
+  let m;
+  let blocks = 0;
+  while ((m = packerRegex.exec(rawText)) !== null && blocks < 4) {
+    blocks++;
+    const radix = Number(m[3]);
+    const count = Number(m[4]);
+    if (
+      !Number.isFinite(radix) ||
+      radix < 2 ||
+      radix > 62 ||
+      !Number.isFinite(count) ||
+      count <= 0 ||
+      count > 10000
+    ) {
+      continue;
+    }
+    const payload = m[2].replace(/\\(['"\\])/g, '$1');
+    const symtab = m[6].replace(/\\(['"\\])/g, '$1').split('|');
+    const dict = new Map();
+    for (let i = Math.min(count, symtab.length) - 1; i >= 0; i--) {
+      if (symtab[i]) {
+        dict.set(encodePackerBaseToken(i, radix), symtab[i]);
+      }
+    }
+    const unpacked = payload.replace(/\b[0-9a-zA-Z]+\b/g, (tok) =>
+      dict.has(tok) ? dict.get(tok) : tok
+    );
+    results.push(unpacked);
+  }
+  return results.join('\n');
+}
+
+function safeBase64DecodeUtf8(b64) {
+  if (!b64 || typeof b64 !== 'string') return '';
+  const cleaned = b64
+    .replace(/[^A-Za-z0-9+/=_-]/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  if (!cleaned) return '';
+  try {
+    if (typeof Buffer !== 'undefined') {
+      return Buffer.from(cleaned, 'base64').toString('utf8');
+    }
+    if (typeof atob === 'function') {
+      const bin = atob(cleaned);
+      if (typeof TextDecoder !== 'undefined') {
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder('utf-8').decode(bytes);
+      }
+      return bin;
+    }
+  } catch {}
+  return '';
+}
+
+function decodeVoePayloadObjects(rawText) {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const objects = [];
+  const jsonScriptRegex =
+    /<script[^>]+type=["']application\/json["'][^>]*>\s*\[\s*"([^"]{24,})"\s*\]\s*<\/script>/gi;
+  let m;
+  let count = 0;
+  while ((m = jsonScriptRegex.exec(rawText)) !== null && count < 4) {
+    count++;
+    try {
+      const rot = m[1].replace(/[a-zA-Z]/g, (c) => {
+        const base = c <= 'Z' ? 65 : 97;
+        return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+      });
+      const stripped = rot.replace(/@\$|\^\^|~@|%\?|\*~|!!|#&/g, '');
+      const step3 = safeBase64DecodeUtf8(stripped);
+      if (!step3) continue;
+      let shifted = '';
+      for (let i = 0; i < step3.length; i++) {
+        shifted += String.fromCharCode(step3.charCodeAt(i) - 3);
+      }
+      const step5 = safeBase64DecodeUtf8(shifted.split('').reverse().join(''));
+      if (!step5) continue;
+      const parsed = JSON.parse(step5);
+      if (parsed && typeof parsed === 'object') {
+        objects.push(parsed);
+      }
+    } catch {}
+  }
+  return objects;
+}
+
+function decodeVoeEmbeddedStreams(rawText) {
+  if (!rawText || typeof rawText !== 'string') return [];
+  const urls = [];
+  for (const obj of decodeVoePayloadObjects(rawText)) {
+    for (const candidate of [obj.source, obj.direct_access_url, obj.hls, obj.mp4]) {
+      if (
+        typeof candidate === 'string' &&
+        /^https?:\/\//i.test(candidate.trim()) &&
+        !DECOY_OR_AD_VIDEO_URL_REGEX.test(candidate) &&
+        !urls.includes(candidate.trim())
+      ) {
+        urls.push(candidate.trim());
+      }
+    }
+  }
+  // Legacy VOE base64-encoded hls/mp4 keys
+  const b64KeyRegex = /["'](?:hls|mp4)["']\s*:\s*["']([A-Za-z0-9+/=]{24,})["']/g;
+  let bm;
+  while ((bm = b64KeyRegex.exec(rawText)) !== null && urls.length < 6) {
+    const decoded = safeBase64DecodeUtf8(bm[1]).trim();
+    if (
+      /^https?:\/\/[^\s"'<>]+$/i.test(decoded) &&
+      !DECOY_OR_AD_VIDEO_URL_REGEX.test(decoded) &&
+      !urls.includes(decoded)
+    ) {
+      urls.push(decoded);
+    }
+  }
+  return urls;
+}
+
+function decodeBasicHtmlEntities(rawStr) {
+  if (!rawStr || typeof rawStr !== 'string') return '';
+  return rawStr
+    .replace(/&#(\d+);/g, (_m, dec) => {
+      const code = Number(dec);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : _m;
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : _m;
+    })
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&ndash;/gi, '–')
+    .replace(/&mdash;/gi, '—')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanScannedPageTitle(rawTitle) {
+  if (!rawTitle || typeof rawTitle !== 'string') return null;
+  const decoded = decodeBasicHtmlEntities(rawTitle)
+    .replace(/\s*(?:[-|–—]\s*)?(?:Free Taboo porn videos|FullTaboo(?:\.tv)?|Watch video online)\s*$/i, '')
+    .trim();
+  return decoded || null;
+}
+
+function extractEmbeddedPlayerMetaFromHtml(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return { duration: 0, isHd: false, title: null };
+  }
+  let duration = 0;
+  let isHd = false;
+  let title = null;
+
+  for (const obj of decodeVoePayloadObjects(rawText)) {
+    const d = Number(obj.length || obj.duration);
+    if (!duration && Number.isFinite(d) && d > 0) duration = Math.round(d);
+    if (Number(obj.video_height) >= 720) isHd = true;
+    if (!title && typeof obj.title === 'string' && obj.title.trim()) {
+      title = cleanScannedPageTitle(obj.title);
+    }
+  }
+
+  const unpacked = unpackDeanEdwardsPacker(rawText);
+  const combined = unpacked ? `${unpacked}\n${rawText}` : rawText;
+  if (!duration) {
+    const durMatch =
+      combined.match(/\bduration\s*[:=]\s*["']?(\d{1,6}(?:\.\d+)?)["']?/i) ||
+      rawText.match(/<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](\d+(?:\.\d+)?)["']/i);
+    if (durMatch?.[1]) {
+      const parsedDur = Math.round(Number(durMatch[1]));
+      if (Number.isFinite(parsedDur) && parsedDur > 0 && parsedDur <= 43200) {
+        duration = parsedDur;
+      }
+    }
+  }
+  if (!isHd && /(?:_h\/master\.m3u8|\b(?:720|1080|1440|2160)p\b|for free in HD\b)/i.test(combined)) {
+    isHd = true;
+  }
+
+  return { duration, isHd, title };
+}
+
 // Helper: Decode JSON/JS-escaped URLs in raw HTML/script blocks and extract all playable video stream URLs
 function extractVideoUrlsFromHtml(rawText, baseUrl) {
   if (!rawText || typeof rawText !== 'string') return [];
 
+  const unpackedScripts = unpackDeanEdwardsPacker(rawText);
+  const combinedRaw = unpackedScripts ? `${rawText}\n${unpackedScripts}` : rawText;
+
   // Unescape JSON-escaped forward slashes (https:\/\/...) and unicode escapes (\u002F, \u0026, &amp;)
-  const decodedText = rawText
+  const decodedText = combinedRaw
     .replace(/\\\\\//g, '/')
     .replace(/\\\//g, '/')
     .replace(/\\u002[fF]/g, '/')
@@ -5432,6 +5658,11 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
 
   const foundUrls = new Set();
 
+  // 0. VOE JSON/base64 obfuscated stream payloads
+  for (const voeUrl of decodeVoeEmbeddedStreams(rawText)) {
+    foundUrls.add(voeUrl);
+  }
+
   // 1. Absolute video URLs across all 19 extensions (including inside inline <script> player configs)
   const absRegex = new RegExp(
     `https?:\\/\\/[^\\s"'<>\\\\()]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^\\s"'<>\\\\()]*)?`,
@@ -5439,7 +5670,9 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   );
   let m;
   while ((m = absRegex.exec(decodedText)) !== null) {
-    foundUrls.add(m[0]);
+    if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(m[0])) {
+      foundUrls.add(m[0]);
+    }
   }
 
   // 2. Relative video src/href/data-src/content/file attributes & JSON tube player keys (KVS, SpankBang, PornOne, Streamable)
@@ -5450,7 +5683,9 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   while ((m = relRegex.exec(decodedText)) !== null) {
     try {
       const resolved = new URL(m[1], baseUrl).href;
-      foundUrls.add(resolved);
+      if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(resolved)) {
+        foundUrls.add(resolved);
+      }
     } catch {
       // ignore invalid relative URL
     }
@@ -5459,20 +5694,25 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   // 3. Explicit HTML5 tube player setter calls (e.g. setVideoUrlHigh, setVideoUrlLow, setVideoHLS)
   const setterRegex = /setVideo(?:UrlHigh|UrlLow|HLS)\(\s*["'](https?:\/\/[^"']+)["']\s*\)/gi;
   while ((m = setterRegex.exec(decodedText)) !== null) {
-    foundUrls.add(m[1]);
+    if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(m[1])) {
+      foundUrls.add(m[1]);
+    }
   }
 
   // 4. OpenGraph & Twitter Player stream meta tags (<meta property="og:video" content="...">)
   const ogVideoRegex =
     /<meta[^>]+(?:property|name)=["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["'][^>]+content=["'](https?:\/\/[^"']+)["']/gi;
   while ((m = ogVideoRegex.exec(decodedText)) !== null) {
-    if (DIRECT_VIDEO_URL_REGEX.test(m[1]) || /\.(?:mp4|m3u8|webm|mov)(\b|$)/i.test(m[1])) {
+    if (
+      !DECOY_OR_AD_VIDEO_URL_REGEX.test(m[1]) &&
+      (DIRECT_VIDEO_URL_REGEX.test(m[1]) || /\.(?:mp4|m3u8|webm|mov)(\b|$)/i.test(m[1]))
+    ) {
       foundUrls.add(m[1]);
     }
   }
 
   // Sort full streams ahead of tiny hover-preview clips if both exist on a page
-  const all = [...foundUrls];
+  const all = [...foundUrls].filter((u) => !DECOY_OR_AD_VIDEO_URL_REGEX.test(u));
   const nonPreview = all.filter((u) => !/(?:preview|thumb|trailer|sprite)/i.test(u));
   return nonPreview.length > 0 ? [...nonPreview, ...all.filter((u) => !nonPreview.includes(u))] : all;
 }
@@ -5508,15 +5748,15 @@ function inferVideoPlatform(rawItem) {
   if (id.startsWith('pt-') || /\bpeertube\b/i.test(srcName)) return 'peertube';
   if (id.startsWith('masto-') || /^Mastodon\b/i.test(srcName)) return 'mastodon';
   if (id.startsWith('lemmy') || /^Lemmy\b/i.test(srcName)) return 'lemmy';
-  if (id.startsWith('rd-') || /(?:^|\.)(?:reddit\.com|redd\.it)\b/i.test(refUrl)) return 'reddit';
-  if (id.startsWith('rg-') || /(?:^|\.)redgifs\.com\b/i.test(refUrl) || /^RedGIFs\b/i.test(srcName)) return 'redgifs';
+  if (id.startsWith('rd-') || /(?:^|[./])(?:reddit\.com|redd\.it)\b/i.test(refUrl)) return 'reddit';
+  if (id.startsWith('rg-') || /(?:^|[./])redgifs\.com\b/i.test(refUrl) || /\bRedGIFs\b/i.test(srcName)) return 'redgifs';
   if (id.startsWith('ia-')) return /^Prelinger\b/i.test(srcName) ? 'prelinger' : 'archive';
-  if (id.startsWith('wiki-') || /(?:^|\.)wikimedia\.org\b/i.test(refUrl)) return 'wikimedia';
-  if (id.startsWith('nasa-') || /(?:^|\.)nasa\.gov\b/i.test(refUrl)) return 'nasa';
-  if (id.startsWith('dm-') || /(?:^|\.)(?:dailymotion\.com|dai\.ly)\b/i.test(refUrl)) return 'dailymotion';
-  if (id.startsWith('ep-') || /(?:^|\.)eporner\.com\b/i.test(refUrl)) return 'eporner';
-  if (/^FullTaboo\b/i.test(srcName) || /(?:^|\.)fulltaboo\.tv\b/i.test(refUrl)) return 'fulltaboo';
-  if (/^PornOne\b/i.test(srcName) || /(?:^|\.)pornone\.com\b/i.test(refUrl)) return 'pornone';
+  if (id.startsWith('wiki-') || /(?:^|[./])wikimedia\.org\b/i.test(refUrl)) return 'wikimedia';
+  if (id.startsWith('nasa-') || /(?:^|[./])nasa\.gov\b/i.test(refUrl)) return 'nasa';
+  if (id.startsWith('dm-') || /(?:^|[./])(?:dailymotion\.com|dai\.ly)\b/i.test(refUrl)) return 'dailymotion';
+  if (id.startsWith('ep-') || /(?:^|[./])eporner\.com\b/i.test(refUrl)) return 'eporner';
+  if (/\bFullTaboo\b/i.test(srcName) || /(?:^|[./])fulltaboo\.tv\b/i.test(refUrl)) return 'fulltaboo';
+  if (/\bPornOne\b/i.test(srcName) || /(?:^|[./])pornone\.com\b/i.test(refUrl)) return 'pornone';
   if (id.startsWith('cloud-') || /\(Cloud\)$/i.test(srcName)) return 'cloud';
   if (id.startsWith('fb-')) return 'fallback';
   return 'web';
@@ -5536,6 +5776,14 @@ function normalizeVideoItem(rawItem) {
     rawItem.format || detectVideoFormat(originalUrl || videoUrl, 'mp4').ext
   ).toLowerCase();
   const pageUrl = String(rawItem.pageUrl || originalUrl || videoUrl).trim();
+  const rawStreamRef =
+    typeof rawItem.streamReferer === 'string' ? rawItem.streamReferer.trim() : '';
+  const streamReferer =
+    rawStreamRef &&
+    /^https?:\/\//i.test(rawStreamRef) &&
+    !/\/proxy\?(?:.*&)?key=/i.test(rawStreamRef)
+      ? rawStreamRef
+      : null;
   const isNsfw =
     typeof rawItem.isNsfw === 'boolean'
       ? rawItem.isNsfw
@@ -5564,6 +5812,7 @@ function normalizeVideoItem(rawItem) {
     videoUrl,
     originalUrl,
     convertedUrl,
+    ...(streamReferer ? { streamReferer } : {}),
     format,
     isAutoConverted: Boolean(rawItem.isAutoConverted),
     isNsfw,
@@ -5790,54 +6039,92 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     }
   }
 
+  let effectiveUrl = trimmed;
   let rawText = '';
   try {
     rawText = await fetchWithCorsFallback(trimmed, true);
   } catch {
     rawText = '';
   }
-  const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
-  const pageTitle = titleMatch?.[1]?.replace(/\s+/g, ' ')?.trim() || null;
 
-  let extractedUrls = extractVideoUrlsFromHtml(rawText, trimmed);
-  if (extractedUrls.length === 0 && rawText && /eporner\.com\//i.test(trimmed)) {
-    extractedUrls = await resolveEpornerStreamsFromEmbedHtml(rawText, null, trimmed);
+  let extractedUrls = extractVideoUrlsFromHtml(rawText, effectiveUrl);
+
+  // Follow single-hop client-side JS redirects used by embed hosts (e.g. voe.sx/e/<id> -> mirror player domain)
+  if (extractedUrls.length === 0 && typeof rawText === 'string' && rawText.length > 0 && rawText.length < 24576) {
+    const jsRedirMatch = rawText.match(
+      /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"'\s<>]+)["']|window\.location\.replace\(\s*["'](https?:\/\/[^"'\s<>]+)["']\s*\)/i
+    );
+    const redirectTarget = (jsRedirMatch?.[1] || jsRedirMatch?.[2] || '').trim();
+    if (
+      redirectTarget &&
+      redirectTarget !== effectiveUrl &&
+      !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver)/i.test(redirectTarget)
+    ) {
+      try {
+        const redirHtml = await fetchWithCorsFallback(redirectTarget, true);
+        if (typeof redirHtml === 'string' && redirHtml.length > 0) {
+          effectiveUrl = redirectTarget;
+          rawText = redirHtml;
+          extractedUrls = extractVideoUrlsFromHtml(rawText, effectiveUrl);
+        }
+      } catch {}
+    }
   }
+
+  const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
+  const pageTitle = cleanScannedPageTitle(titleMatch?.[1] || '');
+  const embedMeta = extractEmbeddedPlayerMetaFromHtml(rawText);
+  const resolvedPageTitle = pageTitle || embedMeta.title || null;
+
+  if (extractedUrls.length === 0 && rawText && /eporner\.com\//i.test(effectiveUrl)) {
+    extractedUrls = await resolveEpornerStreamsFromEmbedHtml(rawText, null, effectiveUrl);
+  }
+
+  const voeStreams = decodeVoeEmbeddedStreams(rawText);
+  const collapseSingleEmbedStreams = voeStreams.length > 1 && extractedUrls.length > 1;
+  const urlsToMaterialize = collapseSingleEmbedStreams ? [extractedUrls[0]] : extractedUrls;
+  const secondaryEmbedUrl = collapseSingleEmbedStreams ? extractedUrls[1] || null : null;
+
   const results = [];
   let idx = 0;
 
-  for (const vUrl of extractedUrls) {
+  for (const vUrl of urlsToMaterialize) {
     const normalized = normalizeAndAutoRewriteVideoUrl(vUrl);
     if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
     const shortName = vUrl.split('/').pop().split('?')[0] || `Video #${idx + 1}`;
     const scannedItem = normalizeVideoItem({
       id: `scan-${Date.now()}-${idx}`,
-      title: idx === 0 && pageTitle ? pageTitle : safeDecodeURIComponent(shortName),
+      title: idx === 0 && resolvedPageTitle ? resolvedPageTitle : safeDecodeURIComponent(shortName),
       videoUrl: normalized.videoUrl,
       originalUrl: normalized.originalUrl,
-      convertedUrl: normalized.convertedUrl,
+      convertedUrl: normalized.convertedUrl || secondaryEmbedUrl,
+      ...(effectiveUrl !== trimmed ? { streamReferer: effectiveUrl } : {}),
       format: normalized.format,
       isAutoConverted: normalized.isAutoConverted,
+      duration: embedMeta.duration || 0,
+      isHd: Boolean(embedMeta.isHd),
       isNsfw: Boolean(markScannedNsfw || isKnownNsfwUrl(vUrl)),
       sourceName: customLabel,
-      pageUrl: trimmed
+      pageUrl: effectiveUrl
     });
     if (scannedItem) results.push(scannedItem);
     idx++;
   }
 
-  // If this watch page embeds its player inside an <iframe> and yielded no direct video URLs yet, scan the iframe src
+  // If this watch page embeds its player inside an <iframe> or <meta itemprop="embedUrl">, scan the embed src
   if (results.length === 0 && typeof rawText === 'string' && rawText.length > 0) {
     const iframeLinks = [];
-    const iframeRegex = /<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
-    let im;
-    while ((im = iframeRegex.exec(rawText)) !== null && iframeLinks.length < 2) {
+    const considerEmbedCandidate = (rawCandidate) => {
+      if (!rawCandidate || iframeLinks.length >= 3) return;
       try {
-        const frameUrl = new URL(im[1].replace(/&amp;/g, '&'), trimmed).href;
+        const frameUrl = new URL(rawCandidate.replace(/&amp;/g, '&'), effectiveUrl).href;
         if (
           /^https?:\/\//i.test(frameUrl) &&
           frameUrl !== trimmed &&
-          !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver|facebook|twitter)/i.test(frameUrl) &&
+          frameUrl !== effectiveUrl &&
+          !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver|facebook|twitter|recaptcha|cloudflare)/i.test(
+            frameUrl
+          ) &&
           !iframeLinks.includes(frameUrl)
         ) {
           iframeLinks.push(frameUrl);
@@ -5845,21 +6132,68 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       } catch {
         // ignore invalid iframe URL
       }
+    };
+
+    const iframeRegex = /<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+    let im;
+    while ((im = iframeRegex.exec(rawText)) !== null && iframeLinks.length < 3) {
+      considerEmbedCandidate(im[1]);
+    }
+    const metaEmbedRegex =
+      /<meta[^>]+itemprop=["']embedUrl["'][^>]+content=["']([^"']+)["']/gi;
+    while ((im = metaEmbedRegex.exec(rawText)) !== null && iframeLinks.length < 3) {
+      considerEmbedCandidate(im[1]);
     }
 
     if (iframeLinks.length > 0) {
       const frameSettled = await Promise.allSettled(
         iframeLinks.map((fUrl) => scanUrlForVideos(fUrl, customLabel, false))
       );
-      for (const s of frameSettled) {
+      for (let i = 0; i < frameSettled.length; i++) {
+        const s = frameSettled[i];
+        const fallbackFrameUrl = iframeLinks[i];
         if (s.status === 'fulfilled' && Array.isArray(s.value)) {
           for (const item of s.value.slice(0, 2)) {
-            if (pageTitle && (!item.title || /^Video #/i.test(item.title))) {
-              item.title = pageTitle;
+            if (!item.streamReferer) {
+              item.streamReferer =
+                item.pageUrl && item.pageUrl !== trimmed ? item.pageUrl : fallbackFrameUrl;
+            }
+            if (resolvedPageTitle) {
+              item.title = resolvedPageTitle;
+            }
+            if (!item.duration && embedMeta.duration) {
+              item.duration = embedMeta.duration;
+            }
+            if (!item.isHd && embedMeta.isHd) {
+              item.isHd = true;
             }
             item.pageUrl = trimmed;
+            item.originalUrl = trimmed;
+            item.platform = inferVideoPlatform({
+              ...item,
+              platform: '',
+              pageUrl: trimmed,
+              originalUrl: trimmed
+            });
             results.push(item);
           }
+        }
+      }
+
+      if (results.length === 0 && !triedCloudExtract && allowSubpageCrawl && isCloudBackendConfigured()) {
+        triedCloudExtract = true;
+        const cloudFrameItems = await fetchCloudExtractedItems(
+          iframeLinks[0],
+          customLabel,
+          resolvedPageTitle,
+          markScannedNsfw
+        );
+        for (const item of cloudFrameItems) {
+          item.streamReferer = item.streamReferer || iframeLinks[0];
+          item.pageUrl = trimmed;
+          item.originalUrl = trimmed;
+          if (resolvedPageTitle) item.title = resolvedPageTitle;
+          results.push(item);
         }
       }
     }
@@ -5874,11 +6208,11 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     SINGLE_WATCH_URL_HINT_REGEX.test(trimmed)
   ) {
     triedCloudExtract = true;
-    const cloudWatchItems = await fetchCloudExtractedItems(trimmed, customLabel, pageTitle, markScannedNsfw);
+    const cloudWatchItems = await fetchCloudExtractedItems(trimmed, customLabel, resolvedPageTitle, markScannedNsfw);
     results.push(...cloudWatchItems);
   }
 
-  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 4 randomized watch pages
+  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 6 randomized watch pages
   if (
     allowSubpageCrawl &&
     results.length < 2 &&
@@ -5916,7 +6250,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
           // Match single-segment hyphenated post slugs while excluding navigation/taxonomy paths
           if (
             /^[a-z0-9]+-[a-z0-9-]{4,}$/i.test(pathClean) &&
-            !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|page|wp-[a-z0-9-]+|feed|about|contact|privacy|terms|dmca|login|register)/i.test(
+            !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|pornstar|pornstars|partner|partners|page|wp-[a-z0-9-]+|feed|about|contact|privacy|terms|dmca|login|register)/i.test(
               pathClean
             ) &&
             parsed.href !== trimmed &&
@@ -5930,7 +6264,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       }
     }
 
-    const watchLinks = shuffleArray(candidateLinks).slice(0, 4);
+    const watchLinks = shuffleArray(candidateLinks).slice(0, 6);
     if (watchLinks.length > 0) {
       const subSettled = await Promise.allSettled(
         watchLinks.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
@@ -5951,7 +6285,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     isCloudBackendConfigured() &&
     /^https?:\/\//i.test(trimmed)
   ) {
-    const cloudFallbackItems = await fetchCloudExtractedItems(trimmed, customLabel, pageTitle, markScannedNsfw);
+    const cloudFallbackItems = await fetchCloudExtractedItems(trimmed, customLabel, resolvedPageTitle, markScannedNsfw);
     results.push(...cloudFallbackItems);
   }
 
@@ -8648,6 +8982,16 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
     if (epIdMatch?.[1]) {
       scrapeTargets.push(`https://www.eporner.com/embed/${epIdMatch[1]}/`);
     }
+    const rawStreamReferer =
+      typeof videoItem.streamReferer === 'string' ? videoItem.streamReferer.trim() : '';
+    if (
+      rawStreamReferer &&
+      /^https?:\/\//i.test(rawStreamReferer) &&
+      !DIRECT_VIDEO_URL_REGEX.test(rawStreamReferer) &&
+      !scrapeTargets.includes(rawStreamReferer)
+    ) {
+      scrapeTargets.push(rawStreamReferer);
+    }
     if (
       pageUrl &&
       /^https?:\/\//i.test(pageUrl) &&
@@ -8676,8 +9020,24 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
           return {
             videoUrl: primary,
             convertedUrl: mp4First[1] || null,
+            ...(target !== pageUrl ? { streamReferer: target } : {}),
             format: detectVideoFormat(primary, 'mp4').ext
           };
+        }
+        if (/<iframe\b|window\.location/i.test(String(html || ''))) {
+          const rescanned = await scanUrlForVideos(target, videoItem.sourceName || 'Web Scanner', false);
+          const validItem = rescanned.find((it) => it && isUsableRescueUrl(it.videoUrl));
+          if (validItem) {
+            return {
+              videoUrl: validItem.videoUrl,
+              convertedUrl:
+                validItem.convertedUrl && isUsableRescueUrl(validItem.convertedUrl)
+                  ? validItem.convertedUrl
+                  : null,
+              ...(validItem.streamReferer ? { streamReferer: validItem.streamReferer } : {}),
+              format: validItem.format || detectVideoFormat(validItem.videoUrl, 'mp4').ext
+            };
+          }
         }
       } catch {}
     }
@@ -8980,6 +9340,9 @@ async function handleVideoPlaybackError(opts = {}) {
           current.videoUrl = rescued.videoUrl;
           current.convertedUrl = rescued.convertedUrl || null;
           current.proxiedStreamUrl = null;
+          if (rescued.streamReferer) {
+            current.streamReferer = rescued.streamReferer;
+          }
           if (rescued.format) {
             current.format = rescued.format;
           }
@@ -9026,7 +9389,7 @@ async function handleVideoPlaybackError(opts = {}) {
       !current._triedDirectBypass &&
       opts?.reason !== 'decoy-bumper' &&
       /^https:\/\//i.test(current.videoUrl || '') &&
-      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com)/i.test(
+      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|tnmr\.org|cloudwindow-route\.com|luluvid\.com|voe\.sx)/i.test(
         current.videoUrl || ''
       )
     ) {
@@ -11085,21 +11448,25 @@ if (typeof document !== 'undefined') {
         try {
           const items = await scanUrlForVideos(entry.value, entry.label || 'FullTaboo.tv');
           if (isStaleAdultPull()) return;
-          if (items.length > 0) {
-            items.forEach((i) => {
+          const usable = items.filter((i) => i?.videoUrl && !deadUrls.has(i.videoUrl));
+          if (usable.length > 0) {
+            usable.forEach((i) => {
               i.isNsfw = true;
             });
-            const pick = items[Math.floor(Math.random() * items.length)];
+            const unseen = usable.filter((i) => !seenUrls.has(i.videoUrl));
+            const candidates = unseen.length > 0 ? unseen : usable;
+            const pick = candidates[Math.floor(Math.random() * candidates.length)];
+            seenUrls.add(pick.videoUrl);
             videoQueue.push(pick);
             currentIndex = videoQueue.length - 1;
             updatePlayerUI();
             showToast(`🔞 Loaded clip from ${entry.label}!`);
           } else {
-            await pullRandomVideos(1, entry.label);
+            showToast(`No playable videos extracted from ${entry.label} right now. Try again!`);
           }
         } catch {
           if (isStaleAdultPull()) return;
-          await pullRandomVideos(1, entry.label);
+          showToast(`Could not reach ${entry.label} right now. Try again!`);
         } finally {
           if (!isStaleAdultPull()) {
             setPlayerLoading(false);
@@ -11766,6 +12133,9 @@ if (typeof module !== 'undefined' && module.exports) {
     getRedgifsTempToken,
     calcEpornerBase36Hash,
     resolveEpornerStreamsFromEmbedHtml,
+    unpackDeanEdwardsPacker,
+    decodeVoeEmbeddedStreams,
+    extractEmbeddedPlayerMetaFromHtml,
     unwrapProxyTargetUrl,
     buildHttpsMediaProxyCandidates,
     createHttpsProxyHlsLoaderClass,
