@@ -112,7 +112,10 @@ const chrome = spawn(
     `--user-data-dir=${userDataDir}`,
     'about:blank'
   ],
-  { stdio: ['ignore', 'pipe', 'pipe'] }
+  {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' }
+  }
 );
 
 function cleanup() {
@@ -139,7 +142,7 @@ try {
     let stderr = '';
     const timer = setTimeout(
       () => reject(new Error(`Timed out waiting for Chrome DevTools endpoint: ${stderr}`)),
-      12000
+      30000
     );
     chrome.stderr.on('data', (chunk) => {
       stderr += chunk.toString();
