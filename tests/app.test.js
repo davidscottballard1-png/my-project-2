@@ -36,6 +36,9 @@ const {
   unlockAppGate,
   lockAppGate,
   triggerPanicSafeMode,
+  APP_BUILD_VERSION,
+  syncAppBuildVersion,
+  clearLoadedVideoQueue,
   restorePlaybackState,
   setPlayerLoading,
   updatePlayerUI,
@@ -1573,6 +1576,7 @@ describe('ReelVault Unit Tests', () => {
       assert.ok(verMatch, 'sw.js must define CACHE_NAME = reelvault-v<N>');
       const ver = Number(verMatch[1]);
       assert.ok(ver >= 32, 'CACHE_NAME version should be >= 32');
+      assert.strictEqual(APP_BUILD_VERSION, `v${ver}`, `APP_BUILD_VERSION (${APP_BUILD_VERSION}) must match sw.js v${ver}`);
       assert.ok(html.includes(`./styles.css?v=${ver}`), `index.html styles.css?v=${ver} must match sw.js`);
       assert.ok(html.includes(`./app.js?v=${ver}`), `index.html app.js?v=${ver} must match sw.js`);
       assert.ok(html.includes('id="mainVideo"') && html.includes('data-player-slot="A"'));
@@ -2089,6 +2093,172 @@ describe('ReelVault Unit Tests', () => {
         settings.resumePlayback = origResume;
         settings.prebuffer = origPrebuffer;
         settings.allowNsfw = origAllowNsfw;
+        setAppState({ videoQueue: [], currentIndex: -1, savedSessionExpiredOnRestore: false });
+      }
+    });
+
+    it('uses Network-First for HTML navigation, auto-navigates open tabs on SW cache upgrade, purges stale queues on build bump, and supports 1-tap Clear Queue', async () => {
+      const swSource = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
+      const listeners = {};
+      const cacheEntries = new Map();
+      cacheEntries.set('https://reelvault.local/', { ok: true, tag: 'stale-cached-html', clone() { return this; } });
+
+      const deletedKeys = [];
+      const navigatedUrls = [];
+
+      const mockCache = {
+        match: async (req) => {
+          const url = typeof req === 'string' ? req : req.url;
+          return cacheEntries.get(url) || null;
+        },
+        put: async (req, res) => {
+          const url = typeof req === 'string' ? req : req.url;
+          cacheEntries.set(url, res);
+        }
+      };
+
+      const sandbox = {
+        URL,
+        Promise,
+        Response: { error: () => ({ ok: false }) },
+        caches: {
+          open: async () => mockCache,
+          keys: async () => ['reelvault-v32', 'reelvault-v33'],
+          delete: async (k) => {
+            deletedKeys.push(k);
+            return true;
+          }
+        },
+        fetch: async () => ({
+          ok: true,
+          tag: 'fresh-network-html',
+          clone() {
+            return this;
+          }
+        }),
+        self: {
+          location: { origin: 'https://reelvault.local' },
+          skipWaiting: () => {},
+          clients: {
+            claim: async () => {},
+            matchAll: async () => [
+              {
+                url: 'https://reelvault.local/',
+                navigate: async (u) => {
+                  navigatedUrls.push(u);
+                }
+              }
+            ]
+          },
+          addEventListener: (type, fn) => {
+            listeners[type] = fn;
+          }
+        }
+      };
+
+      vm.runInNewContext(swSource, sandbox);
+
+      // 1. SW activate must delete old caches and auto-navigate controlled window clients into the new build
+      let activatePromise = null;
+      listeners.activate({
+        waitUntil: (p) => {
+          activatePromise = p;
+        }
+      });
+      await activatePromise;
+      assert.deepStrictEqual(deletedKeys, ['reelvault-v32', 'reelvault-v33']);
+      assert.deepStrictEqual(
+        navigatedUrls,
+        ['https://reelvault.local/'],
+        'Upgrading Service Worker must auto-refresh open window clients'
+      );
+
+      // 2. HTML navigation (mode: "navigate") must use Network-First instead of returning stale cached HTML
+      let navPromise = null;
+      listeners.fetch({
+        request: { method: 'GET', mode: 'navigate', url: 'https://reelvault.local/' },
+        respondWith: (p) => {
+          navPromise = p;
+        },
+        waitUntil: () => {}
+      });
+      const navResult = await navPromise;
+      assert.strictEqual(navResult.tag, 'fresh-network-html');
+
+      // 3. syncAppBuildVersion must clear stale non-Vault remote queue items on version upgrade while preserving Vault items
+      const { elements } = createMockDom();
+      const clearBtnEl = {
+        classList: {
+          _set: new Set(['hidden']),
+          toggle(cls, force) {
+            if (force) this._set.add(cls);
+            else this._set.delete(cls);
+          },
+          contains(cls) {
+            return this._set.has(cls);
+          },
+          add(cls) {
+            this._set.add(cls);
+          },
+          remove(cls) {
+            this._set.delete(cls);
+          }
+        }
+      };
+      elements.set('clearQueueBtn', clearBtnEl);
+
+      const store = new Map();
+      const origStorage = globalThis.localStorage;
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+
+      try {
+        store.set(STORAGE_KEYS.APP_VERSION, 'v32');
+        store.set(
+          STORAGE_KEYS.PLAYBACK_STATE,
+          JSON.stringify({
+            videoQueue: [
+              { id: 'stale-ep', title: 'Old Eporner Clip', videoUrl: 'https://s1.eporner.com/dload/old.mp4', isNsfw: true }
+            ],
+            currentIndex: 0
+          })
+        );
+
+        const upgraded = syncAppBuildVersion();
+        assert.strictEqual(upgraded, true);
+        assert.strictEqual(store.get(STORAGE_KEYS.APP_VERSION), APP_BUILD_VERSION);
+        assert.strictEqual(store.has(STORAGE_KEYS.PLAYBACK_STATE), false, 'Stale remote queue must be wiped on build upgrade');
+        assert.strictEqual(getAppState().savedSessionExpiredOnRestore, true);
+
+        // Same version on subsequent reload must NOT wipe PLAYBACK_STATE
+        store.set(
+          STORAGE_KEYS.PLAYBACK_STATE,
+          JSON.stringify({
+            videoQueue: [{ id: 'current-v', title: 'Current Build Clip', videoUrl: 'https://example.com/v.mp4' }],
+            currentIndex: 0
+          })
+        );
+        assert.strictEqual(syncAppBuildVersion(), false);
+        assert.strictEqual(store.has(STORAGE_KEYS.PLAYBACK_STATE), true);
+
+        // 4. clearLoadedVideoQueue (1-tap ✕ Clear button) wipes loaded queue & hides #clearQueueBtn
+        setAppState({
+          videoQueue: [{ id: 'q-1', title: 'Queued Clip', videoUrl: 'https://example.com/q1.mp4', format: 'mp4' }],
+          currentIndex: 0
+        });
+        updatePlayerUI();
+        assert.strictEqual(clearBtnEl.classList.contains('hidden'), false, '#clearQueueBtn should show when queue > 0');
+
+        clearLoadedVideoQueue({ silent: true });
+        assert.strictEqual(getAppState().videoQueue.length, 0);
+        assert.strictEqual(getAppState().currentIndex, -1);
+        assert.strictEqual(store.has(STORAGE_KEYS.PLAYBACK_STATE), false);
+        assert.strictEqual(clearBtnEl.classList.contains('hidden'), true, '#clearQueueBtn should hide when queue is empty');
+      } finally {
+        globalThis.localStorage = origStorage;
         setAppState({ videoQueue: [], currentIndex: -1, savedSessionExpiredOnRestore: false });
       }
     });

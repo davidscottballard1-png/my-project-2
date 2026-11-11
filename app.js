@@ -1,11 +1,14 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
+const APP_BUILD_VERSION = 'v34';
+
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
   SETTINGS: 'reelvault_settings_v1',
   PLAYBACK_STATE: 'reelvault_playback_state_v1',
   CLOUD_CONFIG: 'reelvault_cloud_config_v1',
-  AFFINITY_PROFILE: 'reelvault_affinity_v1'
+  AFFINITY_PROFILE: 'reelvault_affinity_v1',
+  APP_VERSION: 'reelvault_app_version_v1'
 };
 
 // Comprehensive catalog of 19 video extensions across the internet:
@@ -3410,6 +3413,75 @@ function isStaleOrDisallowedRestoredItem(item, activeSources) {
   return false;
 }
 
+function syncAppBuildVersion() {
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    const prevVersion = localStorage.getItem(STORAGE_KEYS.APP_VERSION);
+    if (prevVersion === APP_BUILD_VERSION) return false;
+    localStorage.setItem(STORAGE_KEYS.APP_VERSION, APP_BUILD_VERSION);
+
+    const raw = localStorage.getItem(STORAGE_KEYS.PLAYBACK_STATE);
+    if (raw) {
+      let keptVaultItems = [];
+      try {
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed?.videoQueue)
+          ? parsed.videoQueue
+          : parsed?.currentVideo
+          ? [parsed.currentVideo]
+          : [];
+        keptVaultItems = list.filter((item) => item && (item.fromVault || item.hasOfflineBlob));
+      } catch {}
+
+      if (keptVaultItems.length > 0) {
+        localStorage.setItem(
+          STORAGE_KEYS.PLAYBACK_STATE,
+          JSON.stringify({
+            appVersion: APP_BUILD_VERSION,
+            currentVideo: keptVaultItems[0],
+            videoQueue: keptVaultItems,
+            currentIndex: 0,
+            currentTime: 0,
+            wasPlaying: false,
+            positions: {},
+            updatedAt: Date.now()
+          })
+        );
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+        savedSessionExpiredOnRestore = true;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearLoadedVideoQueue(opts = {}) {
+  modeGeneration++;
+  savedSessionExpiredOnRestore = false;
+  revokeVideoItemBlobUrls(videoQueue);
+  clearStandbyVideoBuffer();
+  videoQueue = [];
+  currentIndex = -1;
+  playbackPositions = {};
+  seenUrls.clear();
+  deadUrls.clear();
+  sourcePoolCache.clear();
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
+    }
+  } catch {}
+  setPlayerLoading(false);
+  updatePlayerUI();
+  if (!opts?.silent) {
+    showToast('Cleared loaded video queue');
+  }
+  return true;
+}
+
 function restorePlaybackState() {
   if (!settings.resumePlayback) return false;
   try {
@@ -6628,6 +6700,9 @@ async function runContinuousPullCycle() {
         if (queueEl && videoQueue.length > 0) {
           queueEl.textContent = `Video ${Math.max(0, currentIndex) + 1} of ${videoQueue.length}`;
         }
+        document
+          .getElementById('clearQueueBtn')
+          ?.classList?.toggle('hidden', videoQueue.length === 0);
       }
     } catch {
       // silent background refill
@@ -7775,6 +7850,7 @@ function updatePlayerUI() {
   const skipFwd30Btn = document.getElementById('skipFwd30Btn');
   const speedSelectEl = document.getElementById('playbackSpeedSelect');
   const queueEl = document.getElementById('queueCounter');
+  const clearQueueBtn = document.getElementById('clearQueueBtn');
   const origLink = document.getElementById('videoOriginalLink');
   const prevBtn = document.getElementById('prevVideoBtn');
   const savePhoneBtn = document.getElementById('saveToPhoneBtn');
@@ -7796,6 +7872,7 @@ function updatePlayerUI() {
         ? `Video ${currentIndex + 1} of ${videoQueue.length}`
         : '0 in queue';
   }
+  clearQueueBtn?.classList?.toggle('hidden', videoQueue.length === 0);
 
   if (prevBtn) prevBtn.disabled = currentIndex <= 0;
 
@@ -9931,6 +10008,9 @@ if (typeof document !== 'undefined') {
   if (prebufferToggle) prebufferToggle.checked = settings.prebuffer !== false;
   if (offlineVaultToggle) offlineVaultToggle.checked = settings.offlineVaultCache !== false;
 
+  // Clear stale non-Vault playback queues automatically when a new app build ships
+  syncAppBuildVersion();
+
   // Restore last watched video and timestamp if no deep-link query/scan was launched
   if (!launchedDeepLink && videoQueue.length === 0 && settings.resumePlayback) {
     if (restorePlaybackState()) {
@@ -9949,8 +10029,19 @@ if (typeof document !== 'undefined') {
     }
   }
 
-  // Register Service Worker for PWA
+  document.getElementById('clearQueueBtn')?.addEventListener('click', () => {
+    clearLoadedVideoQueue();
+  });
+
+  // Register Service Worker for PWA & auto-reload once when a newer build takes control
   if ('serviceWorker' in navigator) {
+    const hadController = Boolean(navigator.serviceWorker.controller);
+    let refreshingForSwUpdate = false;
+    navigator.serviceWorker.addEventListener?.('controllerchange', () => {
+      if (!hadController || refreshingForSwUpdate) return;
+      refreshingForSwUpdate = true;
+      window.location?.reload?.();
+    });
     navigator.serviceWorker
       .register('./sw.js', { updateViaCache: 'none' })
       .then((reg) => reg?.update?.())
@@ -11696,6 +11787,9 @@ if (typeof module !== 'undefined' && module.exports) {
     triggerPanicSafeMode,
     getSavedPlaybackTime,
     savePlaybackState,
+    syncAppBuildVersion,
+    clearLoadedVideoQueue,
+    APP_BUILD_VERSION,
     restorePlaybackState,
     rehydrateQueueOfflineBlobsFromVault,
     handleVisibilityPlaybackChange,

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reelvault-v33';
+const CACHE_NAME = 'reelvault-v34';
 const APP_SHELL = [
   './',
   './index.html',
@@ -31,17 +31,32 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
+    (async () => {
+      const keys = await caches.keys();
+      let deletedOldCache = false;
+      await Promise.all(
         keys.map((key) => {
           if (key !== CACHE_NAME) {
+            deletedOldCache = true;
             return caches.delete(key);
           }
         })
-      )
-    )
+      );
+      await self.clients.claim();
+      // When upgrading from an older Service Worker cache, immediately refresh open app windows into the new build
+      if (deletedOldCache && typeof self.clients?.matchAll === 'function') {
+        const windowClients = await self.clients.matchAll({ type: 'window' });
+        await Promise.all(
+          windowClients.map((client) => {
+            if (client && typeof client.navigate === 'function' && client.url) {
+              return Promise.resolve(client.navigate(client.url)).catch(() => null);
+            }
+            return null;
+          })
+        );
+      }
+    })()
   );
-  self.clients.claim();
 });
 
 self.addEventListener('fetch', (event) => {
@@ -51,7 +66,28 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Stale-While-Revalidate: serve cached App Shell in 0ms on boot while refreshing in background
+  // Network-First for HTML document navigations so browser/PWA refresh always loads the latest deployed version
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        try {
+          const fresh = await fetch(event.request, { cache: 'no-cache' });
+          if (fresh && fresh.ok) {
+            cache.put(event.request, fresh.clone());
+            return fresh;
+          }
+        } catch {}
+        const cachedNav =
+          (await cache.match(event.request)) ||
+          (await cache.match('./index.html')) ||
+          (await cache.match('./'));
+        return cachedNav || Response.error();
+      })
+    );
+    return;
+  }
+
+  // Stale-While-Revalidate: serve cached App Shell subresources in 0ms while refreshing in background
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
       const cached =

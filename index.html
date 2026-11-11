@@ -22,7 +22,7 @@
   <link rel="preconnect" href="https://gvideo.eporner.com" crossorigin />
   <link rel="dns-prefetch" href="https://www.reddit.com" />
   <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
-  <link rel="stylesheet" href="./styles.css?v=33" />
+  <link rel="stylesheet" href="./styles.css?v=34" />
 </head>
 <body class="app-locked">
   <!-- Full-Screen Passcode Gate Overlay -->
@@ -257,7 +257,18 @@
                     ☁️ Connect Cloud
                   </button>
                 </div>
-                <span class="queue-counter" id="queueCounter">0 in queue</span>
+                <div class="queue-status-group">
+                  <span class="queue-counter" id="queueCounter">0 in queue</span>
+                  <button
+                    type="button"
+                    id="clearQueueBtn"
+                    class="queue-clear-btn hidden"
+                    title="Clear loaded videos from Player queue"
+                    aria-label="Clear loaded queue"
+                  >
+                    ✕ Clear
+                  </button>
+                </div>
               </div>
               <h3 id="videoTitle" class="video-title">Tap "Shuffle Random" to begin</h3>
               <div id="videoTagsBar" class="video-tags-bar hidden" aria-label="Interactive Video Tags"></div>
@@ -902,6 +913,6 @@
     </div>
   </div>
 
-  <script src="./app.js?v=33"></script>
+  <script src="./app.js?v=34"></script>
 </body>
 </html>
