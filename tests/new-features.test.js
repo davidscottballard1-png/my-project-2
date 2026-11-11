@@ -3493,7 +3493,93 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       }
     });
   });
+
+  describe('Horizontal Overflow & Responsive Grid Guardrails (IMG_1528 Regression)', () => {
+    it('prevents CSS Grid 1fr blowout and long unbroken subreddit/URL overflow across Directory, Sources, Vault, and Toast', () => {
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+
+      // 1. Single-column grids must NEVER use bare `grid-template-columns: 1fr` (which means minmax(auto, 1fr) and blows out on long unbroken text)
+      assert.ok(
+        !/grid-template-columns\s*:\s*1fr\s*;/i.test(css),
+        'styles.css must never use bare `grid-template-columns: 1fr;` — always use `minmax(0, 1fr)`'
+      );
+
+      // 2. Responsive auto-fill grids must clamp fixed pixel minimums with min(100%, <px>)
+      const autoFillMatches = [...css.matchAll(/repeat\(\s*auto-fill\s*,\s*minmax\(((?:[^()]+|\([^()]*\))+)\)\s*\)/g)];
+      assert.ok(autoFillMatches.length >= 4, 'Expected responsive auto-fill grid rules in styles.css');
+      for (const m of autoFillMatches) {
+        assert.ok(
+          m[1].includes('min(100%'),
+          `Responsive auto-fill minmax(${m[1]}) must wrap pixel minimum in min(100%, ...) to prevent narrow-container overflow`
+        );
+      }
+
+      // 3. Directory & Source subtitles must break 50+ char unbroken multi-feeds (r/nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual)
+      const extractRuleBody = (selector) => {
+        const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`));
+        return match ? match[1] : '';
+      };
+
+      for (const sel of ['.directory-card-sub', '.source-sub', '.source-sub code']) {
+        const body = extractRuleBody(sel);
+        assert.ok(body.includes('overflow-wrap: anywhere'), `${sel} must set overflow-wrap: anywhere`);
+        assert.ok(body.includes('word-break: break-word'), `${sel} must set word-break: break-word`);
+      }
+
+      for (const sel of ['.directory-category', '.directory-grid', '.directory-card', '.sources-list', '.source-item', '.video-grid-list', '.card-section', '.tab-view']) {
+        const body = extractRuleBody(sel);
+        assert.ok(body.includes('min-width: 0'), `${sel} must set min-width: 0`);
+        assert.ok(body.includes('max-width: 100%'), `${sel} must set max-width: 100%`);
+      }
+
+      const catBtnBody = extractRuleBody('.btn-dir-cat-enable');
+      assert.ok(catBtnBody.includes('white-space: nowrap') && catBtnBody.includes('flex-shrink: 0'), '.btn-dir-cat-enable must stay on one line without shrinking');
+
+      const vaultBarBody = extractRuleBody('.vault-playback-bar');
+      assert.ok(vaultBarBody.includes('flex-wrap: wrap'), '.vault-playback-bar must wrap buttons on narrow phones');
+
+      const toastBody = extractRuleBody('.toast');
+      assert.ok(toastBody.includes('max-width: calc(100vw - 28px)'), '.toast must clamp max-width to viewport');
+      assert.ok(!toastBody.includes('white-space: nowrap'), '.toast must allow multi-line wrapping instead of overflowing viewport');
+
+      // 4. renderSourcesList must isolate label text in .source-name-text so .nsfw-badge never overflows .source-name
+      const { renderSourcesList } = require('../app.js');
+      const prevDoc = globalThis.document;
+      const listEl = { innerHTML: '' };
+      globalThis.document = {
+        getElementById: (id) => (id === 'sourcesList' ? listEl : null)
+      };
+      const origAllowNsfw = settings.allowNsfw;
+      const origSources = getAppState().sources;
+      try {
+        settings.allowNsfw = true;
+        setAppState({
+          sources: [
+            {
+              id: 'src-mega',
+              type: 'subreddit',
+              value: 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual',
+              label: 'Reddit 18+ Mega-Mix (6-in-1)',
+              enabled: true,
+              isNsfw: true
+            }
+          ]
+        });
+        renderSourcesList();
+        assert.ok(
+          listEl.innerHTML.includes('<span class="source-name-text">Reddit 18+ Mega-Mix (6-in-1)</span>'),
+          'renderSourcesList must wrap label in .source-name-text span'
+        );
+        assert.ok(
+          listEl.innerHTML.includes('<span class="nsfw-badge">🔞 18+</span>'),
+          'renderSourcesList must render non-shrinking .nsfw-badge sibling'
+        );
+      } finally {
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({ sources: origSources });
+        globalThis.document = prevDoc;
+      }
+    });
+  });
 });
-
-
-

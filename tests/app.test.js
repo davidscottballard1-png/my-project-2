@@ -752,18 +752,25 @@ describe('ReelVault Unit Tests', () => {
       }
     });
 
-    it('should keep sw.js CACHE_NAME version in lockstep with index.html app.js?v= cache-buster and reject poisoned proxy payloads', () => {
+    it('should keep sw.js CACHE_NAME version in 3-way lockstep with index.html styles.css?v= and app.js?v= cache-busters and reject poisoned proxy payloads', () => {
       const swCode = fs.readFileSync(path.join(rootDir, 'sw.js'), 'utf8');
       const indexHtml = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
       const swVerMatch = swCode.match(/CACHE_NAME\s*=\s*['"]reelvault-v(\d+)['"]/);
+      const cssVerMatch = indexHtml.match(/<link\s+rel=["']stylesheet["']\s+href=["']\.\/styles\.css\?v=(\d+)["']\s*\/?>/);
       const htmlVerMatch = indexHtml.match(/<script\s+src=["']\.\/app\.js\?v=(\d+)["']><\/script>/);
 
       assert.ok(swVerMatch, 'sw.js must define CACHE_NAME = "reelvault-v<N>"');
+      assert.ok(cssVerMatch, 'index.html must include <link rel="stylesheet" href="./styles.css?v=<N>" />');
       assert.ok(htmlVerMatch, 'index.html must include <script src="./app.js?v=<N>"></script>');
       assert.strictEqual(
         swVerMatch[1],
+        cssVerMatch[1],
+        `sw.js version (v${swVerMatch[1]}) must match index.html styles.css version (v${cssVerMatch[1]}) so Safari invalidates stale CSS`
+      );
+      assert.strictEqual(
+        swVerMatch[1],
         htmlVerMatch[1],
-        `sw.js version (v${swVerMatch[1]}) must match index.html script version (v${htmlVerMatch[1]}) so Safari invalidates stale caches`
+        `sw.js version (v${swVerMatch[1]}) must match index.html app.js version (v${htmlVerMatch[1]}) so Safari invalidates stale JS`
       );
 
       const { isInvalidCorsProxyPayload } = require('../app.js');

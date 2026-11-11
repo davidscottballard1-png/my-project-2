@@ -7470,7 +7470,7 @@ function renderSourcesList() {
       <div class="source-item">
         <div class="source-info">
           <div class="source-name">
-            ${escapeHtml(s.label || s.value)}
+            <span class="source-name-text">${escapeHtml(s.label || s.value)}</span>
             ${s.isNsfw ? '<span class="nsfw-badge">🔞 18+</span>' : ''}
           </div>
           <div class="source-sub">${typeBadges[s.type] || s.type}: <code>${escapeHtml(s.value)}</code></div>
