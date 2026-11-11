@@ -1399,8 +1399,24 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       '.png': 'image/png'
     };
 
+    // Valid 783-byte 10-second 16x16 VP8 WebM video so Chromium <video> elements decode cleanly with zero errors
+    const TINY_WEBM_B64 =
+      'GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAALfEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHYTbuMU6uEElTDZ1OsggEeTbuMU6uEHFO7a1OsggLJ7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirXsYMPQkBNgI1MYXZmNTkuMjcuMTAwV0GNTGF2ZjU5LjI3LjEwMESJiEDDiAAAAAAAFlSua8GuAQAAAAAAADjXgQFzxYiXB6scBq4Dr5yBACK1nIN1bmSIgQCGhVZfVlA4g4EBI+ODhDuaygDgibCBELqBEJqBAhJUw2f9c3OgY8CAZ8iaRaOHRU5DT0RFUkSHjUxhdmY1OS4yNy4xMDBzc9djwItjxYiXB6scBq4Dr2fIoUWjh0VOQ09ERVJEh5RMYXZjNTkuMzcuMTAwIGxpYnZweGfIokWjiERVUkFUSU9ORIeUMDA6MDA6MTAuMDAwMDAwMDAwAAAfQ7Z1QK/ngQCjo4EAAIAQAgCdASoQABAAAEcIhYWImYSIAgIADA1gAP7/q1CAo5mBA+gAsQEAARAQABgAMD/0DAAAAP7/q1CAo5mBB9AAsQEAARAQABgAMD/0DAAAAP7/q1CAo5mBC7gAsQEAARAQABgAMD/0DAAAAP7/q1CAo5mBD6AAsQEAARAQABgAMD/0DAAAAP7/q1CAo5mBE4gAsQEAARAQABgAMD/0DAAAAP7/q1CAH0O2de/nghdwo5mBAAAAsQEAARAQABgAMD/0DAAAAP7/q1CAo5iBA+gAkQEAARAQFGAAwP/QMAAA/v+rUICjmYEH0ACxAQABEBAAGAAwP/QMAAAA/v+rUICjmYELuACxAQABEBAAGAAwP/QMAAAA/v+rUIAcU7trkbuPs4EAt4r3gQHxggGg8IED';
+    const TINY_WEBM_BUF = Buffer.from(TINY_WEBM_B64, 'base64');
+
+    const openMediaResponses = new Set();
     const appServer = http.createServer((req, res) => {
       const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+      if (urlPath.startsWith('/mock-media/')) {
+        res.writeHead(200, {
+          'Content-Type': 'video/webm',
+          'Content-Length': String(TINY_WEBM_BUF.length),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-store'
+        });
+        res.end(TINY_WEBM_BUF);
+        return;
+      }
       const relPath = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
       const filePath = path.resolve(repoDir, relPath);
       if (!filePath.startsWith(repoDir + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
@@ -1513,6 +1529,14 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
               body: Buffer.from(JSON.stringify(obj)).toString('base64')
             }).catch(() => {});
 
+          if (/archive\.org\/download\//i.test(u)) {
+            return send('Fetch.fulfillRequest', {
+              requestId,
+              responseCode: 200,
+              responseHeaders: [{ name: 'Content-Type', value: 'video/webm' }, ...cors],
+              body: TINY_WEBM_B64
+            }).catch(() => {});
+          }
           if (/api\.redgifs\.com\/v2\/auth\/temporary/i.test(u)) {
             return fulfillJson({ token: 'rg_test_token' });
           }
@@ -1676,10 +1700,10 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
         settings.prebuffer = true;
         settings.autoPlay = false;
         videoQueue = [
-          { id: 'dl-0', title: 'Dual Clip 0', videoUrl: 'https://archive.org/download/dl0.mp4', format: 'mp4', isNsfw: false },
-          { id: 'dl-1', title: 'Dual Clip 1', videoUrl: 'https://archive.org/download/dl1.mp4', format: 'mp4', isNsfw: false },
-          { id: 'dl-2', title: 'Dual Clip 2', videoUrl: 'https://archive.org/download/dl2.mp4', format: 'mp4', isNsfw: false },
-          { id: 'dl-3', title: 'Dual Clip 3', videoUrl: 'https://archive.org/download/dl3.mp4', format: 'mp4', isNsfw: false }
+          { id: 'dl-0', title: 'Dual Clip 0', videoUrl: 'http://127.0.0.1:${port}/mock-media/dl0.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-1', title: 'Dual Clip 1', videoUrl: 'http://127.0.0.1:${port}/mock-media/dl1.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-2', title: 'Dual Clip 2', videoUrl: 'http://127.0.0.1:${port}/mock-media/dl2.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-3', title: 'Dual Clip 3', videoUrl: 'http://127.0.0.1:${port}/mock-media/dl3.mp4', format: 'mp4', isNsfw: false }
         ];
         currentIndex = 0;
         updatePlayerUI();
@@ -1701,14 +1725,140 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       })()`);
       assert.strictEqual(dualLayerCheck.totalStageVideos, 2, '#videoStage must always contain exactly 2 <video> elements');
       assert.notStrictEqual(dualLayerCheck.beforeActiveSlot, dualLayerCheck.beforeStandbySlot);
-      assert.strictEqual(dualLayerCheck.beforeStandbyUrl, 'https://archive.org/download/dl1.mp4');
+      assert.strictEqual(dualLayerCheck.beforeStandbyUrl, `http://127.0.0.1:${port}/mock-media/dl1.mp4`);
       assert.strictEqual(
         dualLayerCheck.afterActiveSlot,
         dualLayerCheck.beforeStandbySlot,
         'Advancing must promote standby slot to #mainVideo in real Chromium DOM'
       );
       assert.strictEqual(dualLayerCheck.afterStandbySlot, dualLayerCheck.beforeActiveSlot);
-      assert.strictEqual(dualLayerCheck.afterStandbyUrl, 'https://archive.org/download/dl2.mp4');
+      assert.strictEqual(dualLayerCheck.afterStandbyUrl, `http://127.0.0.1:${port}/mock-media/dl2.mp4`);
+
+      // 5. Live Chromium <video> DOM event listeners: >=80% timeupdate completion, loop wrap, Favorite click & standby error isolation
+      const liveDomEventsCheck = await evalJs(`(async () => {
+        resetAffinityState();
+        settings.allowNsfw = false;
+        settings.prebuffer = true;
+        settings.autoPlay = false;
+        videoQueue = [
+          {
+            id: 'ev-0',
+            title: 'Live Event Clip 0',
+            videoUrl: 'http://127.0.0.1:${port}/mock-media/ev0.mp4',
+            format: 'mp4',
+            duration: 10,
+            tags: ['astrophysics'],
+            author: 'carl',
+            platform: 'archive',
+            isNsfw: false
+          },
+          {
+            id: 'ev-1',
+            title: 'Live Event Clip 1',
+            videoUrl: 'http://127.0.0.1:${port}/mock-media/ev1.mp4',
+            format: 'mp4',
+            duration: 10,
+            isNsfw: false
+          },
+          {
+            id: 'ev-2',
+            title: 'Live Event Clip 2',
+            videoUrl: 'http://127.0.0.1:${port}/mock-media/ev2.mp4',
+            format: 'mp4',
+            duration: 10,
+            isNsfw: false
+          },
+          {
+            id: 'ev-3',
+            title: 'Live Event Clip 3',
+            videoUrl: 'http://127.0.0.1:${port}/mock-media/ev3.mp4',
+            format: 'mp4',
+            duration: 10,
+            isNsfw: false
+          }
+        ];
+        currentIndex = 0;
+        updatePlayerUI();
+        await scheduleBackgroundQueuePrebuffer();
+
+        const fgVideo = document.getElementById('mainVideo');
+        const sbVideo = document.getElementById('standbyVideo');
+        let mockTime = 0;
+        Object.defineProperty(fgVideo, 'currentTime', {
+          configurable: true,
+          get: () => mockTime,
+          set: (v) => { mockTime = Number(v) || 0; }
+        });
+
+        let afterCompletionWeight = 0;
+        let afterDuplicateTickWeight = 0;
+        let afterLoopWeight = 0;
+        let afterFavoriteClickWeight = 0;
+        try {
+          // Cross >= 80% duration -> +5 completion
+          mockTime = 8.5;
+          fgVideo.dispatchEvent(new Event('timeupdate'));
+          afterCompletionWeight = AffinityEngine.getState().safe.tags.astrophysics || 0;
+
+          // Subsequent tick at 9.2s before wrapping must not double-count
+          mockTime = 9.2;
+          fgVideo.dispatchEvent(new Event('timeupdate'));
+          afterDuplicateTickWeight = AffinityEngine.getState().safe.tags.astrophysics || 0;
+
+          // Loop wraparound (<20% then >=80% again) -> +5 loop
+          mockTime = 0.4;
+          fgVideo.dispatchEvent(new Event('timeupdate'));
+          mockTime = 8.4;
+          fgVideo.dispatchEvent(new Event('timeupdate'));
+          afterLoopWeight = AffinityEngine.getState().safe.tags.astrophysics || 0;
+
+          // Live #favoriteCurrentBtn click -> +5 favorite
+          document.getElementById('favoriteCurrentBtn').click();
+          for (let i = 0; i < 40; i++) {
+            if (document.getElementById('favoriteCurrentBtn')?.classList?.contains('active')) break;
+            await new Promise((r) => setTimeout(r, 15));
+          }
+          afterFavoriteClickWeight = AffinityEngine.getState().safe.tags.astrophysics || 0;
+        } finally {
+          delete fgVideo.currentTime;
+        }
+
+        // Dispatch real DOM error event on #standbyVideo: must isolate failure without interrupting #mainVideo
+        const activeSlotBeforeErr = fgVideo.dataset.playerSlot;
+        sbVideo.dispatchEvent(new Event('error'));
+        await new Promise((r) => setTimeout(r, 20));
+        const standbyFailedFlag = sbVideo.dataset.prebufferFailed;
+        const indexAfterStandbyErr = currentIndex;
+        const activeSlotAfterStandbyErr = document.getElementById('mainVideo')?.dataset?.playerSlot;
+
+        // Advancing when standby failed must keep foreground slot active rather than promoting broken standby
+        advanceToNextVideo({ userInitiated: true });
+        const activeSlotAfterFailedAdvance = document.getElementById('mainVideo')?.dataset?.playerSlot;
+
+        return {
+          afterCompletionWeight,
+          afterDuplicateTickWeight,
+          afterLoopWeight,
+          afterFavoriteClickWeight,
+          standbyFailedFlag,
+          indexAfterStandbyErr,
+          activeSlotBeforeErr,
+          activeSlotAfterStandbyErr,
+          activeSlotAfterFailedAdvance
+        };
+      })()`);
+      assert.strictEqual(liveDomEventsCheck.afterCompletionWeight, 5, 'timeupdate >=80% must award +5 completion');
+      assert.strictEqual(liveDomEventsCheck.afterDuplicateTickWeight, 5, 'Same-playthrough ticks must not double-reward');
+      assert.strictEqual(liveDomEventsCheck.afterLoopWeight, 10, 'Loop wraparound + >=80% must award +5 loop');
+      assert.strictEqual(liveDomEventsCheck.afterFavoriteClickWeight, 15, 'Favorite action must award +5');
+      assert.strictEqual(liveDomEventsCheck.standbyFailedFlag, 'true', '#standbyVideo error event must set prebufferFailed');
+      assert.strictEqual(liveDomEventsCheck.indexAfterStandbyErr, 0, 'Standby error must never skip active video');
+      assert.strictEqual(liveDomEventsCheck.activeSlotAfterStandbyErr, liveDomEventsCheck.activeSlotBeforeErr);
+      assert.strictEqual(
+        liveDomEventsCheck.activeSlotAfterFailedAdvance,
+        liveDomEventsCheck.activeSlotBeforeErr,
+        'Failed standby slot must not be promoted on advance'
+      );
     } finally {
       try {
         ws?.close();
@@ -1716,6 +1866,11 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       try {
         chrome.kill('SIGKILL');
       } catch {}
+      for (const r of openMediaResponses) {
+        try {
+          r.destroy();
+        } catch {}
+      }
       await new Promise((resolve) => appServer.close(resolve));
       try {
         fs.rmSync(tempRoot, { recursive: true, force: true });

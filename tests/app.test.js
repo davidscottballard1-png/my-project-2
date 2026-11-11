@@ -1564,14 +1564,17 @@ describe('ReelVault Unit Tests', () => {
       return { elements, slotA, slotB, getVideoCreateCount: () => videoCreateCount };
     }
 
-    it('keeps index.html, styles.css, and sw.js in v31 lockstep with stacked Player A and Player B in #videoStage', () => {
+    it('keeps index.html, styles.css, and sw.js in 3-way version lockstep with stacked Player A and Player B in #videoStage', () => {
       const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
       const swCode = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
       const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
 
-      assert.ok(swCode.includes("const CACHE_NAME = 'reelvault-v31'"));
-      assert.ok(html.includes('./styles.css?v=31'));
-      assert.ok(html.includes('./app.js?v=31'));
+      const verMatch = swCode.match(/const CACHE_NAME = 'reelvault-v(\d+)'/);
+      assert.ok(verMatch, 'sw.js must define CACHE_NAME = reelvault-v<N>');
+      const ver = Number(verMatch[1]);
+      assert.ok(ver >= 32, 'CACHE_NAME version should be >= 32');
+      assert.ok(html.includes(`./styles.css?v=${ver}`), `index.html styles.css?v=${ver} must match sw.js`);
+      assert.ok(html.includes(`./app.js?v=${ver}`), `index.html app.js?v=${ver} must match sw.js`);
       assert.ok(html.includes('id="mainVideo"') && html.includes('data-player-slot="A"'));
       assert.ok(html.includes('id="standbyVideo"') && html.includes('data-player-slot="B"'));
       assert.ok(css.includes('.video-stage .active-video-layer'));

@@ -2796,7 +2796,7 @@ function unlockAppGate() {
       scheduleBackgroundQueuePrebuffer();
     } else if (settings.prebuffer && videoQueue.length === 0 && savedSessionExpiredOnRestore) {
       savedSessionExpiredOnRestore = false;
-      pullRandomVideos(1).catch?.(() => {});
+      pullRandomVideos(1, null, { backgroundEmptyRecovery: true }).catch?.(() => {});
     }
   }
   return true;
@@ -8569,9 +8569,16 @@ async function handleVideoPlaybackError(opts = {}) {
   clearPlaybackStartupWatchdog();
 
   try {
+    const isStillActiveTarget = () =>
+      videoQueue[currentIndex] === current &&
+      (typeof document === 'undefined' || document.getElementById('mainVideo') === videoEl);
+
     // 0. If this video has a cached offline Blob in IndexedDB Vault, rehydrate and switch to blob: immediately
     if (!(current.offlineBlob instanceof Blob)) {
       const rehydrated = await rehydrateQueueOfflineBlobsFromVault();
+      if (!isStillActiveTarget()) {
+        return false;
+      }
       if (rehydrated && current.offlineBlob instanceof Blob) {
         consecutiveErrorSkips = 0;
         updatePlayerUI();
@@ -8611,6 +8618,9 @@ async function handleVideoPlaybackError(opts = {}) {
       if (videoEl.dataset) videoEl.dataset.autoConvertAttempted = 'true';
       showToast(`Auto-converting .${(current.format || 'video').toUpperCase()} for iPhone playback...`);
       const convertedOk = await convertCurrentVideoForPlayer(current);
+      if (!isStillActiveTarget()) {
+        return false;
+      }
       if (convertedOk) {
         return true;
       }
@@ -8625,7 +8635,7 @@ async function handleVideoPlaybackError(opts = {}) {
       if (videoEl.dataset) videoEl.dataset.streamRescueAttempted = 'true';
       const rescued = await rescueDeadVideoStream(current, opts);
       if (rescued) {
-        if (videoQueue[currentIndex] !== current) {
+        if (!isStillActiveTarget()) {
           if (rescued.blobUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
             try {
               URL.revokeObjectURL(rescued.blobUrl);
@@ -8807,17 +8817,18 @@ async function handleVideoPlaybackError(opts = {}) {
     } catch {}
 
     currentIndex = -1;
-    await pullRandomVideos(1);
+    await pullRandomVideos(1, null, { backgroundEmptyRecovery: true });
     return true;
   } finally {
     isHandlingPlaybackError = false;
   }
 }
 
-async function pullRandomVideos(count = 1, customKeyword = null) {
+async function pullRandomVideos(count = 1, customKeyword = null, opts = {}) {
   const pullGen = modeGeneration;
   const pullSourceGen = sourceSelectionGeneration;
   const pullAllowNsfw = Boolean(settings.allowNsfw);
+  const onlyIfStillEmpty = Boolean(opts && opts.backgroundEmptyRecovery);
 
   if (typeof document !== 'undefined') {
     const mainEl = document.querySelector?.('.app-main');
@@ -8862,7 +8873,8 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         if (
           pullGen !== modeGeneration ||
           pullSourceGen !== sourceSelectionGeneration ||
-          Boolean(settings.allowNsfw) !== pullAllowNsfw
+          Boolean(settings.allowNsfw) !== pullAllowNsfw ||
+          (onlyIfStillEmpty && videoQueue.length > 0)
         ) {
           return;
         }
@@ -8884,7 +8896,8 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
         if (
           pullGen !== modeGeneration ||
           pullSourceGen !== sourceSelectionGeneration ||
-          Boolean(settings.allowNsfw) !== pullAllowNsfw
+          Boolean(settings.allowNsfw) !== pullAllowNsfw ||
+          (onlyIfStillEmpty && videoQueue.length > 0)
         ) {
           return;
         }
@@ -8933,7 +8946,8 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
     if (
       pullGen !== modeGeneration ||
       (!customKeyword && pullSourceGen !== sourceSelectionGeneration) ||
-      Boolean(settings.allowNsfw) !== pullAllowNsfw
+      Boolean(settings.allowNsfw) !== pullAllowNsfw ||
+      (onlyIfStillEmpty && videoQueue.length > 0)
     ) {
       return;
     }
@@ -8989,7 +9003,11 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
     }
     return selected;
   } catch {
-    if (pullGen !== modeGeneration || Boolean(settings.allowNsfw) !== pullAllowNsfw) {
+    if (
+      pullGen !== modeGeneration ||
+      Boolean(settings.allowNsfw) !== pullAllowNsfw ||
+      (onlyIfStillEmpty && videoQueue.length > 0)
+    ) {
       return [];
     }
     if (!settings.allowNsfw) {
@@ -9650,6 +9668,8 @@ if (typeof document !== 'undefined') {
   updateHeaderSummary();
   renderSourcesList();
   await renderVaultList();
+  attachVideoLayerListeners(document.getElementById('mainVideo'));
+  attachVideoLayerListeners(document.getElementById('standbyVideo'));
   const launchedDeepLink = initBookmarkletAndUrlParams();
 
   // Sync settings controls
@@ -9696,7 +9716,7 @@ if (typeof document !== 'undefined') {
       }
     } else if (isAppUnlocked && settings.prebuffer && savedSessionExpiredOnRestore) {
       savedSessionExpiredOnRestore = false;
-      pullRandomVideos(1).catch?.(() => {});
+      pullRandomVideos(1, null, { backgroundEmptyRecovery: true }).catch?.(() => {});
     }
     if (!isAppUnlocked) {
       try {
@@ -9786,7 +9806,7 @@ if (typeof document !== 'undefined') {
   });
 
   // Bind Dual-Layer Video Recycling listeners to both Player A & Player B (never destroyed/recreated)
-  const attachVideoLayerListeners = (videoEl) => {
+  function attachVideoLayerListeners(videoEl) {
     if (!videoEl || boundVideoLayerElements.has(videoEl)) return;
     boundVideoLayerElements.add(videoEl);
 
@@ -9973,7 +9993,7 @@ if (typeof document !== 'undefined') {
       }
       await handleVideoPlaybackError();
     });
-  };
+  }
 
   attachVideoLayerListeners(document.getElementById('mainVideo'));
   attachVideoLayerListeners(document.getElementById('standbyVideo'));
