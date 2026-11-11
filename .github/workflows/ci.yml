@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   unit-and-regression-tests:
-    name: Syntax & Unit/Regression Tests
+    name: Syntax, Unit Tests & Headless Chrome Overflow Audit
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -34,9 +34,13 @@ jobs:
           node --check app.js
           node --check sw.js
           node --check scripts/smoke-live-proxies.mjs
+          node --check scripts/check-layout-overflow.mjs
 
       - name: Run full unit & regression test suite
         run: node --test tests/*.js
+
+      - name: Run headless Chrome pixel-level overflow audit (6 viewports × 4 tabs)
+        run: node scripts/check-layout-overflow.mjs
 
   live-production-proxy-smoke:
     name: Live github.io Origin CORS Proxy Smoke Check
