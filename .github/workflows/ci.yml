@@ -29,12 +29,14 @@ jobs:
         with:
           node-version: 22
 
-      - name: Check JavaScript syntax
+      - name: Check JavaScript & Installer syntax
         run: |
           node --check app.js
           node --check sw.js
+          node --check server/bridge.js
           node --check scripts/smoke-live-proxies.mjs
           node --check scripts/check-layout-overflow.mjs
+          bash -n server/setup.sh
 
       - name: Run full unit & regression test suite
         run: node --test tests/*.js

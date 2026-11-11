@@ -852,6 +852,114 @@ button:disabled {
   font-weight: 600;
 }
 
+/* Plex & Private Cloud Server Controls */
+.plex-action-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+}
+
+.btn-plex-full {
+  width: 100%;
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  color: #1c1302;
+  font-weight: 700;
+  padding: 11px 14px;
+  border-radius: 12px;
+  font-size: 0.9rem;
+  box-shadow: 0 4px 14px rgba(245, 158, 11, 0.24);
+}
+
+.btn-plex {
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  color: #1c1302;
+  font-weight: 700;
+}
+
+#cloudBackendUrlInput,
+#cloudApiKeyInput {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-main);
+  padding: 11px 14px;
+  border-radius: 12px;
+  font-size: 0.92rem;
+  outline: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+#cloudBackendUrlInput:focus,
+#cloudApiKeyInput:focus {
+  border-color: var(--accent-primary);
+}
+
+.cloud-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.cloud-badge-ok {
+  color: #6ee7b7;
+  font-weight: 600;
+}
+
+.cloud-badge-warn {
+  color: #fcd34d;
+  font-weight: 600;
+}
+
+.cloud-jobs-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 11px;
+  padding: 10px 12px;
+  font-size: 0.78rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.cloud-job-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border-subtle);
+  min-width: 0;
+}
+
+.cloud-job-row:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.cloud-job-title {
+  flex: 1 1 140px;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--text-main);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.cloud-job-status {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 /* Card Sections (Tabs 2, 3, 4) */
 .card-section {
   background: var(--bg-card);
@@ -2341,7 +2449,8 @@ body.app-locked .app-container {
   .btn-accent,
   .btn-secondary,
   .btn-download,
-  .btn-vault {
+  .btn-vault,
+  .btn-plex-full {
     padding: 6px 8px;
     font-size: 0.78rem;
     border-radius: 9px;

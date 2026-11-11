@@ -1,0 +1,6 @@
+exclude:
+  - server
+  - scripts
+  - tests
+  - node_modules
+  - README.md

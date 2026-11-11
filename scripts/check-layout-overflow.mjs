@@ -367,6 +367,28 @@ try {
         }
         scanAllTabs('nsfw-dir-enabled');
 
+        // 5. Cloud & Plex Connected State — #sendToPlexBtn, #reelsPlexBtn, Search/Vault 🎬 Plex buttons, and #cloudJobsBox
+        setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_layout_audit_secret_key_0123456789');
+        renderPlexJobsBox([
+          {
+            id: 'a1b2c3d4',
+            title: 'SuperLongUnbrokenClipTitle_nsfw+NSFW_GIF+RealGirls+Amateur_1080p_60fps',
+            isNsfw: true,
+            status: 'ready',
+            sizeBytes: 48 * 1024 * 1024
+          },
+          {
+            id: 'e5f60718',
+            title: 'NASA_Perseverance_Mars_Descent_4K_DirectPlay',
+            isNsfw: false,
+            status: 'optimizing',
+            sizeBytes: 0
+          }
+        ]);
+        await renderVaultList();
+        scanAllTabs('cloud-plex-connected');
+        clearCloudBackendConfig();
+
         return issues;
       })()`
     });

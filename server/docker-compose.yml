@@ -1,0 +1,61 @@
+services:
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: reelvault-plex
+    ports:
+      - "32400:32400/tcp"
+    environment:
+      - PUID=0
+      - PGID=0
+      - TZ=${TZ:-America/New_York}
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM:-}
+      - ADVERTISE_IP=http://${VPS_IP}:32400/,https://${BRIDGE_DOMAIN}:32400/
+    volumes:
+      - ./plex-config:/config
+      - ./media/safe:/data/safe
+      - ./media/vault-18:/data/vault-18
+    restart: unless-stopped
+
+  reelvault-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reelvault-bridge
+    environment:
+      - PORT=8787
+      - REELVAULT_API_KEY=${REELVAULT_API_KEY}
+      - RESIDENTIAL_PROXY_URL=${RESIDENTIAL_PROXY_URL:-}
+      - PLEX_URL=http://plex:32400
+      - PLEX_TOKEN=${PLEX_TOKEN:-}
+      - PLEX_PREFS_PATH=/plex-config/Library/Application Support/Plex Media Server/Preferences.xml
+      - MEDIA_SAFE_DIR=/data/safe
+      - MEDIA_NSFW_DIR=/data/vault-18
+    volumes:
+      - ./media/safe:/data/safe
+      - ./media/vault-18:/data/vault-18
+      - ./plex-config:/plex-config:ro
+    depends_on:
+      - plex
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: reelvault-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - BRIDGE_DOMAIN=${BRIDGE_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - reelvault-bridge
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
