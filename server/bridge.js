@@ -14,8 +14,10 @@ const { spawn, execFile } = require('node:child_process');
 const PORT = Number(process.env.PORT) || 8787;
 const API_KEY = String(process.env.REELVAULT_API_KEY || '').trim();
 const RESIDENTIAL_PROXY_URL = String(process.env.RESIDENTIAL_PROXY_URL || '').trim();
-const PLEX_URL = String(process.env.PLEX_URL || 'http://plex:32400').replace(/\/+$/, '');
+const PLEX_URL = String(process.env.PLEX_URL || 'http://host.docker.internal:32400').replace(/\/+$/, '');
 const ENV_PLEX_TOKEN = String(process.env.PLEX_TOKEN || '').trim();
+const VPS_IP = String(process.env.VPS_IP || '').trim();
+const PLEX_DOMAIN = String(process.env.PLEX_DOMAIN || '').trim();
 const PLEX_PREFS_PATH =
   process.env.PLEX_PREFS_PATH ||
   '/plex-config/Library/Application Support/Plex Media Server/Preferences.xml';
@@ -27,6 +29,7 @@ const BROWSER_UA =
 
 const BLOCKED_HOSTNAMES = new Set([
   'localhost',
+  'host.docker.internal',
   'plex',
   'reelvault-plex',
   'caddy',
@@ -622,7 +625,172 @@ async function getPlexSections(token) {
   return Array.isArray(data?.MediaContainer?.Directory) ? data.MediaContainer.Directory : [];
 }
 
-async function ensurePlexLibraries() {
+let lastPlexConnectivityCheckAt = 0;
+
+function isGenericContainerOrVpsName(name) {
+  const clean = String(name || '').trim();
+  if (!clean) return true;
+  // Matches 12-char hex Docker container IDs (e.g. c9b3ab10cc47) or generic default VPS hostnames (e.g. Contabo vmi123456)
+  return /^(?:[0-9a-f]{12}|vmi\d+(?:\..+)?|localhost|ubuntu|debian)$/i.test(clean);
+}
+
+function buildDesiredCustomConnections(plexDomain = PLEX_DOMAIN, vpsIp = VPS_IP) {
+  const urls = [];
+  const cleanDomain = String(plexDomain || '')
+    .trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '')
+    .replace(/:\d+$/, '');
+  const cleanIp = String(vpsIp || '').trim();
+  if (cleanDomain) {
+    urls.push(`https://${cleanDomain}:443`);
+  }
+  if (cleanIp && net.isIP(cleanIp) === 4 && !isPrivateOrReservedIp(cleanIp)) {
+    urls.push(`http://${cleanIp}:32400`);
+  }
+  return urls;
+}
+
+async function ensurePlexRemoteConnectivity(token, opts = {}) {
+  if (!token) return { synced: false, updated: [] };
+
+  const basePlexUrl = String(opts.plexUrl || PLEX_URL).replace(/\/+$/, '');
+  const plexDomain = opts.plexDomain !== undefined ? opts.plexDomain : PLEX_DOMAIN;
+  const vpsIp = opts.vpsIp !== undefined ? opts.vpsIp : VPS_IP;
+  const force = Boolean(opts.force);
+
+  const prefsRes = await fetch(`${basePlexUrl}/:/prefs?X-Plex-Token=${encodeURIComponent(token)}`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(6000)
+  });
+  if (!prefsRes.ok) {
+    return { synced: false, updated: [] };
+  }
+
+  const prefsData = await prefsRes.json();
+  const rawSettings = Array.isArray(prefsData?.MediaContainer?.Setting)
+    ? prefsData.MediaContainer.Setting
+    : [];
+
+  const byLower = new Map();
+  for (const s of rawSettings) {
+    if (s && typeof s.id === 'string') {
+      byLower.set(s.id.toLowerCase(), s);
+    }
+  }
+
+  const findSetting = (...names) => {
+    for (const n of names) {
+      const found = byLower.get(String(n).toLowerCase());
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const isTruthyPref = (v) =>
+    v === true || v === 1 || v === '1' || String(v || '').toLowerCase() === 'true';
+
+  const formatBoolValue = (setting, val) => {
+    if (setting?.type === 'int') return val ? '1' : '0';
+    return val ? 'true' : 'false';
+  };
+
+  const updates = [];
+
+  const friendlySetting = findSetting('FriendlyName');
+  let friendlyName = String(friendlySetting?.value || '').trim();
+  if (friendlySetting && isGenericContainerOrVpsName(friendlyName)) {
+    friendlyName = 'ReelVault Cloud';
+    updates.push([friendlySetting.id, friendlyName]);
+  }
+
+  const eulaSetting = findSetting('acceptedEULA');
+  if (eulaSetting && !isTruthyPref(eulaSetting.value)) {
+    updates.push([eulaSetting.id, formatBoolValue(eulaSetting, true)]);
+  }
+
+  const publishSetting = findSetting('PublishServerOnPlexOnlineKey', 'PublishServerOnPlexOnline');
+  if (publishSetting && !isTruthyPref(publishSetting.value)) {
+    updates.push([publishSetting.id, formatBoolValue(publishSetting, true)]);
+  }
+
+  const manualModeSetting = findSetting('ManualPortMappingMode');
+  if (manualModeSetting && !isTruthyPref(manualModeSetting.value)) {
+    updates.push([manualModeSetting.id, formatBoolValue(manualModeSetting, true)]);
+  }
+
+  const manualPortSetting = findSetting('ManualPortMappingPort');
+  if (manualPortSetting && Number(manualPortSetting.value) !== 32400) {
+    updates.push([manualPortSetting.id, '32400']);
+  }
+
+  const secureSetting = findSetting('secureConnections');
+  if (secureSetting && Number(secureSetting.value) !== 1) {
+    updates.push([secureSetting.id, '1']);
+  }
+
+  const customConnSetting = findSetting('customConnections');
+  const desiredUrls = buildDesiredCustomConnections(plexDomain, vpsIp);
+  let customConnections = String(customConnSetting?.value || '').trim();
+  if (customConnSetting && desiredUrls.length > 0) {
+    const cleanedExisting = customConnections
+      .split(',')
+      .map((u) => u.trim().replace(/\/+$/, ''))
+      .filter((u) => {
+        if (!u) return false;
+        try {
+          const parsed = new URL(u);
+          if (net.isIP(parsed.hostname) && isPrivateOrReservedIp(parsed.hostname)) return false;
+          if (parsed.hostname === 'localhost') return false;
+          if (/\.(?:nip|sslip)\.io$/i.test(parsed.hostname) && parsed.port === '32400') return false;
+          return true;
+        } catch {
+          return false;
+        }
+      });
+
+    const merged = [...new Set([...desiredUrls, ...cleanedExisting])].join(',');
+    if (customConnections !== merged) {
+      customConnections = merged;
+      updates.push([customConnSetting.id, merged]);
+    }
+  }
+
+  const appliedKeys = [];
+  for (const [exactKey, val] of updates) {
+    const putRes = await fetch(
+      `${basePlexUrl}/:/prefs?${encodeURIComponent(exactKey)}=${encodeURIComponent(
+        val
+      )}&X-Plex-Token=${encodeURIComponent(token)}`,
+      {
+        method: 'PUT',
+        signal: AbortSignal.timeout(6000)
+      }
+    );
+    if (putRes.ok) {
+      appliedKeys.push(exactKey);
+    }
+  }
+
+  if (appliedKeys.length > 0 || force) {
+    await fetch(
+      `${basePlexUrl}/myplex/refreshReachability?X-Plex-Token=${encodeURIComponent(token)}`,
+      {
+        method: 'PUT',
+        signal: AbortSignal.timeout(8000)
+      }
+    ).catch(() => {});
+  }
+
+  return {
+    synced: true,
+    updated: appliedKeys,
+    friendlyName: friendlyName || null,
+    customConnections: customConnections || null
+  };
+}
+
+async function ensurePlexLibraries(opts = {}) {
   const token = readPlexToken();
   if (!token) {
     return { reachable: false, claimed: false, libraries: [] };
@@ -632,6 +800,15 @@ async function ensurePlexLibraries() {
     let dirs = await getPlexSections(token);
     if (!dirs) {
       return { reachable: false, claimed: true, libraries: [] };
+    }
+
+    let remoteAccess = null;
+    const now = Date.now();
+    if (opts.forceRefresh || now - lastPlexConnectivityCheckAt > 45000) {
+      lastPlexConnectivityCheckAt = now;
+      remoteAccess = await ensurePlexRemoteConnectivity(token, {
+        force: Boolean(opts.forceRefresh)
+      }).catch(() => null);
     }
 
     const hasPath = (sections, targetPath) =>
@@ -682,6 +859,8 @@ async function ensurePlexLibraries() {
     return {
       reachable: true,
       claimed: true,
+      friendlyName: remoteAccess?.friendlyName || undefined,
+      updatedPrefs: remoteAccess?.updated || undefined,
       libraries: dirs.map((d) => ({ id: d.key, title: d.title }))
     };
   } catch {
@@ -1048,7 +1227,8 @@ function createBridgeServer() {
       if (!verifyApiKey(providedKey)) {
         return sendJson(res, 401, { ok: false, error: 'Invalid API Secret Key' });
       }
-      const plex = await ensurePlexLibraries();
+      const forceRefresh = parsedUrl.searchParams.get('refreshPlex') === '1';
+      const plex = await ensurePlexLibraries({ forceRefresh });
       return sendJson(res, 200, {
         ok: true,
         authenticated: true,
@@ -1100,7 +1280,7 @@ if (require.main === module) {
       })`
     );
     setTimeout(() => {
-      ensurePlexLibraries().catch(() => {});
+      ensurePlexLibraries({ forceRefresh: true }).catch(() => {});
     }, 8000).unref?.();
   });
 }
@@ -1115,5 +1295,8 @@ module.exports = {
   sanitizeFilenameTitle,
   isSpecificWatchPageUrl,
   pickPlayableItemsFromYtDlp,
+  isGenericContainerOrVpsName,
+  buildDesiredCustomConnections,
+  ensurePlexRemoteConnectivity,
   createBridgeServer
 };

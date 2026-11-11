@@ -38,6 +38,7 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
     assert.strictEqual(bridge.isPrivateOrReservedIp('2606:4700:4700::1111'), false);
 
     await assert.rejects(() => bridge.assertSafePublicUrl('http://127.0.0.1:32400/web'));
+    await assert.rejects(() => bridge.assertSafePublicUrl('http://host.docker.internal:32400/identity'));
     await assert.rejects(() => bridge.assertSafePublicUrl('http://plex:32400/library/sections'));
     await assert.rejects(() => bridge.assertSafePublicUrl('http://169.254.169.254/latest/meta-data/'));
     await assert.rejects(() => bridge.assertSafePublicUrl('file:///etc/passwd'));
@@ -106,6 +107,99 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
     assert.strictEqual(picked[0].videoUrl, 'https://cdn.example.org/v_720.mp4');
     assert.strictEqual(picked[0].format, 'mp4');
     assert.strictEqual(picked[0].isHd, true);
+  });
+
+  it('repairs unreachable Docker container ID Plex servers (e.g. c9b3ab10cc47), enables Remote Access, sets HTTPS :443 customConnections, and refreshes plex.tv reachability', async () => {
+    const prefsState = new Map([
+      ['FriendlyName', { id: 'FriendlyName', type: 'text', value: 'c9b3ab10cc47' }],
+      ['acceptedEULA', { id: 'acceptedEULA', type: 'bool', value: false }],
+      ['PublishServerOnPlexOnlineKey', { id: 'PublishServerOnPlexOnlineKey', type: 'bool', value: false }],
+      ['ManualPortMappingMode', { id: 'ManualPortMappingMode', type: 'bool', value: false }],
+      ['ManualPortMappingPort', { id: 'ManualPortMappingPort', type: 'int', value: 0 }],
+      ['secureConnections', { id: 'secureConnections', type: 'int', value: 1 }],
+      [
+        'customConnections',
+        {
+          id: 'customConnections',
+          type: 'text',
+          value: 'http://172.18.0.2:32400,https://85-239-249-225.nip.io:32400/'
+        }
+      ]
+    ]);
+    let reachabilityRefreshCount = 0;
+
+    const mockPlex = http.createServer((req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      if (u.searchParams.get('X-Plex-Token') !== 'plex_tok_test') {
+        res.writeHead(401);
+        return res.end();
+      }
+      if (req.method === 'GET' && u.pathname === '/:/prefs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            MediaContainer: { Setting: Array.from(prefsState.values()) }
+          })
+        );
+      }
+      if (req.method === 'PUT' && u.pathname === '/:/prefs') {
+        for (const [k, v] of u.searchParams.entries()) {
+          if (k === 'X-Plex-Token') continue;
+          const existing = prefsState.get(k);
+          if (!existing) {
+            res.writeHead(400);
+            return res.end(`unknown preference ${k}`);
+          }
+          existing.value = existing.type === 'bool' ? v === 'true' || v === '1' : existing.type === 'int' ? Number(v) : v;
+        }
+        res.writeHead(200);
+        return res.end();
+      }
+      if (req.method === 'PUT' && u.pathname === '/myplex/refreshReachability') {
+        reachabilityRefreshCount++;
+        res.writeHead(200);
+        return res.end();
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockPlex.listen(0, '127.0.0.1', resolve));
+    const plexUrl = `http://127.0.0.1:${mockPlex.address().port}`;
+
+    try {
+      const sync1 = await bridge.ensurePlexRemoteConnectivity('plex_tok_test', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+
+      assert.strictEqual(sync1.synced, true);
+      assert.strictEqual(sync1.friendlyName, 'ReelVault Cloud');
+      assert.strictEqual(prefsState.get('FriendlyName').value, 'ReelVault Cloud');
+      assert.strictEqual(prefsState.get('acceptedEULA').value, true);
+      assert.strictEqual(prefsState.get('PublishServerOnPlexOnlineKey').value, true);
+      assert.strictEqual(prefsState.get('ManualPortMappingMode').value, true);
+      assert.strictEqual(prefsState.get('ManualPortMappingPort').value, 32400);
+      assert.strictEqual(
+        prefsState.get('customConnections').value,
+        'https://plex-85-239-249-225.nip.io:443,http://85.239.249.225:32400'
+      );
+      assert.strictEqual(reachabilityRefreshCount, 1);
+
+      // Second run should be idempotent (no unnecessary PUTs) and preserve user-chosen FriendlyName
+      prefsState.get('FriendlyName').value = 'My Personal Cloud Vault';
+      const sync2 = await bridge.ensurePlexRemoteConnectivity('plex_tok_test', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+      assert.deepStrictEqual(sync2.updated, []);
+      assert.strictEqual(prefsState.get('FriendlyName').value, 'My Personal Cloud Vault');
+      assert.strictEqual(reachabilityRefreshCount, 1);
+    } finally {
+      await new Promise((resolve) => mockPlex.close(resolve));
+    }
   });
 
   it('serves /health (unauthenticated & authenticated) and rejects unauthorized /proxy & /plex/save calls', async () => {

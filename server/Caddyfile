@@ -4,3 +4,9 @@
 		flush_interval -1
 	}
 }
+
+{$PLEX_DOMAIN} {
+	reverse_proxy host.docker.internal:32400 {
+		flush_interval -1
+	}
+}
