@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   unit-and-regression-tests:
-    name: Syntax & 147 Unit/Regression Tests
+    name: Syntax & Unit/Regression Tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

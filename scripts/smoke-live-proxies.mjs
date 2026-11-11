@@ -99,15 +99,14 @@ async function runWithRetry(fn, attempts = 2) {
   throw lastErr;
 }
 
-// Fast (<100ms) real ReelVault discovery endpoint (Wikimedia Commons JSON API)
-const probeJsonUrl =
-  'https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=filetype:video&srnamespace=6&srlimit=1&format=json';
+// Ultra-fast (<30ms CDN) JSON endpoint so proxy health is tested without flaking on slow upstream search engines
+const probeJsonUrl = 'https://davidscottballard1-png.github.io/my-project-2/manifest.json';
 
 console.log(`[smoke] Probing fetchWithCorsFallback() with Origin: ${PROD_ORIGIN} ...`);
 
 let jsonPayload;
 try {
-  jsonPayload = await runWithRetry(() => fetchWithCorsFallback(probeJsonUrl, false), 2);
+  jsonPayload = await runWithRetry(() => fetchWithCorsFallback(probeJsonUrl, false), 3);
 } catch (err) {
   console.error(`[smoke] Proxy diagnostics: ${proxyDiagnostics.join(' | ')}`);
   throw err;
@@ -120,9 +119,10 @@ assert.strictEqual(
   false,
   'Returned JSON payload must pass isInvalidCorsProxyPayload()'
 );
-assert.ok(
-  Array.isArray(jsonPayload?.query?.search),
-  `Expected Wikimedia query.search array via production CORS proxy, got: ${JSON.stringify(jsonPayload).slice(0, 200)}`
+assert.strictEqual(
+  jsonPayload?.short_name,
+  'ReelVault',
+  `Expected ReelVault manifest JSON via production CORS proxy, got: ${JSON.stringify(jsonPayload).slice(0, 200)}`
 );
 assert.strictEqual(
   observedProxyRequests.some((u) => u.startsWith('https://corsproxy.io/')),
