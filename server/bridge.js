@@ -772,6 +772,7 @@ function pickPlayableItemsFromYtDlp(info, fallbackPageUrl) {
       proxyRequired: isIpBoundStreamUrl(best.url),
       ...(ageLimit >= 18 || isKnownAdultHost(pageUrl || '') ? { isNsfw: true } : {}),
       tags: Array.isArray(entry.tags) ? entry.tags.slice(0, 6) : [],
+      author: entry.uploader || entry.channel || null,
       sourceName: entry.extractor_key ? `${entry.extractor_key} (Cloud)` : 'Cloud Extractor',
       pageUrl
     });

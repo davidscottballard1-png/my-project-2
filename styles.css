@@ -261,6 +261,21 @@ input:focus {
   background: #000;
 }
 
+.video-stage .active-video-layer {
+  position: relative;
+  z-index: 1;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.video-stage .standby-video-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .video-controls-panel {
   display: flex;
   flex-direction: column;
@@ -549,6 +564,7 @@ body.reels-mode-active .bottom-nav,
 .player-overlay {
   position: absolute;
   inset: 0;
+  z-index: 6;
   background: rgba(7, 11, 18, 0.88);
   display: flex;
   flex-direction: column;

@@ -4,7 +4,8 @@ const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
   SETTINGS: 'reelvault_settings_v1',
   PLAYBACK_STATE: 'reelvault_playback_state_v1',
-  CLOUD_CONFIG: 'reelvault_cloud_config_v1'
+  CLOUD_CONFIG: 'reelvault_cloud_config_v1',
+  AFFINITY_PROFILE: 'reelvault_affinity_v1'
 };
 
 // Comprehensive catalog of 19 video extensions across the internet:
@@ -265,7 +266,16 @@ const FALLBACK_VIDEOS = [
     id: 'fb-apollo11',
     title: 'Apollo 11 Saturn V Launch (NASA Archive)',
     videoUrl: 'https://archive.org/download/Apollo11Audio/Apollo11Launch.mp4',
+    originalUrl: 'https://archive.org/download/Apollo11Audio/Apollo11Launch.mp4',
+    convertedUrl: null,
     format: 'mp4',
+    isAutoConverted: false,
+    isNsfw: false,
+    duration: 0,
+    isHd: false,
+    tags: [],
+    author: 'NASA',
+    platform: 'fallback',
     sourceName: 'Internet Archive (NASA)',
     pageUrl: 'https://archive.org/details/Apollo11Audio'
   },
@@ -273,7 +283,16 @@ const FALLBACK_VIDEOS = [
     id: 'fb-bigbuck',
     title: 'Big Buck Bunny — Open Movie Short Clip',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
+    originalUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
+    convertedUrl: null,
     format: 'mp4',
+    isAutoConverted: false,
+    isNsfw: false,
+    duration: 0,
+    isHd: false,
+    tags: [],
+    author: 'Blender Foundation',
+    platform: 'fallback',
     sourceName: 'Open Movie Archive',
     pageUrl: 'https://peach.blender.org/'
   },
@@ -281,7 +300,16 @@ const FALLBACK_VIDEOS = [
     id: 'fb-forbiggerblazes',
     title: 'High Speed Nature & Fire Reel',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    originalUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+    convertedUrl: null,
     format: 'mp4',
+    isAutoConverted: false,
+    isNsfw: false,
+    duration: 0,
+    isHd: false,
+    tags: [],
+    author: null,
+    platform: 'fallback',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   },
@@ -289,7 +317,16 @@ const FALLBACK_VIDEOS = [
     id: 'fb-forbiggerescapes',
     title: 'Scenic Mountain & Alpine Escape Reel',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
+    originalUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
+    convertedUrl: null,
     format: 'mp4',
+    isAutoConverted: false,
+    isNsfw: false,
+    duration: 0,
+    isHd: false,
+    tags: [],
+    author: null,
+    platform: 'fallback',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   },
@@ -297,7 +334,16 @@ const FALLBACK_VIDEOS = [
     id: 'fb-wearegoingonbullrun',
     title: 'Rally & Roadtrip Action Clip',
     videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4',
+    originalUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4',
+    convertedUrl: null,
     format: 'mp4',
+    isAutoConverted: false,
+    isNsfw: false,
+    duration: 0,
+    isHd: false,
+    tags: [],
+    author: null,
+    platform: 'fallback',
     sourceName: 'Open Media Stream',
     pageUrl: 'https://commondatastorage.googleapis.com/'
   }
@@ -335,6 +381,24 @@ let isReelsFullscreen = false;
 let isAdultDirectoryExpanded = false;
 let isBackgroundRefilling = false;
 let prebufferVideoEl = null;
+let savedSessionExpiredOnRestore = false;
+const boundVideoLayerElements = new WeakSet();
+let affinityState = {
+  safe: { tags: {}, authors: {}, platforms: {} },
+  nsfw: { tags: {}, authors: {}, platforms: {} }
+};
+let activeAffinityWatch = {
+  key: '',
+  item: null,
+  hasPlayed: false,
+  accumulatedPlaySec: 0,
+  lastPlayResumeMs: 0,
+  maxCurrentTimeSec: 0,
+  rewardedCompletion: false,
+  loopArmed: false,
+  loopCount: 0,
+  rewardedVault: false
+};
 let cachedRedgifsToken = null;
 let cachedRedgifsTokenExpiry = 0;
 let cachedRedgifsTokenViaProxy = false;
@@ -1455,6 +1519,13 @@ async function saveAndCacheVideoToVault(videoItem, forceOfflineDownload = false)
   if (videoItem && typeof videoItem === 'object' && savedRecord?.id) {
     videoItem.id = savedRecord.id;
   }
+  if (videoItem && typeof videoItem === 'object' && !videoItem._affinityVaultRewarded) {
+    videoItem._affinityVaultRewarded = true;
+    if (activeAffinityWatch.key && activeAffinityWatch.key === getPlaybackItemKey(videoItem)) {
+      activeAffinityWatch.rewardedVault = true;
+    }
+    recordAffinitySignal(videoItem, 'vault');
+  }
 
   if (!forceOfflineDownload && !settings.offlineVaultCache) {
     await renderVaultList();
@@ -1546,6 +1617,13 @@ async function toggleCurrentVideoFavorite() {
   const current = videoQueue[currentIndex];
   if (!current) return null;
   current.isFavorite = !current.isFavorite;
+  if (current.isFavorite && !current._affinityVaultRewarded) {
+    current._affinityVaultRewarded = true;
+    if (activeAffinityWatch.key && activeAffinityWatch.key === getPlaybackItemKey(current)) {
+      activeAffinityWatch.rewardedVault = true;
+    }
+    recordAffinitySignal(current, 'favorite');
+  }
   try {
     const saved = await saveVideoToVaultDB(current);
     if (saved?.id) {
@@ -1751,6 +1829,8 @@ function loadState() {
   } catch {
     cloudConfig = { backendUrl: '', apiKey: '', enabled: false };
   }
+
+  loadAffinityState();
 }
 
 function saveSources() {
@@ -2501,6 +2581,7 @@ function renderAdultDirectory(filterOverride) {
 
 function isPeerTubeVideoItem(item) {
   if (!item || typeof item !== 'object') return false;
+  if (item.platform === 'peertube') return true;
   if (String(item.id || '').startsWith('pt-')) return true;
   if (/\bpeertube\b/i.test(String(item.sourceName || ''))) return true;
   return false;
@@ -2608,15 +2689,9 @@ function syncQueueAfterSourceChange() {
       }
       revokeVideoItemBlobUrls(removedUpcoming);
 
-      if (prebufferVideoEl) {
-        const nextRemaining = videoQueue[currentIndex + 1];
-        const nextUrl = nextRemaining ? getEffectivePlaybackUrl(nextRemaining) : '';
-        if (!nextUrl || prebufferVideoEl.src !== nextUrl) {
-          try {
-            prebufferVideoEl.src = '';
-          } catch {}
-        }
-      }
+      const nextRemaining = videoQueue[currentIndex + 1];
+      const nextUrl = nextRemaining ? getEffectivePlaybackUrl(nextRemaining) : '';
+      clearStandbyVideoBufferIfMismatch(nextUrl);
 
       if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
         updatePlayerUI();
@@ -2719,6 +2794,9 @@ function unlockAppGate() {
     if (pinInput) pinInput.value = '';
     if (settings.prebuffer && videoQueue.length > 0) {
       scheduleBackgroundQueuePrebuffer();
+    } else if (settings.prebuffer && videoQueue.length === 0 && savedSessionExpiredOnRestore) {
+      savedSessionExpiredOnRestore = false;
+      pullRandomVideos(1).catch?.(() => {});
     }
   }
   return true;
@@ -2740,6 +2818,7 @@ function lockAppGate() {
     try {
       videoEl?.pause?.();
     } catch {}
+    clearStandbyVideoBuffer();
     document.body?.classList?.add('app-locked');
     document.getElementById('appLockOverlay')?.classList.remove('hidden');
     document.getElementById('appLockError')?.classList.add('hidden');
@@ -2813,6 +2892,7 @@ function scrubNsfwFromActiveSession() {
   const current = videoQueue[currentIndex];
   const wasPlayingNsfw = isItemNsfw(current);
 
+  clearStandbyVideoBuffer();
   const removedNsfw = videoQueue.filter((item) => isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => !isItemNsfw(item));
   revokeVideoItemBlobUrls(removedNsfw);
@@ -2879,6 +2959,7 @@ function scrubSafeFromActiveSession() {
   const current = videoQueue[currentIndex];
   const wasPlayingSafe = Boolean(current && !isItemNsfw(current));
 
+  clearStandbyVideoBuffer();
   const removedSafe = videoQueue.filter((item) => !isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => isItemNsfw(item));
   revokeVideoItemBlobUrls(removedSafe);
@@ -2941,6 +3022,7 @@ function scrubSafeFromActiveSession() {
 // Panic / "Boss Key": immediately drops into Safe Mode, exits fullscreen, and loads a safe NASA space clip
 function triggerPanicSafeMode() {
   modeGeneration++;
+  clearStandbyVideoBuffer();
   if (isReelsFullscreen) {
     toggleReelsFullscreen(false);
   }
@@ -2960,12 +3042,14 @@ function triggerPanicSafeMode() {
     }
     switchTab('view-discover');
     updatePlayerUI();
-    if (videoEl) {
-      videoEl.muted = true;
+    const postUpdateVideoEl = document.getElementById('mainVideo');
+    if (postUpdateVideoEl) {
+      postUpdateVideoEl.muted = true;
       try {
-        videoEl.pause?.();
+        postUpdateVideoEl.pause?.();
       } catch {}
     }
+    clearStandbyVideoBuffer();
   }
   showToast('🛡️ Safe Mode Active');
 }
@@ -3165,8 +3249,9 @@ function isStaleOrDisallowedRestoredItem(item, activeSources) {
     return true;
   }
 
+  const platform = String(item.platform || '').toLowerCase();
   const srcName = String(item.sourceName || '');
-  if (/^(?:Mastodon|Lemmy)\b/i.test(srcName)) {
+  if (platform === 'mastodon' || platform === 'lemmy' || /^(?:Mastodon|Lemmy)\b/i.test(srcName)) {
     const fedEnabled = list.some((s) =>
       /^dir-fed-lemmy|\b(?:lemmy|fediverse|mastodon)\b/i.test(
         `${s?.id || ''} ${s?.value || ''} ${s?.label || ''}`
@@ -3174,7 +3259,7 @@ function isStaleOrDisallowedRestoredItem(item, activeSources) {
     );
     if (!fedEnabled) return true;
   }
-  if (/^FullTaboo/i.test(srcName)) {
+  if (platform === 'fulltaboo' || /^FullTaboo/i.test(srcName)) {
     const ftEnabled = list.some((s) => /fulltaboo\.tv/i.test(String(s?.value || '')));
     if (!ftEnabled) return true;
   }
@@ -3212,11 +3297,18 @@ function restorePlaybackState() {
     if (!isPeerTubeExplicitlyEnabled()) {
       restoredQueue = restoredQueue.filter((item) => !isPeerTubeVideoItem(item));
     }
+    const hadModeMatchingItems = restoredQueue.length > 0;
     const activeSources = getEffectiveActiveSources();
     restoredQueue = restoredQueue.filter(
       (item) => !isStaleOrDisallowedRestoredItem(item, activeSources)
     );
-    if (restoredQueue.length === 0) return false;
+    if (restoredQueue.length === 0) {
+      if (hadModeMatchingItems && activeSources.length > 0) {
+        savedSessionExpiredOnRestore = true;
+      }
+      return false;
+    }
+    savedSessionExpiredOnRestore = false;
 
     const targetKey = getPlaybackItemKey(parsed.currentVideo);
     let restoredIndex = restoredQueue.findIndex((item) => getPlaybackItemKey(item) === targetKey);
@@ -3913,17 +4005,27 @@ async function searchInternetArchive(keyword, limit = 6, extraQueryFilter = '') 
           ? webMp4Url
           : null;
 
-        const sourcePrefix = extraQueryFilter.includes('prelinger') ? 'Prelinger Archive' : 'Archive.org';
-        results.push({
+        const isPrelinger = extraQueryFilter.includes('prelinger');
+        const sourcePrefix = isPrelinger ? 'Prelinger Archive' : 'Archive.org';
+        const collectionMeta = meta?.metadata?.collection;
+        const collectionStr = Array.isArray(collectionMeta)
+          ? collectionMeta.join(' ').toLowerCase()
+          : String(collectionMeta || '').toLowerCase();
+        const item = normalizeVideoItem({
           id: `ia-${doc.identifier}-${chosenEntry.ext}`,
           title: doc.title || doc.identifier,
           videoUrl: primaryUrl,
           originalUrl: chosenRawUrl,
           convertedUrl: fallbackMp4Url,
           format: chosenEntry.ext,
+          isNsfw: Boolean(settings.allowNsfw || /\badult\b/.test(collectionStr)),
+          duration: Number(chosenEntry.file?.length) || 0,
+          author: meta?.metadata?.creator || null,
+          platform: isPrelinger ? 'prelinger' : 'archive',
           sourceName: `${sourcePrefix} (${keyword})`,
           pageUrl: `https://archive.org/details/${encodeURIComponent(doc.identifier)}`
         });
+        if (item) results.push(item);
       } catch {
         // ignore individual metadata error
       }
@@ -3986,16 +4088,19 @@ async function searchWikimediaVideos(keyword, limit = 8) {
       .replace(VIDEO_EXT_END_REGEX, '')
       .replace(/_/g, ' ');
 
-    results.push({
+    const item = normalizeVideoItem({
       id: `wiki-${page.pageid}`,
       title: cleanTitle,
       videoUrl: primaryUrl,
       originalUrl: info.url,
       convertedUrl: mp4Deriv?.src || (!fmt.iphoneNative && webmDeriv?.src ? webmDeriv.src : null),
       format: primaryExt,
+      isNsfw: false,
+      platform: 'wikimedia',
       sourceName: `Wikimedia (${keyword})`,
       pageUrl: info.descriptionurl || info.url
     });
+    if (item) results.push(item);
   }
 
   return results;
@@ -4128,7 +4233,7 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
       const sdUrl = gif?.urls?.sd || null;
       const mp4Url = hdUrl || sdUrl;
       if (mp4Url) {
-        return {
+        return normalizeVideoItem({
           id: `rg-${gif.id || rgId.toLowerCase()}`,
           title: (Array.isArray(gif.tags) && gif.tags.length ? `RedGIFs: ${gif.tags.slice(0, 4).join(', ')}` : fallbackTitle),
           videoUrl: mp4Url,
@@ -4137,11 +4242,13 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
           format: 'mp4',
           duration: Number(gif.duration) || 0,
           tags: Array.isArray(gif.tags) ? gif.tags.slice(0, 6) : [],
+          author: gif.userName || null,
+          platform: 'redgifs',
           isHd: Boolean(hdUrl),
           isNsfw: true,
           sourceName: 'RedGIFs HD',
           pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`
-        };
+        });
       }
     }
   } catch {
@@ -4156,18 +4263,19 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
     const mp4Streams = streams.filter((u) => /\.mp4(\?|$)/i.test(u));
     const bestMp4 = mp4Streams[0] || streams[0];
     if (bestMp4) {
-      return {
+      return normalizeVideoItem({
         id: `rg-${rgId.toLowerCase()}`,
         title: fallbackTitle,
         videoUrl: bestMp4,
         originalUrl: rawUrl,
         convertedUrl: mp4Streams[1] && mp4Streams[1] !== bestMp4 ? mp4Streams[1] : null,
         format: 'mp4',
+        platform: 'redgifs',
         isHd: true,
         isNsfw: true,
         sourceName: 'RedGIFs HD',
         pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`
-      };
+      });
     }
   } catch {
     // ignore
@@ -4382,19 +4490,22 @@ async function fetchDirectEpornerVideos(
       const normalized = normalizeAndAutoRewriteVideoUrl(chosenStream);
       if (!normalized || !isFormatAllowedBySettings(normalized.format)) return;
 
-      results.push({
+      const item = normalizeVideoItem({
         id: `ep-${v.id}`,
         title: v.title || 'Free Tube 18+ Video',
         videoUrl: normalized.videoUrl,
         originalUrl: normalized.originalUrl,
         convertedUrl: normalized.convertedUrl || altStream,
         format: normalized.format,
+        isAutoConverted: normalized.isAutoConverted,
         duration: Number(v.length_sec) || 0,
         isHd: /720|1080|hd/i.test(chosenStream) || Boolean(v.hd),
         isNsfw: true,
+        platform: 'eporner',
         sourceName: customSourceLabel || `Free Tube (${rawQuery || '18+'})`,
         pageUrl: v.url || embedUrl
       });
+      if (item) results.push(item);
     })
   );
 
@@ -4417,7 +4528,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       if (!mp4Url || !isFormatAllowedBySettings('mp4')) continue;
       seenIds.add(g.id);
       const tagLabel = Array.isArray(g.tags) && g.tags.length ? g.tags.slice(0, 4).join(', ') : cleanKw;
-      results.push({
+      const item = normalizeVideoItem({
         id: `rg-${g.id}`,
         title: `RedGIFs HD — ${tagLabel}`,
         videoUrl: mp4Url,
@@ -4426,11 +4537,14 @@ async function searchRedgifsVideos(keyword, limit = 6) {
         format: 'mp4',
         duration: Number(g.duration) || 0,
         tags: Array.isArray(g.tags) ? g.tags.slice(0, 6) : [],
+        author: g.userName || null,
+        platform: 'redgifs',
         isHd: Boolean(hdUrl),
         isNsfw: true,
         sourceName: `RedGIFs (${cleanKw})`,
         pageUrl: `https://www.redgifs.com/watch/${encodeURIComponent(g.id)}`
       });
+      if (item) results.push(item);
     }
   };
 
@@ -4587,7 +4701,7 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         postTags.push(post.link_flair_text.trim());
       }
 
-      results.push({
+      const item = normalizeVideoItem({
         id: `rd-${post.id}`,
         title: post.title || 'Reddit Video Clip',
         videoUrl: normalized.videoUrl,
@@ -4599,10 +4713,13 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         over_18: Boolean(post.over_18 || settings.allowNsfw),
         duration: durationSec,
         tags: postTags,
+        author: post.author ? `u/${post.author}` : null,
+        platform: 'reddit',
         isHd: heightPx >= 720 || /720|1080/i.test(normalized.videoUrl),
         sourceName: sourceLabel,
         pageUrl: `https://www.reddit.com${post.permalink || ''}`
       });
+      if (item) results.push(item);
     }
   }
 
@@ -4629,14 +4746,15 @@ async function upgradeUnsignedRedgifsItems(items) {
       toResolve.map(async (item) => {
         const resolved = await resolveRedgifsUrlToMp4(item.videoUrl, item.title);
         if (!resolved?.videoUrl) return null;
-        return {
+        return normalizeVideoItem({
           ...item,
           videoUrl: resolved.videoUrl,
           originalUrl: resolved.videoUrl,
           convertedUrl: resolved.convertedUrl || null,
           duration: item.duration || resolved.duration || 0,
+          author: item.author || resolved.author || null,
           isHd: Boolean(item.isHd || resolved.isHd)
-        };
+        });
       })
     );
     for (const s of settled) {
@@ -4809,7 +4927,7 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
         const fmt = detectVideoFormat(primaryUrl, hlsPlaylistUrl === primaryUrl ? 'm3u8' : 'mp4');
         if (!isFormatAllowedBySettings(fmt.ext)) return;
 
-        results.push({
+        const builtItem = normalizeVideoItem({
           id: `pt-${uuid}`,
           title: item.name || detail.name || 'PeerTube Video',
           videoUrl: primaryUrl,
@@ -4818,10 +4936,13 @@ async function searchPeerTubeVideos(keyword, limit = 4) {
           format: fmt.ext,
           isNsfw: Boolean(item.nsfw || detail.nsfw),
           duration: Number(detail.duration || item.duration) || 0,
+          author: detail?.account?.displayName || item?.account?.displayName || item?.account?.name || null,
+          platform: 'peertube',
           isHd: Number(mp4File?.resolution?.id || 0) >= 720,
           sourceName: `PeerTube (${host})`,
           pageUrl: item.url || `https://${host}/w/${uuid}`
         });
+        if (builtItem) results.push(builtItem);
       } catch {
         // ignore instance error
       }
@@ -4867,7 +4988,7 @@ async function searchFediverseVideos(keyword) {
               typeof att.remote_url === 'string' && /^https:\/\//i.test(att.remote_url) && att.remote_url !== att.url
                 ? att.remote_url
                 : null;
-            results.push({
+            const item = normalizeVideoItem({
               id: `masto-${att.id || st.id}`,
               title: plainText.slice(0, 75) || `Mastodon #${cleanTag} Clip`,
               videoUrl: att.url,
@@ -4875,9 +4996,13 @@ async function searchFediverseVideos(keyword) {
               convertedUrl: remoteFallback,
               format: fmt.ext,
               isNsfw: Boolean(st?.sensitive),
+              duration: Number(att?.meta?.original?.duration) || 0,
+              author: st?.account?.acct ? `@${st.account.acct}` : null,
+              platform: 'mastodon',
               sourceName: `Mastodon (#${cleanTag})`,
               pageUrl: st.url || att.url
             });
+            if (item) results.push(item);
           }
         }
       }
@@ -4903,13 +5028,16 @@ async function searchFediverseVideos(keyword) {
         if (/redgifs\.com/i.test(candidateUrl)) {
           const resolvedRg = await resolveRedgifsUrlToMp4(candidateUrl, post.name || 'Lemmy Video Post');
           if (resolvedRg) {
-            results.push({
+            const item = normalizeVideoItem({
               ...resolvedRg,
               id: `lemmy-${post.id}`,
               title: post.name || resolvedRg.title,
+              author: entry?.creator?.name || resolvedRg.author || null,
+              platform: 'lemmy',
               sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
               pageUrl: post.ap_id || candidateUrl
             });
+            if (item) results.push(item);
           }
           continue;
         }
@@ -4917,7 +5045,7 @@ async function searchFediverseVideos(keyword) {
         if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
           const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
           if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
-          results.push({
+          const item = normalizeVideoItem({
             id: `lemmy-${post.id}`,
             title: post.name || 'Lemmy Video Post',
             videoUrl: normalized.videoUrl,
@@ -4926,9 +5054,12 @@ async function searchFediverseVideos(keyword) {
             format: normalized.format,
             isAutoConverted: normalized.isAutoConverted,
             isNsfw: isPostNsfw,
+            author: entry?.creator?.name || null,
+            platform: 'lemmy',
             sourceName: `Lemmy (${entry?.community?.name || 'fediverse'})`,
             pageUrl: post.ap_id || candidateUrl
           });
+          if (item) results.push(item);
         }
       }
     })()
@@ -4955,13 +5086,16 @@ async function searchFediverseVideos(keyword) {
           if (/redgifs\.com/i.test(candidateUrl)) {
             const resolvedRg = await resolveRedgifsUrlToMp4(candidateUrl, post.name || 'Fediverse 18+ Video Post');
             if (resolvedRg) {
-              results.push({
+              const item = normalizeVideoItem({
                 ...resolvedRg,
                 id: `lemmynsfw-${post.id}`,
                 title: post.name || resolvedRg.title,
+                author: entry?.creator?.name || resolvedRg.author || null,
+                platform: 'lemmy',
                 sourceName: `Lemmy 18+ (${entry?.community?.name || 'nsfw'})`,
                 pageUrl: post.ap_id || candidateUrl
               });
+              if (item) results.push(item);
             }
             continue;
           }
@@ -4969,7 +5103,7 @@ async function searchFediverseVideos(keyword) {
           if (DIRECT_VIDEO_URL_REGEX.test(candidateUrl)) {
             const normalized = normalizeAndAutoRewriteVideoUrl(candidateUrl);
             if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
-            results.push({
+            const item = normalizeVideoItem({
               id: `lemmynsfw-${post.id}`,
               title: post.name || 'Fediverse 18+ Video Post',
               videoUrl: normalized.videoUrl,
@@ -4978,9 +5112,12 @@ async function searchFediverseVideos(keyword) {
               format: normalized.format,
               isAutoConverted: normalized.isAutoConverted,
               isNsfw: true,
+              author: entry?.creator?.name || null,
+              platform: 'lemmy',
               sourceName: `Lemmy 18+ (${entry?.community?.name || 'nsfw'})`,
               pageUrl: post.ap_id || candidateUrl
             });
+            if (item) results.push(item);
           }
         }
       })()
@@ -5039,16 +5176,20 @@ async function searchNasaVideos(keyword, limit = 4) {
         const secureMp4 = mp4Asset ? mp4Asset.replace(/^http:\/\//i, 'https://') : null;
         const fmt = detectVideoFormat(secureChosen, 'mp4');
 
-        results.push({
+        const builtNasaItem = normalizeVideoItem({
           id: `nasa-${meta.nasa_id}`,
           title: meta.title || 'NASA Archival Video',
           videoUrl: secureChosen,
           originalUrl: secureChosen,
           convertedUrl: fmt.ext !== 'mp4' ? secureMp4 : null,
           format: fmt.ext,
+          isNsfw: false,
+          author: meta.center || meta.secondary_creator || null,
+          platform: 'nasa',
           sourceName: 'NASA Video Library',
           pageUrl: `https://images.nasa.gov/details/${encodeURIComponent(meta.nasa_id)}`
         });
+        if (builtNasaItem) results.push(builtNasaItem);
       } catch {
         // ignore individual asset error
       }
@@ -5136,6 +5277,87 @@ function isKnownNsfwUrl(rawUrl) {
   return KNOWN_NSFW_DOMAIN_REGEX.test(rawUrl);
 }
 
+function inferVideoPlatform(rawItem) {
+  if (!rawItem || typeof rawItem !== 'object') return 'web';
+  if (typeof rawItem.platform === 'string' && rawItem.platform.trim()) {
+    return rawItem.platform.trim().toLowerCase();
+  }
+  const id = String(rawItem.id || '');
+  const srcName = String(rawItem.sourceName || '');
+  const refUrl = String(rawItem.pageUrl || rawItem.originalUrl || rawItem.videoUrl || '');
+
+  if (id.startsWith('pt-') || /\bpeertube\b/i.test(srcName)) return 'peertube';
+  if (id.startsWith('masto-') || /^Mastodon\b/i.test(srcName)) return 'mastodon';
+  if (id.startsWith('lemmy') || /^Lemmy\b/i.test(srcName)) return 'lemmy';
+  if (id.startsWith('rd-') || /(?:^|\.)(?:reddit\.com|redd\.it)\b/i.test(refUrl)) return 'reddit';
+  if (id.startsWith('rg-') || /(?:^|\.)redgifs\.com\b/i.test(refUrl) || /^RedGIFs\b/i.test(srcName)) return 'redgifs';
+  if (id.startsWith('ia-')) return /^Prelinger\b/i.test(srcName) ? 'prelinger' : 'archive';
+  if (id.startsWith('wiki-') || /(?:^|\.)wikimedia\.org\b/i.test(refUrl)) return 'wikimedia';
+  if (id.startsWith('nasa-') || /(?:^|\.)nasa\.gov\b/i.test(refUrl)) return 'nasa';
+  if (id.startsWith('dm-') || /(?:^|\.)(?:dailymotion\.com|dai\.ly)\b/i.test(refUrl)) return 'dailymotion';
+  if (id.startsWith('ep-') || /(?:^|\.)eporner\.com\b/i.test(refUrl)) return 'eporner';
+  if (/^FullTaboo\b/i.test(srcName) || /(?:^|\.)fulltaboo\.tv\b/i.test(refUrl)) return 'fulltaboo';
+  if (/^PornOne\b/i.test(srcName) || /(?:^|\.)pornone\.com\b/i.test(refUrl)) return 'pornone';
+  if (id.startsWith('cloud-') || /\(Cloud\)$/i.test(srcName)) return 'cloud';
+  if (id.startsWith('fb-')) return 'fallback';
+  return 'web';
+}
+
+function normalizeVideoItem(rawItem) {
+  if (!rawItem || typeof rawItem !== 'object' || !rawItem.videoUrl) return null;
+  const videoUrl = String(rawItem.videoUrl).trim();
+  if (!videoUrl) return null;
+
+  const originalUrl = String(rawItem.originalUrl || videoUrl).trim();
+  const convertedUrl =
+    typeof rawItem.convertedUrl === 'string' && rawItem.convertedUrl.trim()
+      ? rawItem.convertedUrl.trim()
+      : null;
+  const format = String(
+    rawItem.format || detectVideoFormat(originalUrl || videoUrl, 'mp4').ext
+  ).toLowerCase();
+  const pageUrl = String(rawItem.pageUrl || originalUrl || videoUrl).trim();
+  const isNsfw =
+    typeof rawItem.isNsfw === 'boolean'
+      ? rawItem.isNsfw
+      : typeof rawItem.over_18 === 'boolean'
+      ? rawItem.over_18
+      : Boolean(
+          isKnownNsfwUrl(videoUrl) || isKnownNsfwUrl(pageUrl) || isKnownNsfwUrl(originalUrl)
+        );
+  const rawAuthor = Array.isArray(rawItem.author) ? rawItem.author[0] : rawItem.author;
+  const author =
+    typeof rawAuthor === 'string' && rawAuthor.trim() ? rawAuthor.trim() : null;
+  const tags = Array.isArray(rawItem.tags)
+    ? rawItem.tags
+        .filter((t) => typeof t === 'string' && t.trim())
+        .map((t) => t.trim())
+    : [];
+  const rawDuration = Number(rawItem.duration);
+  const duration = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : 0;
+
+  return {
+    ...rawItem,
+    id: String(
+      rawItem.id || `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    ),
+    title: String(rawItem.title || 'Untitled Video').trim() || 'Untitled Video',
+    videoUrl,
+    originalUrl,
+    convertedUrl,
+    format,
+    isAutoConverted: Boolean(rawItem.isAutoConverted),
+    isNsfw,
+    duration,
+    isHd: Boolean(rawItem.isHd),
+    tags,
+    author,
+    platform: inferVideoPlatform(rawItem),
+    sourceName: String(rawItem.sourceName || 'Open Web'),
+    pageUrl
+  };
+}
+
 function isMainstreamSfwClientUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
   try {
@@ -5170,7 +5392,7 @@ function mapCloudExtractedItem(cItem, customLabel, fallbackUrl, pageTitle = null
     isKnownNsfwUrl(cItem.videoUrl) ||
     isKnownNsfwUrl(pageRef);
 
-  return {
+  return normalizeVideoItem({
     id: cItem.id || `cloud-${Date.now()}-${index}`,
     title: cItem.title || pageTitle || 'Extracted Video',
     videoUrl: cItem.videoUrl,
@@ -5182,10 +5404,12 @@ function mapCloudExtractedItem(cItem, customLabel, fallbackUrl, pageTitle = null
     duration: Number(cItem.duration) || 0,
     isHd: Boolean(cItem.isHd),
     tags: Array.isArray(cItem.tags) ? cItem.tags : [],
-    ...(isAdult ? { isNsfw: true } : {}),
+    author: cItem.author || null,
+    platform: 'cloud',
+    isNsfw: isAdult,
     sourceName: cItem.sourceName || `${customLabel} (Cloud)`,
     pageUrl: pageRef || cItem.videoUrl
-  };
+  });
 }
 
 async function fetchCloudExtractedItems(targetUrl, customLabel, pageTitle = null, markScannedNsfw = false) {
@@ -5298,20 +5522,19 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       return [];
     }
     const fileName = trimmed.split('/').pop().split('?')[0].split('#')[0] || 'Direct Video';
-    return [
-      {
-        id: `url-${Date.now()}`,
-        title: safeDecodeURIComponent(fileName),
-        videoUrl: normalized.videoUrl,
-        originalUrl: normalized.originalUrl,
-        convertedUrl: normalized.convertedUrl,
-        format: normalized.format,
-        isAutoConverted: normalized.isAutoConverted,
-        ...(markScannedNsfw ? { isNsfw: true } : {}),
-        sourceName: customLabel,
-        pageUrl: trimmed
-      }
-    ];
+    const directItem = normalizeVideoItem({
+      id: `url-${Date.now()}`,
+      title: safeDecodeURIComponent(fileName),
+      videoUrl: normalized.videoUrl,
+      originalUrl: normalized.originalUrl,
+      convertedUrl: normalized.convertedUrl,
+      format: normalized.format,
+      isAutoConverted: normalized.isAutoConverted,
+      isNsfw: Boolean(markScannedNsfw),
+      sourceName: customLabel,
+      pageUrl: trimmed
+    });
+    return directItem ? [directItem] : [];
   }
 
   // Specific Reddit post permalink or redd.it shortlink -> extract exact post video(s), not random subreddit hot feed
@@ -5368,7 +5591,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     const normalized = normalizeAndAutoRewriteVideoUrl(vUrl);
     if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
     const shortName = vUrl.split('/').pop().split('?')[0] || `Video #${idx + 1}`;
-    results.push({
+    const scannedItem = normalizeVideoItem({
       id: `scan-${Date.now()}-${idx}`,
       title: idx === 0 && pageTitle ? pageTitle : safeDecodeURIComponent(shortName),
       videoUrl: normalized.videoUrl,
@@ -5376,10 +5599,11 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       convertedUrl: normalized.convertedUrl,
       format: normalized.format,
       isAutoConverted: normalized.isAutoConverted,
-      ...(markScannedNsfw || isKnownNsfwUrl(vUrl) ? { isNsfw: true } : {}),
+      isNsfw: Boolean(markScannedNsfw || isKnownNsfwUrl(vUrl)),
       sourceName: customLabel,
       pageUrl: trimmed
     });
+    if (scannedItem) results.push(scannedItem);
     idx++;
   }
 
@@ -5804,18 +6028,22 @@ async function searchFreeTubeSites(keyword, limit = 6) {
           if (directStream && typeof directStream === 'string') {
             const normalized = normalizeAndAutoRewriteVideoUrl(directStream);
             if (!normalized || !isFormatAllowedBySettings(normalized.format)) continue;
-            results.push({
+            const builtDm = normalizeVideoItem({
               id: `dm-${item.id}`,
               title: item.title || 'Dailymotion Tube Clip',
               videoUrl: normalized.videoUrl,
               originalUrl: normalized.originalUrl,
               convertedUrl: normalized.convertedUrl,
               format: normalized.format,
+              isAutoConverted: normalized.isAutoConverted,
+              isNsfw: false,
               duration: Number(item.duration) || 0,
               isHd: /720|1080|hd/i.test(directStream),
+              platform: 'dailymotion',
               sourceName: 'Dailymotion Tube',
               pageUrl: item.url || `https://www.dailymotion.com/video/${item.id}`
             });
+            if (builtDm) results.push(builtDm);
           }
         }
       })()
@@ -5846,6 +6074,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
           const poItems = await scanUrlForVideos(poSearchUrl, `PornOne Tube (${keyword})`, true);
           for (const item of poItems.slice(0, 3)) {
             item.isNsfw = true;
+            item.platform = 'pornone';
             results.push(item);
           }
         } catch {}
@@ -5863,6 +6092,7 @@ async function searchFreeTubeSites(keyword, limit = 6) {
           const ftItems = await scanUrlForVideos(ftSearchUrl, `FullTaboo.tv (${keyword})`, true);
           for (const item of ftItems) {
             item.isNsfw = true;
+            item.platform = 'fulltaboo';
             results.push(item);
           }
         })()
@@ -6204,11 +6434,14 @@ async function runContinuousPullCycle() {
         }
         fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
       }
-      const picks = shuffleArray(fresh).slice(0, 4);
+      const picks = rankVideosByAffinity(fresh, { isNsfw: pullAllowNsfw }).slice(0, 4);
       for (const p of picks) {
         seenUrls.add(p.videoUrl);
         videoQueue.push(p);
         addedCount++;
+      }
+      if (addedCount > 0) {
+        reRankUpcomingQueueTail();
       }
 
       if (addedCount > 0 && typeof document !== 'undefined') {
@@ -6227,6 +6460,498 @@ async function runContinuousPullCycle() {
   })();
 
   return await continuousPullPromise;
+}
+
+// ==========================================
+// LOCAL-ONLY AFFINITY ENGINE (SMART PERSONALIZATION)
+// ==========================================
+
+const AFFINITY_REWARD_DELTA = 5;
+const AFFINITY_SKIP_PENALTY = -3;
+const AFFINITY_MIN_WEIGHT = -25;
+const AFFINITY_MAX_WEIGHT = 50;
+const AFFINITY_MAX_KEYS_PER_DICT = 120;
+
+function createEmptyAffinityBucket() {
+  return { tags: {}, authors: {}, platforms: {} };
+}
+
+function createEmptyAffinityState() {
+  return {
+    safe: createEmptyAffinityBucket(),
+    nsfw: createEmptyAffinityBucket()
+  };
+}
+
+function sanitizeAffinityDict(rawDict) {
+  if (!rawDict || typeof rawDict !== 'object') return {};
+  const entries = [];
+  for (const [rawKey, rawVal] of Object.entries(rawDict)) {
+    const key = String(rawKey || '').trim().toLowerCase();
+    const num = Math.round(Number(rawVal));
+    if (!key || !Number.isFinite(num) || num === 0) continue;
+    const clamped = Math.max(AFFINITY_MIN_WEIGHT, Math.min(AFFINITY_MAX_WEIGHT, num));
+    entries.push([key, clamped]);
+  }
+  entries.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  const out = {};
+  for (const [k, v] of entries.slice(0, AFFINITY_MAX_KEYS_PER_DICT)) {
+    out[k] = v;
+  }
+  return out;
+}
+
+function sanitizeAffinityBucket(rawBucket) {
+  return {
+    tags: sanitizeAffinityDict(rawBucket?.tags),
+    authors: sanitizeAffinityDict(rawBucket?.authors),
+    platforms: sanitizeAffinityDict(rawBucket?.platforms)
+  };
+}
+
+function loadAffinityState() {
+  try {
+    if (typeof localStorage === 'undefined') {
+      affinityState = createEmptyAffinityState();
+      return affinityState;
+    }
+    const raw = localStorage.getItem(STORAGE_KEYS.AFFINITY_PROFILE);
+    if (!raw) {
+      affinityState = createEmptyAffinityState();
+      return affinityState;
+    }
+    const parsed = JSON.parse(raw);
+    affinityState = {
+      safe: sanitizeAffinityBucket(parsed?.safe),
+      nsfw: sanitizeAffinityBucket(parsed?.nsfw)
+    };
+  } catch {
+    affinityState = createEmptyAffinityState();
+  }
+  return affinityState;
+}
+
+function saveAffinityState() {
+  affinityState = {
+    safe: sanitizeAffinityBucket(affinityState?.safe),
+    nsfw: sanitizeAffinityBucket(affinityState?.nsfw)
+  };
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(STORAGE_KEYS.AFFINITY_PROFILE, JSON.stringify(affinityState));
+    }
+  } catch {}
+  return affinityState;
+}
+
+function resetAffinityState(mode = 'all') {
+  if (mode === 'safe') {
+    affinityState.safe = createEmptyAffinityBucket();
+    saveAffinityState();
+  } else if (mode === 'nsfw') {
+    affinityState.nsfw = createEmptyAffinityBucket();
+    saveAffinityState();
+  } else {
+    affinityState = createEmptyAffinityState();
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(STORAGE_KEYS.AFFINITY_PROFILE);
+      }
+    } catch {}
+  }
+  return affinityState;
+}
+
+function isVideoItemNsfwForAffinity(videoItem) {
+  if (videoItem && (typeof videoItem.isNsfw === 'boolean' || videoItem.over_18 !== undefined)) {
+    return Boolean(videoItem.isNsfw || videoItem.over_18);
+  }
+  return Boolean(settings.allowNsfw);
+}
+
+function getAffinityBucketForItem(videoItem) {
+  if (!affinityState || typeof affinityState !== 'object') {
+    affinityState = createEmptyAffinityState();
+  }
+  return isVideoItemNsfwForAffinity(videoItem) ? affinityState.nsfw : affinityState.safe;
+}
+
+function extractAffinityFeatures(videoItem) {
+  if (!videoItem || typeof videoItem !== 'object') {
+    return { tags: [], author: '', platform: '' };
+  }
+  const tagSet = new Set();
+  const pushTag = (raw) => {
+    const clean = String(raw || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^(?:r\/|#)+/, '')
+      .replace(/[^a-z0-9_-]/g, '');
+    if (clean.length >= 2 && clean.length <= 36 && !TAG_STOPWORDS.has(clean)) {
+      tagSet.add(clean);
+    }
+  };
+  if (Array.isArray(videoItem.tags)) {
+    for (const t of videoItem.tags) {
+      pushTag(t);
+      if (tagSet.size >= 8) break;
+    }
+  }
+  for (const smart of extractSmartVideoTags(videoItem, 6)) {
+    pushTag(smart);
+    if (tagSet.size >= 10) break;
+  }
+
+  const author = String(videoItem.author || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^@+|^u\//, '');
+
+  const rawPlatform = String(videoItem.platform || inferVideoPlatform(videoItem) || '')
+    .trim()
+    .toLowerCase();
+  const platform = rawPlatform && rawPlatform !== 'unknown' ? rawPlatform : '';
+
+  return {
+    tags: [...tagSet],
+    author,
+    platform
+  };
+}
+
+function applyWeightDelta(dict, key, delta) {
+  if (!key || !Number.isFinite(delta) || delta === 0) return;
+  const prev = Number(dict[key] || 0);
+  const next = Math.max(AFFINITY_MIN_WEIGHT, Math.min(AFFINITY_MAX_WEIGHT, Math.round(prev + delta)));
+  if (next === 0) {
+    delete dict[key];
+  } else {
+    dict[key] = next;
+  }
+}
+
+function recordAffinitySignal(videoItem, signal = 'complete') {
+  if (!videoItem || typeof videoItem !== 'object') return 0;
+  const delta =
+    signal === 'skip'
+      ? AFFINITY_SKIP_PENALTY
+      : signal === 'complete' || signal === 'loop' || signal === 'vault' || signal === 'favorite'
+      ? AFFINITY_REWARD_DELTA
+      : 0;
+  if (delta === 0) return 0;
+
+  const bucket = getAffinityBucketForItem(videoItem);
+  const { tags, author, platform } = extractAffinityFeatures(videoItem);
+  for (const tag of tags) {
+    applyWeightDelta(bucket.tags, tag, delta);
+  }
+  if (author) {
+    applyWeightDelta(bucket.authors, author, delta);
+  }
+  if (platform) {
+    applyWeightDelta(bucket.platforms, platform, delta);
+  }
+
+  saveAffinityState();
+  reRankUpcomingQueueTail();
+  return delta;
+}
+
+function getVideoAffinityScore(videoItem) {
+  if (!videoItem || typeof videoItem !== 'object') return 0;
+  const bucket = getAffinityBucketForItem(videoItem);
+  const { tags, author, platform } = extractAffinityFeatures(videoItem);
+
+  let rawTagSum = 0;
+  for (const tag of tags) {
+    rawTagSum += Number(bucket.tags?.[tag] || 0);
+  }
+  const tagScore = Math.max(-30, Math.min(60, rawTagSum));
+  const authorScore = author ? Number(bucket.authors?.[author] || 0) : 0;
+  const platformScore = platform ? Number(bucket.platforms?.[platform] || 0) * 0.35 : 0;
+  return Number((tagScore + authorScore + platformScore).toFixed(2));
+}
+
+function hasAffinitySignals(isNsfwMode = Boolean(settings.allowNsfw)) {
+  const bucket = isNsfwMode ? affinityState?.nsfw : affinityState?.safe;
+  if (!bucket) return false;
+  return (
+    Object.keys(bucket.tags || {}).length > 0 ||
+    Object.keys(bucket.authors || {}).length > 0 ||
+    Object.keys(bucket.platforms || {}).length > 0
+  );
+}
+
+function rankVideosByAffinity(items, opts = {}) {
+  if (!Array.isArray(items)) return [];
+  if (items.length <= 1) return [...items];
+
+  const modeIsNsfw =
+    opts.isNsfw !== undefined ? Boolean(opts.isNsfw) : Boolean(settings.allowNsfw);
+  if (!hasAffinitySignals(modeIsNsfw)) {
+    return shuffleArray(items);
+  }
+
+  const jitterScale = typeof opts.jitter === 'number' ? Math.max(0, opts.jitter) : 1.1;
+  const exploreRatio = typeof opts.exploreRatio === 'number' ? Math.max(0, Math.min(0.5, opts.exploreRatio)) : 0.25;
+
+  const scored = items.map((item) => {
+    const affinityScore = getVideoAffinityScore(item);
+    return {
+      item,
+      score: affinityScore,
+      rankScore: affinityScore + (jitterScale > 0 ? Math.random() * jitterScale : 0)
+    };
+  });
+
+  scored.sort((a, b) => b.rankScore - a.rankScore);
+
+  // Inject ~25% exploration slots from non-heavily-penalized candidates so feed stays fresh
+  if (exploreRatio > 0 && scored.length >= 4) {
+    const step = Math.max(2, Math.round(1 / exploreRatio));
+    for (let slot = step - 1; slot < scored.length - 1; slot += step) {
+      const candidateIndices = [];
+      for (let j = slot + 1; j < scored.length; j++) {
+        if (scored[j].score > -6) {
+          candidateIndices.push(j);
+        }
+      }
+      if (candidateIndices.length > 0) {
+        const pickIdx = candidateIndices[Math.floor(Math.random() * candidateIndices.length)];
+        const [picked] = scored.splice(pickIdx, 1);
+        scored.splice(slot, 0, picked);
+      }
+    }
+  }
+
+  return scored.map((entry) => entry.item);
+}
+
+// Re-rank the unplayed tail beyond currentIndex + 1 (preserving currentIndex + 1 on #standbyVideo!)
+function reRankUpcomingQueueTail() {
+  const tailStart = Math.max(0, currentIndex) + 2;
+  if (!Array.isArray(videoQueue) || videoQueue.length <= tailStart + 1) return false;
+  if (!hasAffinitySignals(Boolean(settings.allowNsfw))) return false;
+  const head = videoQueue.slice(0, tailStart);
+  const tail = videoQueue.slice(tailStart);
+  const rankedTail = rankVideosByAffinity(tail, { isNsfw: Boolean(settings.allowNsfw) });
+  videoQueue = [...head, ...rankedTail];
+  return true;
+}
+
+function resetActiveAffinityWatch(videoItem = null) {
+  const key = videoItem ? getPlaybackItemKey(videoItem) : '';
+  activeAffinityWatch = {
+    key,
+    item: videoItem || null,
+    hasPlayed: false,
+    accumulatedPlaySec: 0,
+    lastPlayResumeMs: 0,
+    maxCurrentTimeSec: 0,
+    rewardedCompletion: false,
+    loopArmed: false,
+    loopCount: 0,
+    rewardedVault: Boolean(videoItem?._affinityVaultRewarded)
+  };
+}
+
+const AffinityEngine = {
+  getState: () => affinityState,
+  load: loadAffinityState,
+  save: saveAffinityState,
+  reset: resetAffinityState,
+  recordSignal: recordAffinitySignal,
+  getScore: getVideoAffinityScore,
+  hasSignals: hasAffinitySignals,
+  rankVideos: rankVideosByAffinity,
+  reRankQueueTail: reRankUpcomingQueueTail
+};
+
+// ==========================================
+// DUAL-LAYER VIDEO RECYCLING (TRUE 0MS SWIPE)
+// ==========================================
+
+function getActiveVideoElement() {
+  if (typeof document === 'undefined') return null;
+  return document.getElementById('mainVideo');
+}
+
+function getStandbyVideoElement() {
+  if (typeof document === 'undefined') return null;
+  const domStandby = document.getElementById('standbyVideo');
+  if (domStandby) return domStandby;
+  if (!document.getElementById('videoStage') && typeof document.createElement === 'function') {
+    if (!prebufferVideoEl) {
+      prebufferVideoEl = document.createElement('video');
+      prebufferVideoEl.muted = true;
+      prebufferVideoEl.playsInline = true;
+      prebufferVideoEl.preload = 'auto';
+      prebufferVideoEl.referrerPolicy = 'no-referrer';
+      prebufferVideoEl.setAttribute?.('referrerpolicy', 'no-referrer');
+      if (prebufferVideoEl.style) {
+        prebufferVideoEl.style.display = 'none';
+      }
+    }
+    return prebufferVideoEl;
+  }
+  return null;
+}
+
+function clearVideoElementSource(el) {
+  if (!el) return;
+  detachActiveHlsPlayer(el);
+  try {
+    el.pause?.();
+  } catch {}
+  if (el.dataset) {
+    el.dataset.prebufferedUrl = '';
+    el.dataset.prebufferFailed = 'false';
+  }
+  if (el.src || el.getAttribute?.('src')) {
+    try {
+      if (typeof el.removeAttribute === 'function') {
+        el.removeAttribute('src');
+      } else {
+        el.src = '';
+      }
+      el.load?.();
+    } catch {}
+  }
+}
+
+function clearStandbyVideoBuffer() {
+  if (typeof document !== 'undefined') {
+    const domStandby = document.getElementById('standbyVideo');
+    if (domStandby) {
+      clearVideoElementSource(domStandby);
+    }
+  }
+  if (prebufferVideoEl) {
+    clearVideoElementSource(prebufferVideoEl);
+  }
+}
+
+function clearStandbyVideoBufferIfMismatch(expectedUrl = '') {
+  const cleanExpected = String(expectedUrl || '').trim();
+  const checkEl = (el) => {
+    if (!el) return;
+    const currentSrc = String(el.dataset?.prebufferedUrl || el.src || '').trim();
+    if (!cleanExpected || (currentSrc && currentSrc !== cleanExpected)) {
+      clearVideoElementSource(el);
+    }
+  };
+  if (typeof document !== 'undefined') {
+    checkEl(document.getElementById('standbyVideo'));
+  }
+  checkEl(prebufferVideoEl);
+}
+
+function swapDualVideoLayerRoles(activeEl, standbyEl) {
+  if (!activeEl || !standbyEl || activeEl === standbyEl || typeof document === 'undefined') {
+    return null;
+  }
+  const prevActiveId = activeEl.id;
+  const prevStandbyId = standbyEl.id;
+  activeEl.id = '';
+  standbyEl.id = 'mainVideo';
+  activeEl.id = 'standbyVideo';
+
+  // Guard for static unit-test getElementById maps that don't reflect live .id attribute updates
+  if (document.getElementById('mainVideo') !== standbyEl) {
+    activeEl.id = prevActiveId;
+    standbyEl.id = prevStandbyId;
+    return null;
+  }
+
+  activeEl.classList?.remove('active-video-layer');
+  activeEl.classList?.add('standby-video-layer');
+  activeEl.controls = false;
+  activeEl.removeAttribute?.('controls');
+  activeEl.setAttribute?.('aria-hidden', 'true');
+  activeEl.setAttribute?.('tabindex', '-1');
+  if (activeEl.style) {
+    activeEl.style.transition = '';
+    activeEl.style.transform = '';
+    activeEl.style.zIndex = '0';
+    activeEl.style.opacity = '0';
+    activeEl.style.pointerEvents = 'none';
+  }
+
+  standbyEl.classList?.remove('standby-video-layer');
+  standbyEl.classList?.add('active-video-layer');
+  standbyEl.removeAttribute?.('aria-hidden');
+  standbyEl.removeAttribute?.('tabindex');
+  standbyEl.controls = !isReelsFullscreen;
+  if (isReelsFullscreen) {
+    standbyEl.removeAttribute?.('controls');
+  } else {
+    standbyEl.setAttribute?.('controls', '');
+  }
+  if (standbyEl.style) {
+    standbyEl.style.transition = '';
+    standbyEl.style.transform = '';
+    standbyEl.style.zIndex = '1';
+    standbyEl.style.opacity = '1';
+    standbyEl.style.pointerEvents = 'auto';
+  }
+
+  return standbyEl;
+}
+
+function maybePromoteStandbyVideoLayer(activeEl, targetItem, targetPlayUrl, shouldUseManagedHls, awaitingOfflineRehydrate) {
+  if (
+    !activeEl ||
+    !targetItem ||
+    !targetPlayUrl ||
+    shouldUseManagedHls ||
+    awaitingOfflineRehydrate ||
+    typeof document === 'undefined'
+  ) {
+    return { videoEl: activeEl, promoted: false };
+  }
+  const standbyEl = document.getElementById('standbyVideo');
+  if (!standbyEl || standbyEl === activeEl) {
+    return { videoEl: activeEl, promoted: false };
+  }
+  const standbyMatchesTarget =
+    (standbyEl.src === targetPlayUrl || standbyEl.dataset?.prebufferedUrl === targetPlayUrl) &&
+    standbyEl.dataset?.prebufferFailed !== 'true' &&
+    !standbyEl.error;
+  if (!standbyMatchesTarget) {
+    return { videoEl: activeEl, promoted: false };
+  }
+
+  const prevMuted = Boolean(activeEl.muted);
+  const prevVolume =
+    typeof activeEl.volume === 'number' && Number.isFinite(activeEl.volume) ? activeEl.volume : 1;
+
+  clearPlaybackStartupWatchdog();
+  detachActiveHlsPlayer(activeEl);
+  try {
+    activeEl.pause?.();
+  } catch {}
+  activeEl.muted = true;
+
+  const promotedEl = swapDualVideoLayerRoles(activeEl, standbyEl);
+  if (!promotedEl) {
+    return { videoEl: activeEl, promoted: false };
+  }
+
+  const forceMuteNsfw =
+    Boolean(targetItem.isNsfw || targetItem.over_18 || settings.allowNsfw) &&
+    Boolean(settings.autoMuteNsfw);
+  promotedEl.volume = prevVolume;
+  promotedEl.muted = forceMuteNsfw ? true : prevMuted;
+  promotedEl.playbackRate = settings.playbackSpeed || 1;
+  if (promotedEl.dataset) {
+    promotedEl.dataset.prebufferedUrl = '';
+    promotedEl.dataset.prebufferFailed = 'false';
+    promotedEl.dataset.autoConvertAttempted = 'false';
+    promotedEl.dataset.triedConvertedUrl = 'false';
+    promotedEl.dataset.streamRescueAttempted = targetItem._streamRescueAttempted ? 'true' : 'false';
+  }
+
+  return { videoEl: promotedEl, promoted: true };
 }
 
 function startContinuousBackgroundPuller() {
@@ -6250,10 +6975,18 @@ function stopContinuousBackgroundPuller() {
   }
 }
 
-// Silently pre-buffer the next video in the queue and continuously top up the queue in the background
+// Silently pre-buffer the next video in the queue on the standby <video> layer and top up the queue in the background
 async function scheduleBackgroundQueuePrebuffer() {
   if (!settings.prebuffer) {
     stopContinuousBackgroundPuller();
+    clearStandbyVideoBuffer();
+    if (typeof document !== 'undefined') {
+      document.getElementById('prebufferBadge')?.classList.add('hidden');
+    }
+    return;
+  }
+  if (typeof document !== 'undefined' && document.body?.classList?.contains?.('app-locked')) {
+    clearStandbyVideoBuffer();
     document.getElementById('prebufferBadge')?.classList.add('hidden');
     return;
   }
@@ -6268,33 +7001,61 @@ async function scheduleBackgroundQueuePrebuffer() {
     await runContinuousPullCycle();
   }
 
-  // 2. Warm up the next video in the queue using an offscreen <video preload="auto"> element
+  // 2. Warm up currentIndex + 1 on the permanent hidden standby <video> element (Player B / #standbyVideo)
   const nextItem = videoQueue[currentIndex + 1];
-  const prebufferBadge = document.getElementById('prebufferBadge');
+  const prebufferBadge = typeof document !== 'undefined' ? document.getElementById('prebufferBadge') : null;
   if (!nextItem) {
+    clearStandbyVideoBuffer();
     prebufferBadge?.classList.add('hidden');
+    return;
+  }
+  if (nextItem._rehydratingOfflineBlob && !(nextItem.offlineBlob instanceof Blob)) {
     return;
   }
 
   const nextUrl = getEffectivePlaybackUrl(nextItem);
-  if (!nextUrl) return;
-
-  if (!prebufferVideoEl && typeof document !== 'undefined' && typeof document.createElement === 'function') {
-    prebufferVideoEl = document.createElement('video');
-    prebufferVideoEl.muted = true;
-    prebufferVideoEl.playsInline = true;
-    prebufferVideoEl.preload = 'auto';
-    prebufferVideoEl.referrerPolicy = 'no-referrer';
-    prebufferVideoEl.setAttribute?.('referrerpolicy', 'no-referrer');
-    if (prebufferVideoEl.style) {
-      prebufferVideoEl.style.display = 'none';
-    }
-    document.body?.appendChild?.(prebufferVideoEl);
+  if (!nextUrl) {
+    clearStandbyVideoBuffer();
+    prebufferBadge?.classList.add('hidden');
+    return;
   }
 
-  if (prebufferVideoEl && prebufferVideoEl.src !== nextUrl) {
-    prebufferVideoEl.src = nextUrl;
-    prebufferVideoEl.load?.();
+  const standbyEl = getStandbyVideoElement();
+  if (standbyEl) {
+    const nextExt = (nextItem.format || detectVideoFormat(nextItem.videoUrl).ext).toLowerCase();
+    const canPreloadDirect =
+      nextExt !== 'm3u8' ||
+      typeof standbyEl.canPlayType !== 'function' ||
+      Boolean(
+        standbyEl.canPlayType('application/vnd.apple.mpegurl') ||
+          standbyEl.canPlayType('application/x-mpegURL')
+      );
+
+    if (canPreloadDirect) {
+      standbyEl.muted = true;
+      standbyEl.playsInline = true;
+      standbyEl.preload = 'auto';
+      standbyEl.controls = false;
+      standbyEl.removeAttribute?.('controls');
+      if (standbyEl.style && standbyEl.id === 'standbyVideo') {
+        standbyEl.style.zIndex = '0';
+        standbyEl.style.opacity = '0';
+        standbyEl.style.pointerEvents = 'none';
+      }
+      if (standbyEl.src !== nextUrl) {
+        try {
+          standbyEl.pause?.();
+        } catch {}
+        if (standbyEl.dataset) {
+          standbyEl.dataset.prebufferFailed = 'false';
+          standbyEl.dataset.prebufferedUrl = nextUrl;
+        }
+        standbyEl.src = nextUrl;
+        standbyEl.load?.();
+      }
+    } else {
+      clearVideoElementSource(standbyEl);
+    }
   }
   nextItem.isPrebuffered = true;
   prebufferBadge?.classList.remove('hidden');
@@ -6328,6 +7089,16 @@ function toggleReelsFullscreen(forceState) {
         videoEl.setAttribute?.('controls', '');
       }
     }
+    const standbyEl = document.getElementById('standbyVideo');
+    if (standbyEl) {
+      standbyEl.controls = false;
+      standbyEl.removeAttribute?.('controls');
+      if (standbyEl.style) {
+        standbyEl.style.zIndex = '0';
+        standbyEl.style.opacity = '0';
+        standbyEl.style.pointerEvents = 'none';
+      }
+    }
   }
   updateReelsSeekerUI();
 
@@ -6352,7 +7123,7 @@ function animateReelsSlide(direction = 'next') {
   }
 
   if (isNext) {
-    advanceToNextVideo();
+    advanceToNextVideo({ userInitiated: true });
   } else {
     goToPrevVideo();
   }
@@ -6807,7 +7578,7 @@ async function startProxiedHlsPlayback(videoEl, videoItem, m3u8Url, opts = {}) {
 
 function updatePlayerUI() {
   if (typeof document === 'undefined') return;
-  const videoEl = document.getElementById('mainVideo');
+  let videoEl = document.getElementById('mainVideo');
   const titleEl = document.getElementById('videoTitle');
   const badgeEl = document.getElementById('videoSourceBadge');
   const formatBadgeEl = document.getElementById('videoFormatBadge');
@@ -6846,6 +7617,8 @@ function updatePlayerUI() {
 
   const current = videoQueue[currentIndex];
   if (!current) {
+    resetActiveAffinityWatch(null);
+    clearStandbyVideoBuffer();
     if (savePhoneBtn) savePhoneBtn.disabled = true;
     if (saveVaultBtn) saveVaultBtn.disabled = true;
     if (sendPlexBtn) sendPlexBtn.disabled = true;
@@ -6895,6 +7668,11 @@ function updatePlayerUI() {
     }
     updateReelsSeekerUI();
     return;
+  }
+
+  const currentKey = getPlaybackItemKey(current);
+  if (activeAffinityWatch.key !== currentKey) {
+    resetActiveAffinityWatch(current);
   }
 
   emptyEl?.classList.add('hidden');
@@ -6987,6 +7765,15 @@ function updatePlayerUI() {
           !videoEl.canPlayType('application/vnd.apple.mpegurl') &&
           !videoEl.canPlayType('application/x-mpegURL')));
 
+    const promotion = maybePromoteStandbyVideoLayer(
+      videoEl,
+      current,
+      targetPlayUrl,
+      shouldUseManagedHls,
+      awaitingOfflineRehydrate
+    );
+    videoEl = promotion.videoEl;
+
     if (shouldUseManagedHls) {
       if (
         !activeHlsState ||
@@ -7009,6 +7796,47 @@ function updatePlayerUI() {
         }).catch?.(() => {});
       }
       videoEl.playbackRate = settings.playbackSpeed || 1;
+    } else if (promotion.promoted) {
+      if (savedTime > 0) {
+        try {
+          videoEl.currentTime = savedTime;
+        } catch {}
+        if (!videoEl.duration) {
+          videoEl.addEventListener?.(
+            'loadedmetadata',
+            () => {
+              try {
+                if (!videoEl.duration || savedTime < videoEl.duration - 0.5) {
+                  videoEl.currentTime = savedTime;
+                }
+              } catch {}
+            },
+            { once: true }
+          );
+        }
+      } else if ((Number(videoEl.currentTime) || 0) > 0.05) {
+        try {
+          videoEl.currentTime = 0;
+        } catch {}
+      }
+      if (
+        settings.autoPlay &&
+        !isLockedOverlay &&
+        !(current.offlineBlob instanceof Blob) &&
+        !/^blob:/i.test(targetPlayUrl) &&
+        (Number(videoEl.readyState) || 0) < 2
+      ) {
+        armPlaybackStartupWatchdog(videoEl, current, targetPlayUrl);
+      } else {
+        clearPlaybackStartupWatchdog();
+      }
+      if (settings.autoPlay && !isLockedOverlay) {
+        videoEl.play?.()?.catch?.((err) => {
+          if (err?.name === 'NotAllowedError') {
+            clearPlaybackStartupWatchdog();
+          }
+        });
+      }
     } else if (videoEl.src !== targetPlayUrl) {
       detachActiveHlsPlayer(videoEl);
       if (videoEl.dataset) {
@@ -7073,7 +7901,30 @@ function updatePlayerUI() {
   }
 }
 
-function advanceToNextVideo() {
+function advanceToNextVideo(opts = {}) {
+  const userInitiated = Boolean(opts && opts.userInitiated);
+  const current = videoQueue[currentIndex];
+  if (userInitiated && current && activeAffinityWatch.key === getPlaybackItemKey(current)) {
+    const videoEl = typeof document !== 'undefined' ? document.getElementById('mainVideo') : null;
+    const liveDeltaSec =
+      activeAffinityWatch.lastPlayResumeMs > 0
+        ? Math.max(0, (Date.now() - activeAffinityWatch.lastPlayResumeMs) / 1000)
+        : 0;
+    const watchedSec = Math.max(
+      activeAffinityWatch.accumulatedPlaySec + liveDeltaSec,
+      activeAffinityWatch.maxCurrentTimeSec
+    );
+    if (
+      activeAffinityWatch.hasPlayed &&
+      !activeAffinityWatch.rewardedCompletion &&
+      !activeAffinityWatch.rewardedVault &&
+      !isHandlingPlaybackError &&
+      !videoEl?.error &&
+      watchedSec < 2.0
+    ) {
+      recordAffinitySignal(current, 'skip');
+    }
+  }
   savePlaybackState();
   if (currentIndex < videoQueue.length - 1) {
     currentIndex++;
@@ -8117,7 +8968,10 @@ async function pullRandomVideos(count = 1, customKeyword = null) {
       fresh = [...FALLBACK_VIDEOS];
     }
 
-    const selected = shuffleArray(fresh).slice(0, count);
+    const orderedFresh = customKeyword
+      ? shuffleArray(fresh)
+      : rankVideosByAffinity(fresh, { isNsfw: pullAllowNsfw });
+    const selected = orderedFresh.slice(0, count);
     for (const item of selected) {
       seenUrls.add(item.videoUrl);
       videoQueue.push(item);
@@ -8837,6 +9691,12 @@ if (typeof document !== 'undefined') {
   if (!launchedDeepLink && videoQueue.length === 0 && settings.resumePlayback) {
     if (restorePlaybackState()) {
       await rehydrateQueueOfflineBlobsFromVault();
+      if (isAppUnlocked && settings.prebuffer && videoQueue.length > 0) {
+        scheduleBackgroundQueuePrebuffer();
+      }
+    } else if (isAppUnlocked && settings.prebuffer && savedSessionExpiredOnRestore) {
+      savedSessionExpiredOnRestore = false;
+      pullRandomVideos(1).catch?.(() => {});
     }
     if (!isAppUnlocked) {
       try {
@@ -8925,80 +9785,198 @@ if (typeof document !== 'undefined') {
     saveSettings();
   });
 
-  const mainVideoEl = document.getElementById('mainVideo');
+  // Bind Dual-Layer Video Recycling listeners to both Player A & Player B (never destroyed/recreated)
+  const attachVideoLayerListeners = (videoEl) => {
+    if (!videoEl || boundVideoLayerElements.has(videoEl)) return;
+    boundVideoLayerElements.add(videoEl);
 
-  // Track playback position so user can pick up right where they left off & sync Reels seeker
-  mainVideoEl?.addEventListener('timeupdate', () => {
-    if ((Number(mainVideoEl.readyState) || 0) >= 2 && (Number(mainVideoEl.currentTime) || 0) > 0.1) {
+    const isForeground = () => videoEl === document.getElementById('mainVideo');
+
+    videoEl.addEventListener('timeupdate', () => {
+      if (!isForeground()) return;
+      const curTime = Number(videoEl.currentTime) || 0;
+      if ((Number(videoEl.readyState) || 0) >= 2 && curTime > 0.1) {
+        clearPlaybackStartupWatchdog();
+        consecutiveErrorSkips = 0;
+      }
+      const current = videoQueue[currentIndex];
+      if (current && activeAffinityWatch.key === getPlaybackItemKey(current)) {
+        if ((Number(videoEl.readyState) || 0) >= 2 && curTime > 0.15) {
+          activeAffinityWatch.hasPlayed = true;
+        }
+        const dur = Number(videoEl.duration) || Number(current.duration) || 0;
+        if (
+          activeAffinityWatch.rewardedCompletion &&
+          activeAffinityWatch.loopCount < 1 &&
+          dur >= 3 &&
+          curTime < dur * 0.2 &&
+          activeAffinityWatch.maxCurrentTimeSec >= dur * 0.8
+        ) {
+          activeAffinityWatch.loopArmed = true;
+        }
+        if (curTime > activeAffinityWatch.maxCurrentTimeSec) {
+          activeAffinityWatch.maxCurrentTimeSec = curTime;
+        }
+        if (dur > 0 && curTime / dur >= 0.8) {
+          if (!activeAffinityWatch.rewardedCompletion) {
+            activeAffinityWatch.rewardedCompletion = true;
+            recordAffinitySignal(current, 'complete');
+          } else if (activeAffinityWatch.loopArmed) {
+            activeAffinityWatch.loopArmed = false;
+            activeAffinityWatch.loopCount++;
+            recordAffinitySignal(current, 'loop');
+          }
+        }
+      }
+      savePlaybackState();
+      updateReelsSeekerUI();
+    });
+
+    videoEl.addEventListener('loadedmetadata', () => {
+      if (!isForeground()) return;
+      consecutiveErrorSkips = 0;
+      updateReelsSeekerUI();
+    });
+
+    videoEl.addEventListener('loadeddata', () => {
+      if (!isForeground()) {
+        videoEl.muted = true;
+        if (!videoEl.paused) {
+          try {
+            videoEl.pause?.();
+          } catch {}
+        }
+        return;
+      }
       clearPlaybackStartupWatchdog();
       consecutiveErrorSkips = 0;
-    }
-    savePlaybackState();
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('loadedmetadata', () => {
-    consecutiveErrorSkips = 0;
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('loadeddata', () => {
-    clearPlaybackStartupWatchdog();
-    consecutiveErrorSkips = 0;
-  });
-  mainVideoEl?.addEventListener('canplay', () => {
-    clearPlaybackStartupWatchdog();
-    consecutiveErrorSkips = 0;
-  });
-  mainVideoEl?.addEventListener('playing', () => {
-    clearPlaybackStartupWatchdog();
-    consecutiveErrorSkips = 0;
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('durationchange', () => {
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('play', () => {
-    consecutiveErrorSkips = 0;
-    const activeItem = videoQueue[currentIndex];
-    const activeSrc = mainVideoEl.currentSrc || mainVideoEl.src || '';
-    if (
-      activeItem &&
-      (Number(mainVideoEl.readyState) || 0) < 2 &&
-      !(activeItem.offlineBlob instanceof Blob) &&
-      !/^blob:/i.test(activeSrc)
-    ) {
-      armPlaybackStartupWatchdog(mainVideoEl, activeItem, activeSrc);
-    }
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('pause', () => {
-    if (!mainVideoEl.ended && !mainVideoEl.error) {
+    });
+
+    videoEl.addEventListener('canplay', () => {
+      if (!isForeground()) {
+        videoEl.muted = true;
+        if (!videoEl.paused) {
+          try {
+            videoEl.pause?.();
+          } catch {}
+        }
+        return;
+      }
       clearPlaybackStartupWatchdog();
-    }
-    savePlaybackState();
-    updateReelsSeekerUI();
-  });
-  mainVideoEl?.addEventListener('volumechange', () => {
-    updateReelsSeekerUI();
-  });
+      consecutiveErrorSkips = 0;
+    });
 
-  // Auto-Advance on Video End
-  mainVideoEl?.addEventListener('ended', () => {
-    const current = videoQueue[currentIndex];
-    if (current) {
-      current.resumeTime = 0;
-      const key = getPlaybackItemKey(current);
-      if (key) delete playbackPositions[key];
-      savePlaybackState(0);
-    }
-    if (settings.autoAdvance) {
-      advanceToNextVideo();
-    }
-  });
+    videoEl.addEventListener('playing', () => {
+      if (!isForeground()) {
+        videoEl.muted = true;
+        try {
+          videoEl.pause?.();
+        } catch {}
+        return;
+      }
+      clearPlaybackStartupWatchdog();
+      consecutiveErrorSkips = 0;
+      const current = videoQueue[currentIndex];
+      if (current && activeAffinityWatch.key === getPlaybackItemKey(current)) {
+        activeAffinityWatch.hasPlayed = true;
+        if (!activeAffinityWatch.lastPlayResumeMs) {
+          activeAffinityWatch.lastPlayResumeMs = Date.now();
+        }
+      }
+      updateReelsSeekerUI();
+    });
 
-  // Auto-recover on playback error: try derivative URL -> on-device MP4 convert -> skip dead stream
-  mainVideoEl?.addEventListener('error', async () => {
-    await handleVideoPlaybackError();
-  });
+    videoEl.addEventListener('durationchange', () => {
+      if (!isForeground()) return;
+      updateReelsSeekerUI();
+    });
+
+    videoEl.addEventListener('play', () => {
+      if (!isForeground()) {
+        videoEl.muted = true;
+        try {
+          videoEl.pause?.();
+        } catch {}
+        return;
+      }
+      consecutiveErrorSkips = 0;
+      const activeItem = videoQueue[currentIndex];
+      const activeSrc = videoEl.currentSrc || videoEl.src || '';
+      if (
+        activeItem &&
+        (Number(videoEl.readyState) || 0) < 2 &&
+        !(activeItem.offlineBlob instanceof Blob) &&
+        !/^blob:/i.test(activeSrc)
+      ) {
+        armPlaybackStartupWatchdog(videoEl, activeItem, activeSrc);
+      }
+      updateReelsSeekerUI();
+    });
+
+    videoEl.addEventListener('pause', () => {
+      if (!isForeground()) return;
+      if (activeAffinityWatch.lastPlayResumeMs > 0) {
+        activeAffinityWatch.accumulatedPlaySec += Math.max(
+          0,
+          (Date.now() - activeAffinityWatch.lastPlayResumeMs) / 1000
+        );
+        activeAffinityWatch.lastPlayResumeMs = 0;
+      }
+      if (!videoEl.ended && !videoEl.error) {
+        clearPlaybackStartupWatchdog();
+      }
+      savePlaybackState();
+      updateReelsSeekerUI();
+    });
+
+    videoEl.addEventListener('volumechange', () => {
+      if (!isForeground()) return;
+      updateReelsSeekerUI();
+    });
+
+    // Auto-Advance on Video End + Affinity completion reward
+    videoEl.addEventListener('ended', () => {
+      if (!isForeground()) return;
+      if (activeAffinityWatch.lastPlayResumeMs > 0) {
+        activeAffinityWatch.accumulatedPlaySec += Math.max(
+          0,
+          (Date.now() - activeAffinityWatch.lastPlayResumeMs) / 1000
+        );
+        activeAffinityWatch.lastPlayResumeMs = 0;
+      }
+      const current = videoQueue[currentIndex];
+      if (current) {
+        if (
+          activeAffinityWatch.key === getPlaybackItemKey(current) &&
+          !activeAffinityWatch.rewardedCompletion
+        ) {
+          activeAffinityWatch.rewardedCompletion = true;
+          recordAffinitySignal(current, 'complete');
+        }
+        current.resumeTime = 0;
+        const key = getPlaybackItemKey(current);
+        if (key) delete playbackPositions[key];
+        savePlaybackState(0);
+      }
+      if (settings.autoAdvance) {
+        advanceToNextVideo();
+      }
+    });
+
+    // Isolate background prebuffer errors on #standbyVideo; auto-recover foreground errors on #mainVideo
+    videoEl.addEventListener('error', async () => {
+      if (!isForeground()) {
+        if (videoEl.dataset) {
+          videoEl.dataset.prebufferFailed = 'true';
+        }
+        return;
+      }
+      await handleVideoPlaybackError();
+    });
+  };
+
+  attachVideoLayerListeners(document.getElementById('mainVideo'));
+  attachVideoLayerListeners(document.getElementById('standbyVideo'));
 
   // Manual / 1-Tap Convert to .MP4 button in Player
   document.getElementById('convertNowBtn')?.addEventListener('click', async () => {
@@ -9016,7 +9994,7 @@ if (typeof document !== 'undefined') {
     toggleReelsFullscreen(false);
   });
   document.getElementById('reelsNextBtn')?.addEventListener('click', () => {
-    advanceToNextVideo();
+    advanceToNextVideo({ userInitiated: true });
   });
   document.getElementById('reelsSkip15Btn')?.addEventListener('click', () => {
     skipVideoTime(15);
@@ -9095,18 +10073,20 @@ if (typeof document !== 'undefined') {
   });
 
   document.getElementById('reelsPlayPauseBtn')?.addEventListener('click', () => {
-    if (!mainVideoEl) return;
-    if (mainVideoEl.paused) {
-      mainVideoEl.play().catch(() => {});
+    const activeVideoEl = document.getElementById('mainVideo');
+    if (!activeVideoEl) return;
+    if (activeVideoEl.paused) {
+      activeVideoEl.play().catch(() => {});
     } else {
-      mainVideoEl.pause();
+      activeVideoEl.pause();
     }
     updateReelsSeekerUI();
   });
 
   document.getElementById('reelsMuteBtn')?.addEventListener('click', () => {
-    if (!mainVideoEl) return;
-    mainVideoEl.muted = !mainVideoEl.muted;
+    const activeVideoEl = document.getElementById('mainVideo');
+    if (!activeVideoEl) return;
+    activeVideoEl.muted = !activeVideoEl.muted;
     updateReelsSeekerUI();
   });
 
@@ -9188,7 +10168,7 @@ if (typeof document !== 'undefined') {
   });
 
   document.getElementById('nextVideoBtn')?.addEventListener('click', () => {
-    advanceToNextVideo();
+    advanceToNextVideo({ userInitiated: true });
   });
 
   document.getElementById('prevVideoBtn')?.addEventListener('click', () => {
@@ -9215,10 +10195,11 @@ if (typeof document !== 'undefined') {
   };
 
   const snapBackReelsVideo = () => {
-    if (!mainVideoEl?.style) return;
-    mainVideoEl.style.transition = 'transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
-    mainVideoEl.style.transform = 'translate3d(0, 0, 0)';
-    mainVideoEl.style.opacity = '1';
+    const activeVideoEl = document.getElementById('mainVideo');
+    if (!activeVideoEl?.style) return;
+    activeVideoEl.style.transition = 'transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease';
+    activeVideoEl.style.transform = 'translate3d(0, 0, 0)';
+    activeVideoEl.style.opacity = '1';
   };
 
   stage?.addEventListener(
@@ -9230,8 +10211,9 @@ if (typeof document !== 'undefined') {
       touchStartY = pt.y;
       touchStartTime = Date.now();
       isDraggingReels = false;
-      if (isReelsFullscreen && mainVideoEl?.style) {
-        mainVideoEl.style.transition = 'none';
+      const activeVideoEl = document.getElementById('mainVideo');
+      if (isReelsFullscreen && activeVideoEl?.style) {
+        activeVideoEl.style.transition = 'none';
       }
     },
     { passive: true }
@@ -9249,11 +10231,12 @@ if (typeof document !== 'undefined') {
       if (Math.abs(dy) > 6 && Math.abs(dy) >= Math.abs(dx)) {
         isDraggingReels = true;
         e.preventDefault?.();
-        if (mainVideoEl?.style) {
+        const activeVideoEl = document.getElementById('mainVideo');
+        if (activeVideoEl?.style) {
           const dampedDy = currentIndex <= 0 && dy > 0 ? dy * 0.28 : dy * 0.85;
-          mainVideoEl.style.transition = 'none';
-          mainVideoEl.style.transform = `translate3d(0, ${Math.round(dampedDy)}px, 0)`;
-          mainVideoEl.style.opacity = String(Math.max(0.45, 1 - Math.abs(dy) / 520));
+          activeVideoEl.style.transition = 'none';
+          activeVideoEl.style.transform = `translate3d(0, ${Math.round(dampedDy)}px, 0)`;
+          activeVideoEl.style.opacity = String(Math.max(0.45, 1 - Math.abs(dy) / 520));
         }
       }
     },
@@ -9305,7 +10288,7 @@ if (typeof document !== 'undefined') {
         isDraggingReels = false;
         if (dx < 0) {
           if (isReelsFullscreen) animateReelsSlide('next');
-          else advanceToNextVideo();
+          else advanceToNextVideo({ userInitiated: true });
         } else {
           if (isReelsFullscreen) animateReelsSlide('prev');
           else goToPrevVideo();
@@ -9331,13 +10314,15 @@ if (typeof document !== 'undefined') {
             setTimeout(() => fb?.classList.add('hidden'), 1100);
             await saveAndCacheVideoToVault(current);
           }
-        } else if (isReelsFullscreen && mainVideoEl) {
+        } else if (isReelsFullscreen) {
           clearTimeout(singleTapTimer);
           singleTapTimer = setTimeout(() => {
-            if (mainVideoEl.paused) {
-              mainVideoEl.play().catch(() => {});
+            const activeVideoEl = document.getElementById('mainVideo');
+            if (!activeVideoEl) return;
+            if (activeVideoEl.paused) {
+              activeVideoEl.play().catch(() => {});
             } else {
-              mainVideoEl.pause();
+              activeVideoEl.pause();
             }
             updateReelsSeekerUI();
           }, 285);
@@ -9871,6 +10856,8 @@ if (typeof document !== 'undefined') {
       scheduleBackgroundQueuePrebuffer();
       showToast('Background queue pre-buffering enabled');
     } else {
+      stopContinuousBackgroundPuller();
+      clearStandbyVideoBuffer();
       document.getElementById('prebufferBadge')?.classList.add('hidden');
       showToast('Background pre-buffering disabled');
     }
@@ -10116,6 +11103,8 @@ if (typeof document !== 'undefined') {
     const speedSel = document.getElementById('playbackSpeedSelect');
     if (speedSel) speedSel.value = '1';
     revokeVideoItemBlobUrls(videoQueue);
+    clearStandbyVideoBuffer();
+    resetAffinityState();
     videoQueue = [];
     currentIndex = -1;
     playbackPositions = {};
@@ -10326,8 +11315,12 @@ if (typeof module !== 'undefined' && module.exports) {
     searchRedditVideosByKeyword,
     searchPeerTubeVideos,
     searchFediverseVideos,
+    searchNasaVideos,
     extractVideoUrlsFromHtml,
     isKnownNsfwUrl,
+    inferVideoPlatform,
+    normalizeVideoItem,
+    isPeerTubeVideoItem,
     isMainstreamSfwClientUrl,
     searchCloudVideos,
     scanUrlForVideos,
@@ -10344,6 +11337,22 @@ if (typeof module !== 'undefined' && module.exports) {
     pullSmartInputToPlayer,
     queueSearchResultsToPlayer,
     runContinuousPullCycle,
+    AffinityEngine,
+    loadAffinityState,
+    saveAffinityState,
+    resetAffinityState,
+    extractAffinityFeatures,
+    recordAffinitySignal,
+    getVideoAffinityScore,
+    hasAffinitySignals,
+    rankVideosByAffinity,
+    reRankUpcomingQueueTail,
+    getActiveVideoElement,
+    getStandbyVideoElement,
+    clearStandbyVideoBuffer,
+    clearStandbyVideoBufferIfMismatch,
+    swapDualVideoLayerRoles,
+    maybePromoteStandbyVideoLayer,
     startContinuousBackgroundPuller,
     stopContinuousBackgroundPuller,
     scheduleBackgroundQueuePrebuffer,
@@ -10458,13 +11467,31 @@ if (typeof module !== 'undefined' && module.exports) {
       isAdultDirectoryExpanded,
       lastSearchResults,
       playbackPositions,
-      deadUrls
+      deadUrls,
+      affinityState,
+      activeAffinityWatch,
+      savedSessionExpiredOnRestore
     }),
     setAppState: (patch = {}) => {
       if (patch.resetRedgifsToken) {
         cachedRedgifsToken = null;
         cachedRedgifsTokenExpiry = 0;
         cachedRedgifsTokenViaProxy = false;
+      }
+      if (patch.resetAffinity) {
+        resetAffinityState();
+      }
+      if (patch.affinityState && typeof patch.affinityState === 'object') {
+        affinityState = {
+          safe: sanitizeAffinityBucket(patch.affinityState.safe),
+          nsfw: sanitizeAffinityBucket(patch.affinityState.nsfw)
+        };
+      }
+      if (patch.activeAffinityWatch && typeof patch.activeAffinityWatch === 'object') {
+        activeAffinityWatch = { ...activeAffinityWatch, ...patch.activeAffinityWatch };
+      }
+      if (typeof patch.savedSessionExpiredOnRestore === 'boolean') {
+        savedSessionExpiredOnRestore = patch.savedSessionExpiredOnRestore;
       }
       if (patch.cloudConfig && typeof patch.cloudConfig === 'object') {
         lastCloudStatusOverride = null;
@@ -10495,6 +11522,7 @@ if (typeof module !== 'undefined' && module.exports) {
       if (Array.isArray(patch.videoQueue)) {
         clearPlaybackStartupWatchdog();
         detachActiveHlsPlayer();
+        clearStandbyVideoBuffer();
         const nextSet = new Set(patch.videoQueue);
         revokeVideoItemBlobUrls(videoQueue.filter((item) => !nextSet.has(item)));
         videoQueue = patch.videoQueue;
@@ -10504,6 +11532,7 @@ if (typeof module !== 'undefined' && module.exports) {
           seenUrls.clear();
           deadUrls.clear();
           httpOnlyHosts.clear();
+          resetActiveAffinityWatch(null);
           if (!patch.playbackPositions) {
             playbackPositions = {};
           }

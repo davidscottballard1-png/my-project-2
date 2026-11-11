@@ -2,6 +2,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 const {
   STORAGE_KEYS,
   detectVideoFormat,
@@ -15,10 +16,27 @@ const {
   needsMp4Conversion,
   encodeArchiveFilePath,
   extractRedditVideosFromListing,
+  inferVideoPlatform,
+  normalizeVideoItem,
+  isPeerTubeVideoItem,
+  isStaleOrDisallowedRestoredItem,
   getFormatBadgeInfo,
   getEffectivePlaybackUrl,
   escapeHtml,
   obtainIphoneReadyVideoBlob,
+  AffinityEngine,
+  loadAffinityState,
+  resetAffinityState,
+  recordAffinitySignal,
+  getVideoAffinityScore,
+  rankVideosByAffinity,
+  reRankUpcomingQueueTail,
+  scheduleBackgroundQueuePrebuffer,
+  clearStandbyVideoBuffer,
+  unlockAppGate,
+  lockAppGate,
+  triggerPanicSafeMode,
+  restorePlaybackState,
   setPlayerLoading,
   updatePlayerUI,
   advanceToNextVideo,
@@ -1398,6 +1416,678 @@ describe('ReelVault Unit Tests', () => {
       await new Promise((r) => setTimeout(r, 10));
       assert.strictEqual(elements.get('searchResultsCount').textContent, '1 video');
       assert.ok(elements.get('searchResultsList').innerHTML.includes('sample-clip.mp4'));
+    });
+  });
+
+  describe('normalizeVideoItem & Unified Adapter Schema', () => {
+    it('normalizes missing optional fields, author arrays, and canonical platform tags without losing URL fallback chains', () => {
+      assert.strictEqual(normalizeVideoItem(null), null);
+      assert.strictEqual(normalizeVideoItem({ title: 'No URL' }), null);
+
+      const archiveItem = normalizeVideoItem({
+        id: 'ia-apollo11-mp4',
+        title: '  Apollo 11 Launch  ',
+        videoUrl: 'https://archive.org/download/apollo11/apollo11.ia.mp4',
+        originalUrl: 'https://archive.org/download/apollo11/apollo11.mp4',
+        convertedUrl: 'https://archive.org/download/apollo11/apollo11_512kb.mp4',
+        author: ['NASA Johnson Space Center', 'Secondary'],
+        sourceName: 'Archive.org (apollo)',
+        pageUrl: 'https://archive.org/details/apollo11'
+      });
+
+      assert.strictEqual(archiveItem.title, 'Apollo 11 Launch');
+      assert.strictEqual(archiveItem.videoUrl, 'https://archive.org/download/apollo11/apollo11.ia.mp4');
+      assert.strictEqual(archiveItem.originalUrl, 'https://archive.org/download/apollo11/apollo11.mp4');
+      assert.strictEqual(archiveItem.convertedUrl, 'https://archive.org/download/apollo11/apollo11_512kb.mp4');
+      assert.strictEqual(archiveItem.format, 'mp4');
+      assert.strictEqual(archiveItem.isNsfw, false);
+      assert.strictEqual(archiveItem.duration, 0);
+      assert.strictEqual(archiveItem.isHd, false);
+      assert.deepStrictEqual(archiveItem.tags, []);
+      assert.strictEqual(archiveItem.author, 'NASA Johnson Space Center');
+      assert.strictEqual(archiveItem.platform, 'archive');
+
+      const ptItem = normalizeVideoItem({
+        id: 'custom-uuid',
+        title: 'Federated Clip',
+        videoUrl: 'https://tube.example/static/1080.mp4',
+        platform: 'peertube',
+        sourceName: 'Custom Instance'
+      });
+      assert.strictEqual(isPeerTubeVideoItem(ptItem), true);
+      assert.strictEqual(inferVideoPlatform({ id: 'lemmy-42', sourceName: 'Custom Label' }), 'lemmy');
+      assert.strictEqual(
+        isStaleOrDisallowedRestoredItem(
+          normalizeVideoItem({
+            id: 'custom-lemmy-1',
+            videoUrl: 'https://cdn.example/clip.mp4',
+            platform: 'lemmy',
+            sourceName: 'Custom Label'
+          }),
+          [{ id: 's-reddit', type: 'subreddit', value: 'videos', label: 'r/videos', enabled: true }]
+        ),
+        true
+      );
+    });
+  });
+
+  describe('Dual-Layer Video Recycling (True 0ms Swipe)', () => {
+    function createDualVideoMockDom() {
+      const { elements, tabViews, navTabs } = createMockDom();
+      let videoCreateCount = 0;
+
+      function makeVideoNode(initialId, slotName, initialClasses) {
+        const classes = new Set(initialClasses);
+        const attrs = new Map();
+        const node = {
+          id: initialId,
+          src: '',
+          muted: slotName === 'B',
+          volume: 1,
+          playbackRate: 1,
+          currentTime: 0,
+          duration: 12,
+          readyState: 4,
+          paused: true,
+          controls: slotName === 'A',
+          playsInline: true,
+          preload: 'auto',
+          error: null,
+          loadCount: 0,
+          playCount: 0,
+          pauseCount: 0,
+          style: {},
+          dataset: { playerSlot: slotName, prebufferedUrl: '', prebufferFailed: 'false' },
+          classList: {
+            add: (...tokens) => tokens.forEach((t) => classes.add(t)),
+            remove: (...tokens) => tokens.forEach((t) => classes.delete(t)),
+            toggle: (token, force) => {
+              const shouldAdd = typeof force === 'boolean' ? force : !classes.has(token);
+              if (shouldAdd) classes.add(token);
+              else classes.delete(token);
+              return shouldAdd;
+            },
+            contains: (token) => classes.has(token)
+          },
+          getAttribute: (k) => (k === 'src' ? node.src || null : attrs.get(k) ?? null),
+          setAttribute: (k, v) => {
+            if (k === 'src') node.src = String(v);
+            else attrs.set(k, String(v));
+          },
+          removeAttribute: (k) => {
+            if (k === 'src') node.src = '';
+            else attrs.delete(k);
+          },
+          canPlayType: () => 'probably',
+          load: () => {
+            node.loadCount++;
+          },
+          play: () => {
+            node.playCount++;
+            node.paused = false;
+            return Promise.resolve();
+          },
+          pause: () => {
+            node.pauseCount++;
+            node.paused = true;
+          },
+          addEventListener: () => {}
+        };
+        return node;
+      }
+
+      const slotA = makeVideoNode('mainVideo', 'A', ['stage-video-layer', 'active-video-layer']);
+      const slotB = makeVideoNode('standbyVideo', 'B', ['stage-video-layer', 'standby-video-layer']);
+      const origCreateElement = globalThis.document.createElement;
+
+      globalThis.document = {
+        ...globalThis.document,
+        getElementById: (id) => {
+          if (slotA.id === id) return slotA;
+          if (slotB.id === id) return slotB;
+          return elements.get(id) || null;
+        },
+        createElement: (tag) => {
+          if (String(tag).toLowerCase() === 'video') {
+            videoCreateCount++;
+          }
+          return origCreateElement(tag);
+        },
+        querySelectorAll: (selector) => {
+          if (selector === '.tab-view') return tabViews;
+          if (selector === '.nav-tab') return navTabs;
+          if (selector === '#videoStage video') return [slotA, slotB];
+          return [];
+        }
+      };
+
+      return { elements, slotA, slotB, getVideoCreateCount: () => videoCreateCount };
+    }
+
+    it('keeps index.html, styles.css, and sw.js in v31 lockstep with stacked Player A and Player B in #videoStage', () => {
+      const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+      const swCode = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
+      const css = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+
+      assert.ok(swCode.includes("const CACHE_NAME = 'reelvault-v31'"));
+      assert.ok(html.includes('./styles.css?v=31'));
+      assert.ok(html.includes('./app.js?v=31'));
+      assert.ok(html.includes('id="mainVideo"') && html.includes('data-player-slot="A"'));
+      assert.ok(html.includes('id="standbyVideo"') && html.includes('data-player-slot="B"'));
+      assert.ok(css.includes('.video-stage .active-video-layer'));
+      assert.ok(css.includes('.video-stage .standby-video-layer'));
+    });
+
+    it('swaps foreground/standby roles in 0ms on swipe without reloading or creating <video> elements', async () => {
+      const { slotA, slotB, getVideoCreateCount } = createDualVideoMockDom();
+      const origPrebuffer = settings.prebuffer;
+      const origAutoPlay = settings.autoPlay;
+      const origAllowNsfw = settings.allowNsfw;
+      const origSpeed = settings.playbackSpeed;
+
+      try {
+        settings.prebuffer = true;
+        settings.autoPlay = true;
+        settings.allowNsfw = false;
+        settings.playbackSpeed = 1.5;
+        slotA.muted = false;
+        slotA.volume = 0.65;
+
+        setAppState({
+          videoQueue: [
+            { id: 'c0', title: 'Clip 0', videoUrl: 'https://cdn.example/clip0.mp4', format: 'mp4', isNsfw: false },
+            { id: 'c1', title: 'Clip 1', videoUrl: 'https://cdn.example/clip1.mp4', format: 'mp4', isNsfw: false },
+            { id: 'c2', title: 'Clip 2', videoUrl: 'https://cdn.example/clip2.mp4', format: 'mp4', isNsfw: false },
+            { id: 'c3', title: 'Clip 3', videoUrl: 'https://cdn.example/clip3.mp4', format: 'mp4', isNsfw: false }
+          ],
+          currentIndex: 0
+        });
+
+        updatePlayerUI();
+        await scheduleBackgroundQueuePrebuffer();
+
+        assert.strictEqual(slotA.id, 'mainVideo');
+        assert.strictEqual(slotA.src, 'https://cdn.example/clip0.mp4');
+        assert.strictEqual(slotB.id, 'standbyVideo');
+        assert.strictEqual(slotB.src, 'https://cdn.example/clip1.mp4');
+        assert.strictEqual(slotB.muted, true);
+        assert.strictEqual(slotB.style.zIndex, '0');
+        assert.strictEqual(slotB.style.opacity, '0');
+
+        const slotBLoadsBeforeSwipe = slotB.loadCount;
+        advanceToNextVideo({ userInitiated: true });
+        await scheduleBackgroundQueuePrebuffer();
+
+        // Player B is now the active foreground #mainVideo playing Clip 1 without calling .load() again
+        assert.strictEqual(slotB.id, 'mainVideo');
+        assert.strictEqual(slotB.classList.contains('active-video-layer'), true);
+        assert.strictEqual(slotB.style.zIndex, '1');
+        assert.strictEqual(slotB.style.opacity, '1');
+        assert.strictEqual(slotB.loadCount, slotBLoadsBeforeSwipe, 'Promoted standby layer must not reload src');
+        assert.ok(slotB.playCount >= 1, 'Promoted foreground layer should call play() immediately');
+        assert.strictEqual(slotB.muted, false, 'Foreground layer should inherit user unmuted state');
+        assert.strictEqual(slotB.volume, 0.65, 'Foreground layer should inherit user volume');
+        assert.strictEqual(slotB.playbackRate, 1.5, 'Foreground layer should inherit playback speed');
+
+        // Player A was recycled into hidden #standbyVideo preloading Clip 2
+        assert.strictEqual(slotA.id, 'standbyVideo');
+        assert.strictEqual(slotA.classList.contains('standby-video-layer'), true);
+        assert.strictEqual(slotA.muted, true);
+        assert.strictEqual(slotA.style.zIndex, '0');
+        assert.strictEqual(slotA.style.opacity, '0');
+        assert.strictEqual(slotA.src, 'https://cdn.example/clip2.mp4');
+        assert.strictEqual(getVideoCreateCount(), 0, 'Zero dynamic <video> elements should be created');
+      } finally {
+        settings.prebuffer = origPrebuffer;
+        settings.autoPlay = origAutoPlay;
+        settings.allowNsfw = origAllowNsfw;
+        settings.playbackSpeed = origSpeed;
+        clearStandbyVideoBuffer();
+        setAppState({ videoQueue: [], currentIndex: -1 });
+      }
+    });
+
+    it('refuses to promote a failed standby buffer and scrubs standby src on App Lock and Panic Safe Mode', async () => {
+      const { slotA, slotB } = createDualVideoMockDom();
+      const origPrebuffer = settings.prebuffer;
+
+      try {
+        settings.prebuffer = true;
+        setAppState({
+          videoQueue: [
+            { id: 'f0', title: 'Clip A', videoUrl: 'https://cdn.example/a.mp4', format: 'mp4' },
+            { id: 'f1', title: 'Clip B', videoUrl: 'https://cdn.example/b.mp4', format: 'mp4' },
+            { id: 'f2', title: 'Clip C', videoUrl: 'https://cdn.example/c.mp4', format: 'mp4' },
+            { id: 'f3', title: 'Clip D', videoUrl: 'https://cdn.example/d.mp4', format: 'mp4' }
+          ],
+          currentIndex: 0
+        });
+
+        updatePlayerUI();
+        await scheduleBackgroundQueuePrebuffer();
+        assert.strictEqual(slotB.src, 'https://cdn.example/b.mp4');
+
+        // Simulate background prebuffer error on standby layer
+        slotB.dataset.prebufferFailed = 'true';
+        advanceToNextVideo({ userInitiated: true });
+        assert.strictEqual(slotA.id, 'mainVideo', 'Broken standby layer must not be promoted');
+        assert.strictEqual(slotA.src, 'https://cdn.example/b.mp4');
+
+        // Re-buffer next item on standby, then verify lockAppGate scrubs standby buffer
+        await scheduleBackgroundQueuePrebuffer();
+        assert.strictEqual(slotB.src, 'https://cdn.example/c.mp4');
+        lockAppGate();
+        assert.strictEqual(slotB.src, '', 'lockAppGate must scrub #standbyVideo src');
+        assert.strictEqual(slotB.dataset.prebufferedUrl, '');
+
+        unlockAppGate();
+        await scheduleBackgroundQueuePrebuffer();
+        assert.strictEqual(slotB.src, 'https://cdn.example/c.mp4');
+        triggerPanicSafeMode();
+        const currentStandby = globalThis.document.getElementById('standbyVideo');
+        assert.strictEqual(currentStandby.src, '', 'Panic Safe Mode must scrub #standbyVideo src');
+      } finally {
+        settings.prebuffer = origPrebuffer;
+        unlockAppGate();
+        clearStandbyVideoBuffer();
+        setAppState({ videoQueue: [], currentIndex: -1 });
+      }
+    });
+  });
+
+  describe('Local-Only AffinityEngine (Smart Personalization)', () => {
+    function setupAffinityStorage(initial = {}) {
+      const store = new Map(Object.entries(initial));
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+      return store;
+    }
+
+    it('rewards >=80% completion / Vault / Favorite (+5), clamps weights, and persists strictly separated Safe vs 18+ profiles', () => {
+      createMockDom();
+      const store = setupAffinityStorage();
+      const origAllowNsfw = settings.allowNsfw;
+
+      try {
+        settings.allowNsfw = false;
+        resetAffinityState();
+
+        const safeClip = {
+          id: 'safe-astro-1',
+          title: 'NASA Rocket Telemetry',
+          videoUrl: 'https://archive.org/download/rocket.mp4',
+          tags: ['space', 'rockets'],
+          author: '@NASAOfficial',
+          platform: 'archive',
+          isNsfw: false
+        };
+        const adultClip = {
+          id: 'nsfw-clip-1',
+          title: 'Adult Studio Clip',
+          videoUrl: 'https://media.redgifs.com/sample.mp4?expires=4102444800',
+          tags: ['space', 'glamour'],
+          author: 'StudioCreator',
+          platform: 'redgifs',
+          isNsfw: true
+        };
+
+        assert.strictEqual(recordAffinitySignal(safeClip, 'complete'), 5);
+        assert.strictEqual(recordAffinitySignal(safeClip, 'vault'), 5);
+        assert.strictEqual(recordAffinitySignal(adultClip, 'favorite'), 5);
+
+        const state = AffinityEngine.getState();
+        assert.strictEqual(state.safe.tags.space, 10);
+        assert.strictEqual(state.safe.authors.nasaofficial, 10);
+        assert.strictEqual(state.safe.platforms.archive, 10);
+        assert.strictEqual(state.safe.tags.glamour, undefined, '18+ tags must never leak into Safe profile');
+
+        assert.strictEqual(state.nsfw.tags.glamour, 5);
+        assert.strictEqual(state.nsfw.authors.studiocreator, 5);
+        assert.strictEqual(state.nsfw.platforms.redgifs, 5);
+        assert.strictEqual(state.nsfw.tags.rockets, undefined, 'Safe tags must never leak into 18+ profile');
+
+        // Verify localStorage persistence & reload
+        assert.ok(store.has(STORAGE_KEYS.AFFINITY_PROFILE));
+        setAppState({ resetAffinity: false });
+        const reloaded = loadAffinityState();
+        assert.strictEqual(reloaded.safe.tags.space, 10);
+        assert.strictEqual(reloaded.nsfw.tags.glamour, 5);
+
+        // Verify Safe item sharing only an 18+ tag gets 0 score from 18+ profile
+        const safeGlamourTest = {
+          id: 'safe-glamour',
+          title: 'Fashion Clip',
+          videoUrl: 'https://cdn.example/fashion.mp4',
+          tags: ['glamour'],
+          isNsfw: false
+        };
+        assert.strictEqual(getVideoAffinityScore(safeGlamourTest), 0);
+        assert.ok(getVideoAffinityScore(safeClip) > 20);
+      } finally {
+        settings.allowNsfw = origAllowNsfw;
+        resetAffinityState();
+      }
+    });
+
+    it('applies -3 penalty on <2s manual skip ONLY after playback started, never on buffering or auto-skips', () => {
+      createMockDom();
+      setupAffinityStorage();
+      const origPrebuffer = settings.prebuffer;
+      const origAllowNsfw = settings.allowNsfw;
+
+      try {
+        settings.prebuffer = false;
+        settings.allowNsfw = false;
+        resetAffinityState();
+
+        const clip0 = {
+          id: 'sk-0',
+          title: 'Unstarted Buffering Clip',
+          videoUrl: 'https://cdn.example/sk0.mp4',
+          tags: ['buffertag'],
+          author: 'bufferauthor',
+          platform: 'reddit',
+          isNsfw: false
+        };
+        const clip1 = {
+          id: 'sk-1',
+          title: 'Error Auto-Skipped Clip',
+          videoUrl: 'https://cdn.example/sk1.mp4',
+          tags: ['errortag'],
+          author: 'errorauthor',
+          platform: 'reddit',
+          isNsfw: false
+        };
+        const clip2 = {
+          id: 'sk-2',
+          title: 'Fast Skipped Played Clip',
+          videoUrl: 'https://cdn.example/sk2.mp4',
+          tags: ['boringtag'],
+          author: 'boringauthor',
+          platform: 'reddit',
+          isNsfw: false
+        };
+        const clip3 = {
+          id: 'sk-3',
+          title: 'Final Clip',
+          videoUrl: 'https://cdn.example/sk3.mp4',
+          tags: ['finaltag'],
+          isNsfw: false
+        };
+
+        setAppState({ videoQueue: [clip0, clip1, clip2, clip3], currentIndex: 0 });
+        updatePlayerUI();
+
+        // 1. User skips while clip0 never started playing (hasPlayed = false) -> 0 penalty
+        advanceToNextVideo({ userInitiated: true });
+        assert.strictEqual(AffinityEngine.getState().safe.tags.buffertag, undefined);
+
+        // 2. Non-user-initiated advance on clip1 even if hasPlayed = true -> 0 penalty
+        setAppState({ activeAffinityWatch: { hasPlayed: true, accumulatedPlaySec: 0.5, maxCurrentTimeSec: 0.5 } });
+        advanceToNextVideo();
+        assert.strictEqual(AffinityEngine.getState().safe.tags.errortag, undefined);
+
+        // 3. User-initiated skip on clip2 after 0.8s of actual playback -> -3 penalty
+        setAppState({ activeAffinityWatch: { hasPlayed: true, accumulatedPlaySec: 0.8, maxCurrentTimeSec: 0.8 } });
+        advanceToNextVideo({ userInitiated: true });
+        assert.strictEqual(AffinityEngine.getState().safe.tags.boringtag, -3);
+        assert.strictEqual(AffinityEngine.getState().safe.authors.boringauthor, -3);
+      } finally {
+        settings.prebuffer = origPrebuffer;
+        settings.allowNsfw = origAllowNsfw;
+        resetAffinityState();
+        setAppState({ videoQueue: [], currentIndex: -1 });
+      }
+    });
+
+    it('ranks incoming items by affinity with exploration slots and re-ranks queue tail without touching currentIndex + 1', () => {
+      createMockDom();
+      setupAffinityStorage();
+      const origPrebuffer = settings.prebuffer;
+      const origAllowNsfw = settings.allowNsfw;
+
+      try {
+        settings.prebuffer = false;
+        settings.allowNsfw = false;
+        resetAffinityState();
+
+        // Seed strong positive affinity for 'robotics' and strong negative penalty for 'spamtopic'
+        const likedSeed = {
+          id: 'seed-like',
+          title: 'Robotics Lab',
+          videoUrl: 'https://cdn.example/seed1.mp4',
+          tags: ['robotics'],
+          author: 'mitlab',
+          platform: 'archive',
+          isNsfw: false
+        };
+        recordAffinitySignal(likedSeed, 'complete');
+        recordAffinitySignal(likedSeed, 'vault');
+
+        const dislikedSeed = {
+          id: 'seed-dislike',
+          title: 'Spam Clip',
+          videoUrl: 'https://cdn.example/seed2.mp4',
+          tags: ['spamtopic'],
+          isNsfw: false
+        };
+        recordAffinitySignal(dislikedSeed, 'skip');
+        recordAffinitySignal(dislikedSeed, 'skip');
+        recordAffinitySignal(dislikedSeed, 'skip'); // -9 (< -6 exploration floor)
+
+        const candidates = [
+          { id: 'n1', title: 'Neutral 1', videoUrl: 'https://cdn.example/n1.mp4', tags: ['cooking'], isNsfw: false },
+          { id: 'bad1', title: 'Penalized', videoUrl: 'https://cdn.example/bad1.mp4', tags: ['spamtopic'], isNsfw: false },
+          { id: 'n2', title: 'Neutral 2', videoUrl: 'https://cdn.example/n2.mp4', tags: ['gardening'], isNsfw: false },
+          { id: 'top1', title: 'Top Match 1', videoUrl: 'https://cdn.example/t1.mp4', tags: ['robotics'], author: 'mitlab', isNsfw: false },
+          { id: 'top2', title: 'Top Match 2', videoUrl: 'https://cdn.example/t2.mp4', tags: ['robotics'], isNsfw: false }
+        ];
+
+        const ranked = rankVideosByAffinity(candidates, { jitter: 0, exploreRatio: 0.25, isNsfw: false });
+        assert.strictEqual(ranked[0].id, 'top1');
+        assert.strictEqual(ranked[1].id, 'top2');
+        assert.strictEqual(ranked[ranked.length - 1].id, 'bad1', 'Heavily penalized clip must stay at bottom');
+
+        // Verify reRankUpcomingQueueTail preserves videoQueue[0] and videoQueue[1] (#standbyVideo)
+        const active0 = { id: 'q0', title: 'Playing Now', videoUrl: 'https://cdn.example/q0.mp4', isNsfw: false };
+        const standby1 = { id: 'q1', title: 'Prebuffered Next', videoUrl: 'https://cdn.example/q1.mp4', isNsfw: false };
+        const tailLow = { id: 'q2', title: 'Low Tail', videoUrl: 'https://cdn.example/q2.mp4', tags: ['spamtopic'], isNsfw: false };
+        const tailHigh = { id: 'q3', title: 'High Tail', videoUrl: 'https://cdn.example/q3.mp4', tags: ['robotics'], author: 'mitlab', isNsfw: false };
+
+        setAppState({ videoQueue: [active0, standby1, tailLow, tailHigh], currentIndex: 0 });
+        assert.strictEqual(reRankUpcomingQueueTail(), true);
+
+        const reordered = getAppState().videoQueue;
+        assert.strictEqual(reordered[0].id, 'q0', 'Active video must stay at currentIndex');
+        assert.strictEqual(reordered[1].id, 'q1', 'Prebuffered currentIndex + 1 must remain untouched');
+        assert.strictEqual(reordered[2].id, 'q3', 'High-affinity tail item should move ahead of low-affinity tail');
+        assert.strictEqual(reordered[3].id, 'q2');
+      } finally {
+        settings.prebuffer = origPrebuffer;
+        settings.allowNsfw = origAllowNsfw;
+        resetAffinityState();
+        setAppState({ videoQueue: [], currentIndex: -1 });
+      }
+    });
+  });
+
+  describe('0ms App Boot: Service Worker SWR & Expired Session Auto-Refill', () => {
+    it('serves cached same-origin App Shell assets in 0ms while revalidating in background and ignores cross-origin APIs', async () => {
+      const swSource = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
+      const listeners = {};
+      const cacheEntries = new Map();
+      const cachedResponse = { ok: true, tag: 'cached-app-js', clone() { return this; } };
+      cacheEntries.set('https://reelvault.local/app.js', cachedResponse);
+
+      let resolveNetworkFetch;
+      const networkPromise = new Promise((r) => {
+        resolveNetworkFetch = r;
+      });
+      const fetchedUrls = [];
+
+      const mockCache = {
+        match: async (req, opts) => {
+          const url = typeof req === 'string' ? req : req.url;
+          if (cacheEntries.has(url)) return cacheEntries.get(url);
+          if (opts?.ignoreSearch) {
+            const base = url.split('?')[0];
+            return cacheEntries.get(base) || null;
+          }
+          return null;
+        },
+        put: async (req, res) => {
+          const url = typeof req === 'string' ? req : req.url;
+          cacheEntries.set(url, res);
+        }
+      };
+
+      const sandbox = {
+        URL,
+        Promise,
+        Response: { error: () => ({ ok: false }) },
+        caches: {
+          open: async () => mockCache,
+          keys: async () => ['reelvault-v30', 'reelvault-v31'],
+          delete: async () => true
+        },
+        fetch: (req) => {
+          const url = typeof req === 'string' ? req : req.url;
+          fetchedUrls.push(url);
+          return networkPromise;
+        },
+        self: {
+          location: { origin: 'https://reelvault.local' },
+          skipWaiting: () => {},
+          clients: { claim: () => {} },
+          addEventListener: (type, fn) => {
+            listeners[type] = fn;
+          }
+        }
+      };
+
+      vm.runInNewContext(swSource, sandbox);
+      assert.strictEqual(typeof listeners.fetch, 'function');
+
+      // 1. Cross-origin signed/18+ API request must NOT be intercepted or cached
+      let crossOriginResponded = false;
+      listeners.fetch({
+        request: { method: 'GET', url: 'https://api.redgifs.com/v2/gifs/search?search_text=test' },
+        respondWith: () => {
+          crossOriginResponded = true;
+        },
+        waitUntil: () => {}
+      });
+      assert.strictEqual(crossOriginResponded, false, 'Service Worker must never intercept cross-origin API JSON');
+
+      // 2. Same-origin App Shell asset resolves immediately from cache BEFORE network settles
+      let swResponsePromise = null;
+      const waitUntilPromises = [];
+      listeners.fetch({
+        request: { method: 'GET', url: 'https://reelvault.local/app.js?v=31' },
+        respondWith: (p) => {
+          swResponsePromise = p;
+        },
+        waitUntil: (p) => {
+          waitUntilPromises.push(p);
+        }
+      });
+
+      assert.ok(swResponsePromise, 'Same-origin GET should be handled by SW');
+      const immediateResult = await swResponsePromise;
+      assert.strictEqual(immediateResult.tag, 'cached-app-js', 'Cached shell must return in 0ms before network resolves');
+      assert.strictEqual(fetchedUrls.length, 1);
+
+      // Now finish background network fetch and verify cache updates cleanly
+      const updatedResponse = { ok: true, tag: 'fresh-app-js-v31', clone() { return this; } };
+      resolveNetworkFetch(updatedResponse);
+      await Promise.all(waitUntilPromises);
+      assert.strictEqual(cacheEntries.get('https://reelvault.local/app.js?v=31').tag, 'fresh-app-js-v31');
+    });
+
+    it('flags expired overnight sessions during restorePlaybackState and auto-pulls fresh feed on unlockAppGate', async () => {
+      createMockDom();
+      const origResume = settings.resumePlayback;
+      const origPrebuffer = settings.prebuffer;
+      const origAllowNsfw = settings.allowNsfw;
+      const origFetch = globalThis.fetch;
+
+      const store = new Map();
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+
+      let fetchTriggered = 0;
+      globalThis.fetch = async () => {
+        fetchTriggered++;
+        return {
+          ok: true,
+          json: async () => ({ data: { children: [] }, response: { docs: [] } }),
+          text: async () => ''
+        };
+      };
+
+      try {
+        settings.resumePlayback = true;
+        settings.prebuffer = true;
+        settings.allowNsfw = false;
+
+        setAppState({
+          sources: [{ id: 's-reddit', type: 'subreddit', value: 'space', label: 'r/space', enabled: true }],
+          videoQueue: [],
+          currentIndex: -1,
+          savedSessionExpiredOnRestore: false
+        });
+
+        // Simulate a saved session whose CDN token expired overnight (?expires=1700000000)
+        store.set(
+          STORAGE_KEYS.PLAYBACK_STATE,
+          JSON.stringify({
+            currentVideo: {
+              id: 'exp-1',
+              title: 'Expired CDN Stream',
+              videoUrl: 'https://cdn.example/clip.mp4?expires=1700000000',
+              format: 'mp4',
+              isNsfw: false
+            },
+            videoQueue: [
+              {
+                id: 'exp-1',
+                title: 'Expired CDN Stream',
+                videoUrl: 'https://cdn.example/clip.mp4?expires=1700000000',
+                format: 'mp4',
+                isNsfw: false
+              }
+            ],
+            currentIndex: 0,
+            currentTime: 4.2
+          })
+        );
+
+        const restored = restorePlaybackState();
+        assert.strictEqual(restored, false);
+        assert.strictEqual(
+          getAppState().savedSessionExpiredOnRestore,
+          true,
+          'Pruning all expired session items should mark savedSessionExpiredOnRestore = true'
+        );
+
+        unlockAppGate();
+        await new Promise((r) => setTimeout(r, 25));
+
+        assert.strictEqual(getAppState().savedSessionExpiredOnRestore, false);
+        assert.ok(fetchTriggered > 0, 'unlockAppGate should auto-pull fresh videos after overnight session expiry');
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.resumePlayback = origResume;
+        settings.prebuffer = origPrebuffer;
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({ videoQueue: [], currentIndex: -1, savedSessionExpiredOnRestore: false });
+      }
     });
   });
 });

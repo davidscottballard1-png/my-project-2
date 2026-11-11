@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reelvault-v30';
+const CACHE_NAME = 'reelvault-v31';
 const APP_SHELL = [
   './',
   './index.html',
@@ -46,21 +46,35 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  // Only handle same-origin app shell GET requests
+  // Strictly handle same-origin app shell GET requests only (never cache signed/18+ API JSON or media streams)
   if (event.request.method !== 'GET' || url.origin !== self.location.origin) {
     return;
   }
 
+  // Stale-While-Revalidate: serve cached App Shell in 0ms on boot while refreshing in background
   event.respondWith(
-    fetch(event.request, { cache: 'no-cache' })
-      .then((response) => {
-        if (response && response.ok) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-        }
-        return response;
-      })
-      .catch(() => caches.match(event.request, { ignoreSearch: true }))
+    caches.open(CACHE_NAME).then(async (cache) => {
+      const cached =
+        (await cache.match(event.request)) ||
+        (await cache.match(event.request, { ignoreSearch: true }));
+
+      const networkUpdate = fetch(event.request, { cache: 'no-cache' })
+        .then((response) => {
+          if (response && response.ok) {
+            cache.put(event.request, response.clone());
+          }
+          return response;
+        })
+        .catch(() => null);
+
+      if (cached) {
+        event.waitUntil(networkUpdate);
+        return cached;
+      }
+
+      const fresh = await networkUpdate;
+      return fresh || Response.error();
+    })
   );
 });
 

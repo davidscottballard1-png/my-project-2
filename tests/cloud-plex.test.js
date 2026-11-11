@@ -1670,6 +1670,45 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
         false,
         'Late 18+ Directory pull must never push adult video into Safe Mode queue after Boss Key'
       );
+
+      // 4. Dual-Layer Video Recycling: real Chromium DOM swaps Player A <-> Player B with zero extra <video> nodes
+      const dualLayerCheck = await evalJs(`(async () => {
+        settings.prebuffer = true;
+        settings.autoPlay = false;
+        videoQueue = [
+          { id: 'dl-0', title: 'Dual Clip 0', videoUrl: 'https://archive.org/download/dl0.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-1', title: 'Dual Clip 1', videoUrl: 'https://archive.org/download/dl1.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-2', title: 'Dual Clip 2', videoUrl: 'https://archive.org/download/dl2.mp4', format: 'mp4', isNsfw: false },
+          { id: 'dl-3', title: 'Dual Clip 3', videoUrl: 'https://archive.org/download/dl3.mp4', format: 'mp4', isNsfw: false }
+        ];
+        currentIndex = 0;
+        updatePlayerUI();
+        await scheduleBackgroundQueuePrebuffer();
+        const beforeActiveSlot = document.getElementById('mainVideo')?.dataset?.playerSlot;
+        const beforeStandbySlot = document.getElementById('standbyVideo')?.dataset?.playerSlot;
+        const beforeStandbyUrl = document.getElementById('standbyVideo')?.dataset?.prebufferedUrl;
+        advanceToNextVideo({ userInitiated: true });
+        await scheduleBackgroundQueuePrebuffer();
+        return {
+          totalStageVideos: document.querySelectorAll('#videoStage video').length,
+          beforeActiveSlot,
+          beforeStandbySlot,
+          beforeStandbyUrl,
+          afterActiveSlot: document.getElementById('mainVideo')?.dataset?.playerSlot,
+          afterStandbySlot: document.getElementById('standbyVideo')?.dataset?.playerSlot,
+          afterStandbyUrl: document.getElementById('standbyVideo')?.dataset?.prebufferedUrl
+        };
+      })()`);
+      assert.strictEqual(dualLayerCheck.totalStageVideos, 2, '#videoStage must always contain exactly 2 <video> elements');
+      assert.notStrictEqual(dualLayerCheck.beforeActiveSlot, dualLayerCheck.beforeStandbySlot);
+      assert.strictEqual(dualLayerCheck.beforeStandbyUrl, 'https://archive.org/download/dl1.mp4');
+      assert.strictEqual(
+        dualLayerCheck.afterActiveSlot,
+        dualLayerCheck.beforeStandbySlot,
+        'Advancing must promote standby slot to #mainVideo in real Chromium DOM'
+      );
+      assert.strictEqual(dualLayerCheck.afterStandbySlot, dualLayerCheck.beforeActiveSlot);
+      assert.strictEqual(dualLayerCheck.afterStandbyUrl, 'https://archive.org/download/dl2.mp4');
     } finally {
       try {
         ws?.close();

@@ -22,7 +22,7 @@
   <link rel="preconnect" href="https://gvideo.eporner.com" crossorigin />
   <link rel="dns-prefetch" href="https://www.reddit.com" />
   <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
-  <link rel="stylesheet" href="./styles.css?v=30" />
+  <link rel="stylesheet" href="./styles.css?v=31" />
 </head>
 <body class="app-locked">
   <!-- Full-Screen Passcode Gate Overlay -->
@@ -140,11 +140,25 @@
           <div class="video-stage" id="videoStage">
             <video
               id="mainVideo"
+              class="stage-video-layer active-video-layer"
+              data-player-slot="A"
               playsinline
               webkit-playsinline
               controls
               preload="auto"
               referrerpolicy="no-referrer"
+            ></video>
+            <video
+              id="standbyVideo"
+              class="stage-video-layer standby-video-layer"
+              data-player-slot="B"
+              playsinline
+              webkit-playsinline
+              muted
+              preload="auto"
+              referrerpolicy="no-referrer"
+              aria-hidden="true"
+              tabindex="-1"
             ></video>
 
             <!-- Double-Tap Vault Feedback -->
@@ -888,6 +902,6 @@
     </div>
   </div>
 
-  <script src="./app.js?v=30"></script>
+  <script src="./app.js?v=31"></script>
 </body>
 </html>
