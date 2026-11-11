@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v35';
+const APP_BUILD_VERSION = 'v36';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -553,8 +553,21 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
   if (platform === 'youporn' || host.includes('youporn.com') || host.endsWith('ypncdn.com')) {
     return 'https://www.youporn.com/';
   }
-  if (host.endsWith('tnmr.org') || host.includes('luluvid.com')) return 'https://luluvid.com/';
-  if (host.endsWith('cloudwindow-route.com') || host.includes('voe.sx')) return 'https://voe.sx/';
+  if (
+    /(?:^|\.)[\w-]*tnmr\.org$/i.test(host) ||
+    host.includes('luluvid.com') ||
+    host.includes('luluvdo.com') ||
+    host.includes('lulustream.com')
+  ) {
+    return host.includes('luluvdo.com') ? 'https://luluvdo.com/' : 'https://luluvid.com/';
+  }
+  if (
+    host.endsWith('cloudwindow-route.com') ||
+    host.includes('voe.sx') ||
+    host.includes('hentaisword.com')
+  ) {
+    return 'https://voe.sx/';
+  }
   if (platform === 'fulltaboo' || host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
   if (platform === 'pornone' || host.includes('pornone.com')) return 'https://pornone.com/';
   if (platform === 'vimeo' || host.includes('vimeo.com') || host.endsWith('vimeocdn.com')) {
@@ -594,6 +607,26 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
     } catch {}
   }
   return '';
+}
+
+function isIpBoundEmbedOrCdnUrl(rawUrl) {
+  const cleanUrl = unwrapProxyTargetUrl(rawUrl) || String(rawUrl || '').trim();
+  if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
+  const host = getHostnameSafe(cleanUrl);
+  if (!host) return false;
+  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com|cloudwindow-route\.com)$/i.test(
+    host
+  );
+}
+
+function isStrictProxyBoundHlsUrl(rawUrl) {
+  const cleanUrl = unwrapProxyTargetUrl(rawUrl) || String(rawUrl || '').trim();
+  if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
+  const host = getHostnameSafe(cleanUrl);
+  if (!host) return false;
+  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|cloudwindow-route\.com)$/i.test(
+    host
+  );
 }
 
 function isSecurePageOrigin() {
@@ -688,7 +721,11 @@ function buildHttpsMediaProxyCandidates(rawUrl, opts = {}) {
 
   // When Private Cloud Server is connected, route public media requests through /proxy + Referer FIRST
   if (isCloudBackendConfigured() && isPublicRemoteStreamUrl(cleanUrl)) {
-    candidates.push(buildCloudProxyUrl(cleanUrl, refererUrl));
+    const cloudProxyUrl = buildCloudProxyUrl(cleanUrl, refererUrl);
+    if (isIpBoundEmbedOrCdnUrl(cleanUrl)) {
+      return [cloudProxyUrl];
+    }
+    candidates.push(cloudProxyUrl);
   }
 
   if (isInsecureHttp && secureOrigin) {
@@ -4012,25 +4049,39 @@ function isInvalidCorsProxyPayload(payload, asText = false, targetUrl = '') {
 }
 
 // Fetch helper with Private Cloud Server priority + parallel CORS proxy race
-async function fetchWithCorsFallback(url, asText = false, refererOverride = '') {
+async function fetchWithCorsFallback(url, asText = false, refererOverride = '', opts = {}) {
   const cleanUrl = unwrapProxyTargetUrl(url) || url;
   const host = getHostnameSafe(cleanUrl);
   const isNativeOpenCorsHost =
     /(?:^|\.)(?:archive\.org|wikimedia\.org|nasa\.gov|sepiasearch\.org)$/i.test(host);
+  const mustStayOnCloudProxy =
+    isCloudBackendConfigured() &&
+    /^https?:\/\//i.test(cleanUrl) &&
+    (Boolean(opts?.ipBoundEmbed) || isIpBoundEmbedOrCdnUrl(cleanUrl));
 
   // 1. When Private Cloud Server is connected, route blocked/CORS-restricted hosts through it first
   if (isCloudBackendConfigured() && !isNativeOpenCorsHost && /^https?:\/\//i.test(cleanUrl)) {
-    try {
-      const cloudUrl = buildCloudProxyUrl(cleanUrl, refererOverride);
-      const cloudRes = await fetchWithTimeout(cloudUrl, 6000);
-      if (cloudRes.ok) {
-        const cloudPayload = asText ? await cloudRes.text() : await cloudRes.json();
-        if (!isInvalidCorsProxyPayload(cloudPayload, asText, cleanUrl)) {
-          return cloudPayload;
+    const cloudUrl = buildCloudProxyUrl(cleanUrl, refererOverride);
+    const maxAttempts = mustStayOnCloudProxy ? 2 : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const cloudRes = await fetchWithTimeout(cloudUrl, 12000);
+        if (cloudRes.ok) {
+          const cloudPayload = asText ? await cloudRes.text() : await cloudRes.json();
+          if (!isInvalidCorsProxyPayload(cloudPayload, asText, cleanUrl)) {
+            return cloudPayload;
+          }
+        } else if (cloudRes.status === 404 || cloudRes.status === 410) {
+          break;
         }
+      } catch {
+        // Retry once for IP-bound embed hosts or fall back below for non-IP-bound hosts
       }
-    } catch {
-      // Fall back to direct / public proxy pool below
+    }
+    // Never fall back to direct/third-party CORS proxies for IP/UA-bound embeds or CDNs:
+    // tokens minted on a foreign proxy IP/UA will always 403 when streamed via Cloud /proxy!
+    if (mustStayOnCloudProxy) {
+      throw new Error('Cloud proxy request failed for IP-bound host');
     }
   }
 
@@ -5675,9 +5726,10 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     }
   }
 
-  // 2. Relative video src/href/data-src/content/file attributes & JSON tube player keys (KVS, SpankBang, PornOne, Streamable)
+  // 2. Relative video src/href/data-src/file attributes & JSON tube player keys (KVS, SpankBang, PornOne, Streamable)
+  // Note: exclude bare `content=` so `<meta name="og:title" content="Filename.mp4">` never resolves to a fake 404 URL
   const relRegex = new RegExp(
-    `(?:src|href|data-src|data-video|content|video_url|video_alt_url|video_alt_url2|video_alt_url3|mp4_url|hls_url|stream_url|quality_1080p|quality_720p|quality_480p|quality_360p|quality_240p|contentUrl|file|__fileurl)\\s*[:=]\\s*["']([^"']+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"']*)?)["']`,
+    `(?:src|href|data-src|data-video|video_url|video_alt_url|video_alt_url2|video_alt_url3|mp4_url|hls_url|stream_url|quality_1080p|quality_720p|quality_480p|quality_360p|quality_240p|contentUrl|file|__fileurl)\\s*[:=]\\s*["']([^"'\\s]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"'\\s]*)?)["']`,
     'gi'
   );
   while ((m = relRegex.exec(decodedText)) !== null) {
@@ -5689,6 +5741,27 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     } catch {
       // ignore invalid relative URL
     }
+  }
+
+  // 2B. Explicit video <meta> tags (itemprop="contentUrl", property="og:video", twitter:player:stream) in any attribute order
+  const metaTagRegex = /<meta\b[^>]*>/gi;
+  const metaVideoAttrRegex =
+    /(?:itemprop\s*=\s*["']contentUrl["']|(?:property|name)\s*=\s*["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["'])/i;
+  const metaVideoContentRegex = new RegExp(
+    `content\\s*=\\s*["']((?:https?:\\/\\/|\\/)[^"'\\s]+\\.(?:${VIDEO_EXT_REGEX_PATTERN})(?:\\?[^"'\\s]*)?)["']`,
+    'i'
+  );
+  while ((m = metaTagRegex.exec(decodedText)) !== null) {
+    const tag = m[0];
+    if (!metaVideoAttrRegex.test(tag)) continue;
+    const cm = tag.match(metaVideoContentRegex);
+    if (!cm || !cm[1]) continue;
+    try {
+      const resolved = new URL(cm[1], baseUrl).href;
+      if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(resolved)) {
+        foundUrls.add(resolved);
+      }
+    } catch {}
   }
 
   // 3. Explicit HTML5 tube player setter calls (e.g. setVideoUrlHigh, setVideoUrlLow, setVideoHLS)
@@ -5972,7 +6045,12 @@ async function searchCloudVideos(keyword, limit = 6) {
 }
 
 // 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
-async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSubpageCrawl = true) {
+async function scanUrlForVideos(
+  targetUrl,
+  customLabel = 'Web Scanner',
+  allowSubpageCrawl = true,
+  refererOverride = ''
+) {
   const trimmed = targetUrl.trim();
   const markScannedNsfw = Boolean(settings.allowNsfw) || isKnownNsfwUrl(trimmed);
 
@@ -6042,7 +6120,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   let effectiveUrl = trimmed;
   let rawText = '';
   try {
-    rawText = await fetchWithCorsFallback(trimmed, true);
+    rawText = await fetchWithCorsFallback(trimmed, true, refererOverride);
   } catch {
     rawText = '';
   }
@@ -6061,7 +6139,12 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver)/i.test(redirectTarget)
     ) {
       try {
-        const redirHtml = await fetchWithCorsFallback(redirectTarget, true);
+        const redirHtml = await fetchWithCorsFallback(
+          redirectTarget,
+          true,
+          refererOverride || trimmed,
+          { ipBoundEmbed: true }
+        );
         if (typeof redirHtml === 'string' && redirHtml.length > 0) {
           effectiveUrl = redirectTarget;
           rawText = redirHtml;
@@ -6081,9 +6164,9 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
   }
 
   const voeStreams = decodeVoeEmbeddedStreams(rawText);
-  const collapseSingleEmbedStreams = voeStreams.length > 1 && extractedUrls.length > 1;
-  const urlsToMaterialize = collapseSingleEmbedStreams ? [extractedUrls[0]] : extractedUrls;
-  const secondaryEmbedUrl = collapseSingleEmbedStreams ? extractedUrls[1] || null : null;
+  const collapseSingleEmbedStreams = voeStreams.length >= 1;
+  const urlsToMaterialize = collapseSingleEmbedStreams ? [voeStreams[0]] : extractedUrls;
+  const secondaryEmbedUrl = collapseSingleEmbedStreams ? voeStreams[1] || null : null;
 
   const results = [];
   let idx = 0;
@@ -6147,7 +6230,7 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
 
     if (iframeLinks.length > 0) {
       const frameSettled = await Promise.allSettled(
-        iframeLinks.map((fUrl) => scanUrlForVideos(fUrl, customLabel, false))
+        iframeLinks.map((fUrl) => scanUrlForVideos(fUrl, customLabel, false, effectiveUrl))
       );
       for (let i = 0; i < frameSettled.length; i++) {
         const s = frameSettled[i];
@@ -6264,14 +6347,26 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
       }
     }
 
-    const watchLinks = shuffleArray(candidateLinks).slice(0, 6);
-    if (watchLinks.length > 0) {
+    const shuffledCandidates = shuffleArray(candidateLinks);
+    const firstBatch = shuffledCandidates.slice(0, 6);
+    if (firstBatch.length > 0) {
       const subSettled = await Promise.allSettled(
-        watchLinks.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
+        firstBatch.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
       );
       for (const s of subSettled) {
         if (s.status === 'fulfilled' && Array.isArray(s.value)) {
           results.push(...s.value.slice(0, 2));
+        }
+      }
+      if (results.length < 3 && shuffledCandidates.length > 6) {
+        const secondBatch = shuffledCandidates.slice(6, 12);
+        const secondSettled = await Promise.allSettled(
+          secondBatch.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
+        );
+        for (const s of secondSettled) {
+          if (s.status === 'fulfilled' && Array.isArray(s.value)) {
+            results.push(...s.value.slice(0, 2));
+          }
         }
       }
     }
@@ -7611,13 +7706,20 @@ async function scheduleBackgroundQueuePrebuffer() {
   const standbyEl = getStandbyVideoElement();
   if (standbyEl) {
     const nextExt = (nextItem.format || detectVideoFormat(nextItem.videoUrl).ext).toLowerCase();
+    const requiresManagedHls =
+      nextExt === 'm3u8' &&
+      (Boolean(nextItem._forceProxiedHls) ||
+        (isCloudBackendConfigured() &&
+          hasManagedHlsEngineSupport() &&
+          isStrictProxyBoundHlsUrl(nextUrl)));
     const canPreloadDirect =
-      nextExt !== 'm3u8' ||
-      typeof standbyEl.canPlayType !== 'function' ||
-      Boolean(
-        standbyEl.canPlayType('application/vnd.apple.mpegurl') ||
-          standbyEl.canPlayType('application/x-mpegURL')
-      );
+      !requiresManagedHls &&
+      (nextExt !== 'm3u8' ||
+        typeof standbyEl.canPlayType !== 'function' ||
+        Boolean(
+          standbyEl.canPlayType('application/vnd.apple.mpegurl') ||
+            standbyEl.canPlayType('application/x-mpegURL')
+        ));
 
     if (canPreloadDirect) {
       standbyEl.muted = true;
@@ -7858,6 +7960,31 @@ function detachActiveHlsPlayer(targetVideoEl = null) {
   }
 }
 
+function hasManagedHlsEngineSupport() {
+  const existingHls =
+    globalThis.Hls || (typeof window !== 'undefined' && window ? window.Hls : null);
+  if (existingHls && typeof existingHls.isSupported === 'function') {
+    return Boolean(existingHls.isSupported());
+  }
+  const hasMse =
+    typeof globalThis.ManagedMediaSource !== 'undefined' ||
+    typeof globalThis.MediaSource !== 'undefined' ||
+    typeof globalThis.WebKitMediaSource !== 'undefined' ||
+    (typeof window !== 'undefined' &&
+      Boolean(
+        window &&
+          (window.ManagedMediaSource || window.MediaSource || window.WebKitMediaSource)
+      ));
+  if (!hasMse) return false;
+  return Boolean(
+    existingHls ||
+      (typeof document !== 'undefined' &&
+        typeof document.createElement === 'function' &&
+        document.head &&
+        typeof document.head.appendChild === 'function')
+  );
+}
+
 async function loadHlsJsEngine() {
   if (globalThis.Hls) return globalThis.Hls;
   if (typeof window !== 'undefined' && window.Hls) return window.Hls;
@@ -7951,9 +8078,17 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
         for (const candidateUrl of candidates) {
           if (this.stats.aborted) return;
 
-          const isProxyCandidate = /corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(candidateUrl);
-          const isHttpsUpgradeProbe = isInsecureHttp && !isProxyCandidate && /^https:\/\//i.test(candidateUrl);
-          const timeoutMs = isHttpsUpgradeProbe ? 2000 : 8000;
+          const isThirdPartyCorsProxy =
+            /corsproxy\.io|codetabs\.com|cors\.lol|allorigins\.win/i.test(candidateUrl);
+          const isCloudProxyCandidate = Boolean(
+            cloudConfig.backendUrl && candidateUrl.startsWith(`${cloudConfig.backendUrl}/proxy`)
+          );
+          const isHttpsUpgradeProbe =
+            isInsecureHttp &&
+            !isThirdPartyCorsProxy &&
+            !isCloudProxyCandidate &&
+            /^https:\/\//i.test(candidateUrl);
+          const timeoutMs = isHttpsUpgradeProbe ? 2000 : isCloudProxyCandidate ? 14000 : 8000;
 
           const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
           this.controller = controller;
@@ -7964,7 +8099,7 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
             const fetchInit = {};
             if (controller) fetchInit.signal = controller.signal;
             // Avoid custom Range headers on third-party CORS proxies to prevent OPTIONS preflight rejections; slice buffer below instead
-            if (hasByteRange && !isProxyCandidate) {
+            if (hasByteRange && !isThirdPartyCorsProxy) {
               fetchInit.headers = {
                 Range: `bytes=${context.rangeStart}-${context.rangeEnd - 1}`
               };
@@ -7979,7 +8114,7 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
               if (isHttpsUpgradeProbe) {
                 const h = getHostnameSafe(cleanUrl);
                 if (h) httpOnlyHosts.add(h);
-              } else if (lastStatus === 410 || (!isProxyCandidate && lastStatus === 404)) {
+              } else if (lastStatus === 410 || (!isThirdPartyCorsProxy && lastStatus === 404)) {
                 break;
               }
               continue;
@@ -7990,7 +8125,13 @@ function createHttpsProxyHlsLoaderClass(loaderOpts = {}) {
             const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
 
             if (isBinary) {
-              if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain')) {
+              const isEncryptionKey =
+                context?.type === 'key' || /\.key(?:[?#]|$)/i.test(cleanUrl);
+              if (
+                ct.includes('text/html') ||
+                ct.includes('application/json') ||
+                (ct.includes('text/plain') && !isEncryptionKey)
+              ) {
                 if (isHttpsUpgradeProbe) {
                   const h = getHostnameSafe(cleanUrl);
                   if (h) httpOnlyHosts.add(h);
@@ -8158,7 +8299,11 @@ async function startProxiedHlsPlayback(videoEl, videoItem, m3u8Url, opts = {}) {
   }
 
   // Fallback for pre-iOS 17.1 devices without ManagedMediaSource: stitch .m3u8 segments over HTTPS proxy into a playable Blob
-  if (!videoItem.convertedBlobUrl && videoEl.dataset?.autoConvertAttempted !== 'true') {
+  if (
+    !opts?.skipStitchFallback &&
+    !videoItem.convertedBlobUrl &&
+    videoEl.dataset?.autoConvertAttempted !== 'true'
+  ) {
     if (videoEl.dataset) videoEl.dataset.autoConvertAttempted = 'true';
     const stitchedOk = await convertCurrentVideoForPlayer(videoItem);
     if (stitchedOk) {
@@ -8355,6 +8500,9 @@ function updatePlayerUI() {
       !current.convertedBlobUrl &&
       !(current.offlineBlob instanceof Blob) &&
       (Boolean(current._forceProxiedHls) ||
+        (isCloudBackendConfigured() &&
+          hasManagedHlsEngineSupport() &&
+          isStrictProxyBoundHlsUrl(targetPlayUrl)) ||
         (isSecurePageOrigin() && /^http:\/\//i.test(targetPlayUrl)) ||
         (typeof videoEl.canPlayType === 'function' &&
           !videoEl.canPlayType('application/vnd.apple.mpegurl') &&
@@ -8804,8 +8952,11 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
   };
 
   let rescueTimer = null;
+  const effectiveRescueTimeoutMs = isCloudBackendConfigured()
+    ? Math.max(STREAM_RESCUE_TIMEOUT_MS, 8000)
+    : STREAM_RESCUE_TIMEOUT_MS;
   const timeoutPromise = new Promise((resolve) => {
-    rescueTimer = setTimeout(() => resolve(null), STREAM_RESCUE_TIMEOUT_MS);
+    rescueTimer = setTimeout(() => resolve(null), effectiveRescueTimeoutMs);
     rescueTimer.unref?.();
   });
 
@@ -9017,17 +9168,23 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
             ...extracted.filter((u) => !/\.mp4(\?|$)/i.test(u))
           ];
           const primary = mp4First[0];
+          const primaryExt = detectVideoFormat(primary, 'mp4').ext;
           return {
             videoUrl: primary,
             convertedUrl: mp4First[1] || null,
             ...(target !== pageUrl ? { streamReferer: target } : {}),
-            format: detectVideoFormat(primary, 'mp4').ext
+            ...(primaryExt === 'm3u8' &&
+            (Boolean(videoItem._forceProxiedHls) || isStrictProxyBoundHlsUrl(primary))
+              ? { useProxiedHls: true }
+              : {}),
+            format: primaryExt
           };
         }
         if (/<iframe\b|window\.location/i.test(String(html || ''))) {
           const rescanned = await scanUrlForVideos(target, videoItem.sourceName || 'Web Scanner', false);
           const validItem = rescanned.find((it) => it && isUsableRescueUrl(it.videoUrl));
           if (validItem) {
+            const validExt = validItem.format || detectVideoFormat(validItem.videoUrl, 'mp4').ext;
             return {
               videoUrl: validItem.videoUrl,
               convertedUrl:
@@ -9035,7 +9192,11 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
                   ? validItem.convertedUrl
                   : null,
               ...(validItem.streamReferer ? { streamReferer: validItem.streamReferer } : {}),
-              format: validItem.format || detectVideoFormat(validItem.videoUrl, 'mp4').ext
+              ...(validExt === 'm3u8' &&
+              (Boolean(videoItem._forceProxiedHls) || isStrictProxyBoundHlsUrl(validItem.videoUrl))
+                ? { useProxiedHls: true }
+                : {}),
+              format: validExt
             };
           }
         }
@@ -9059,7 +9220,11 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
       // 7A. Multi-part HLS (.m3u8) on strictly HTTP-only or Referer-blocked hosts
       if (targetFmt.ext === 'm3u8') {
         try {
-          const manifestPreview = await fetchWithCorsFallback(hotlinkTarget, true);
+          const manifestPreview = await fetchWithCorsFallback(
+            hotlinkTarget,
+            true,
+            getVideoRefererUrl(videoItem, hotlinkTarget)
+          );
           if (typeof manifestPreview === 'string' && /#EXTM3U|#EXT-X-|#EXTINF/i.test(manifestPreview)) {
             return {
               useProxiedHls: true,
@@ -9237,9 +9402,36 @@ async function handleVideoPlaybackError(opts = {}) {
       }
     }
 
-    // 2. Try on-device auto-conversion ONLY when the format is non-native (e.g. .webm/.mkv/.avi) and didn't time out
     const ext = (current.format || detectVideoFormat(current.videoUrl).ext).toLowerCase();
     const fmtInfo = VIDEO_FORMAT_CATALOG[ext] || VIDEO_FORMAT_CATALOG.mp4;
+
+    // 1.5. If native <video> failed on an .m3u8 playlist (e.g. AppleCoreMedia UA rejected by IP/UA-bound CDN or un-rewritten child manifest),
+    // immediately fail over to client-side ManagedMediaSource hls.js + HttpsProxyHlsLoader before burning the token
+    if (
+      ext === 'm3u8' &&
+      opts?.reason !== 'hls-fatal' &&
+      !current._forceProxiedHls &&
+      !current._hlsProxyFailed &&
+      !current.convertedBlobUrl &&
+      hasManagedHlsEngineSupport()
+    ) {
+      current._forceProxiedHls = true;
+      const hlsFailoverStarted = await startProxiedHlsPlayback(videoEl, current, current.videoUrl, {
+        forceProxy: true,
+        skipStitchFallback: true,
+        refererUrl: getVideoRefererUrl(current, current.videoUrl)
+      });
+      if (!isStillActiveTarget()) {
+        return false;
+      }
+      if (hlsFailoverStarted) {
+        consecutiveErrorSkips = 0;
+        savePlaybackState();
+        return true;
+      }
+    }
+
+    // 2. Try on-device auto-conversion ONLY when the format is non-native (e.g. .webm/.mkv/.avi) and didn't time out
     if (
       settings.autoConvert &&
       !fmtInfo.iphoneNative &&
@@ -9262,7 +9454,7 @@ async function handleVideoPlaybackError(opts = {}) {
     if (current.videoUrl) recordDeadStreamUrl(current.videoUrl);
     if (current.convertedUrl) recordDeadStreamUrl(current.convertedUrl);
 
-    // 2.5. Live Stream Rescue (~3.5s cap): re-mint fresh signed URLs, attach HTTPS-proxied HLS, or stream/salvage via HTTPS proxy
+    // 2.5. Live Stream Rescue: re-mint fresh signed URLs, attach HTTPS-proxied HLS, or stream/salvage via HTTPS proxy
     if (!current._streamRescueAttempted && videoEl.dataset?.streamRescueAttempted !== 'true') {
       if (videoEl.dataset) videoEl.dataset.streamRescueAttempted = 'true';
       const rescued = await rescueDeadVideoStream(current, opts);
@@ -9276,13 +9468,30 @@ async function handleVideoPlaybackError(opts = {}) {
           return true;
         }
         if (rescued.useProxiedHls) {
+          const nextHlsTarget = rescued.videoUrl || current.videoUrl;
           if (current.videoUrl) deadUrls.delete(current.videoUrl);
+          if (nextHlsTarget) deadUrls.delete(nextHlsTarget);
+          current.videoUrl = nextHlsTarget;
+          if (rescued.convertedUrl !== undefined) {
+            current.convertedUrl = rescued.convertedUrl || null;
+          }
+          current.proxiedStreamUrl = null;
+          if (rescued.streamReferer) {
+            current.streamReferer = rescued.streamReferer;
+          }
+          if (rescued.format) {
+            current.format = rescued.format;
+          }
+          current._hlsProxyFailed = false;
           current._forceProxiedHls = true;
           const hlsStarted = await startProxiedHlsPlayback(
             videoEl,
             current,
-            rescued.videoUrl || current.videoUrl,
-            { forceProxy: true }
+            nextHlsTarget,
+            {
+              forceProxy: true,
+              refererUrl: getVideoRefererUrl(current, nextHlsTarget)
+            }
           );
           if (hlsStarted) {
             consecutiveErrorSkips = 0;
@@ -9352,9 +9561,11 @@ async function handleVideoPlaybackError(opts = {}) {
           const nextRescuedUrl = getEffectivePlaybackUrl(current);
           if (
             rescued.format === 'm3u8' &&
-            isSecurePageOrigin() &&
-            /^http:\/\//i.test(nextRescuedUrl)
+            (Boolean(current._forceProxiedHls) ||
+              isStrictProxyBoundHlsUrl(rescued.videoUrl) ||
+              (isSecurePageOrigin() && /^http:\/\//i.test(nextRescuedUrl)))
           ) {
+            current._hlsProxyFailed = false;
             current._forceProxiedHls = true;
             const hlsStarted = await startProxiedHlsPlayback(videoEl, current, rescued.videoUrl, {
               forceProxy: true,
@@ -9389,7 +9600,7 @@ async function handleVideoPlaybackError(opts = {}) {
       !current._triedDirectBypass &&
       opts?.reason !== 'decoy-bumper' &&
       /^https:\/\//i.test(current.videoUrl || '') &&
-      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|tnmr\.org|cloudwindow-route\.com|luluvid\.com|voe\.sx)/i.test(
+      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com)/i.test(
         current.videoUrl || ''
       )
     ) {
@@ -12138,6 +12349,7 @@ if (typeof module !== 'undefined' && module.exports) {
     extractEmbeddedPlayerMetaFromHtml,
     unwrapProxyTargetUrl,
     buildHttpsMediaProxyCandidates,
+    hasManagedHlsEngineSupport,
     createHttpsProxyHlsLoaderClass,
     startProxiedHlsPlayback,
     detachActiveHlsPlayer,
@@ -12171,6 +12383,8 @@ if (typeof module !== 'undefined' && module.exports) {
     isCloudBackendConfigured,
     buildCloudProxyUrl,
     getVideoRefererUrl,
+    isStrictProxyBoundHlsUrl,
+    isIpBoundEmbedOrCdnUrl,
     isLikelyAntiHotlinkDecoy,
     setCloudBackendConfig,
     clearCloudBackendConfig,

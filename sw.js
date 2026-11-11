@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reelvault-v35';
+const CACHE_NAME = 'reelvault-v36';
 const APP_SHELL = [
   './',
   './index.html',

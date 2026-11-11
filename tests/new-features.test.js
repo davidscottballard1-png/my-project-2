@@ -3764,6 +3764,131 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         });
       }
     });
+
+    it('ignores non-video og:title .mp4 metadata on VOE mirrors, pins IP-bound embeds/CDNs to Cloud /proxy, and accepts text/plain AES-128 .key binary payloads', async () => {
+      const {
+        isIpBoundEmbedOrCdnUrl,
+        isStrictProxyBoundHlsUrl,
+        fetchWithCorsFallback,
+        buildHttpsMediaProxyCandidates,
+        createHttpsProxyHlsLoaderClass,
+        setCloudBackendConfig,
+        clearCloudBackendConfig
+      } = require('../app.js');
+
+      // 1. VOE mirror hentaisword.com has <meta property="og:title" content="Scene_Name.mp4"> — must NOT produce fake 404 relative URL
+      const hentaiSwordHtml = `<html><head>
+        <meta property="og:title" content="Sydney_Harwin_Scene.mp4" />
+        <meta name="twitter:title" content="Sydney_Harwin_Scene.mp4" />
+        <meta property="og:video" content="/streams/valid_preview.mp4" />
+        <meta content="/streams/valid_alt.mp4" itemprop="contentUrl" />
+      </head><body></body></html>`;
+      const extractedMetaUrls = extractVideoUrlsFromHtml(
+        hentaiSwordHtml,
+        'https://hentaisword.com/e/abc123'
+      );
+      assert.ok(
+        !extractedMetaUrls.some((u) => u.includes('Sydney_Harwin_Scene.mp4')),
+        'og:title / twitter:title ending in .mp4 must never be resolved as a fake video URL'
+      );
+      assert.ok(
+        extractedMetaUrls.includes('https://hentaisword.com/streams/valid_preview.mp4') &&
+          extractedMetaUrls.includes('https://hentaisword.com/streams/valid_alt.mp4'),
+        'Explicit og:video and itemprop=contentUrl meta tags must still extract cleanly in any attribute order'
+      );
+
+      // 2. Host classifiers cover LuluVid, LuluVdo, hyphenated tnmr.org CDNs, VOE, HentaiSword, and cloudwindow-route.com
+      assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://luluvdo.com/e/tyerbox5btgh'), true);
+      assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://732394a.tnmr.org/hls2/01/master.m3u8?t=abc'), true);
+      assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://cdn-tnmr.org/hls2/01/master.m3u8?t=abc'), true);
+      assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://hentaisword.com/e/xyz987'), true);
+      assert.strictEqual(isStrictProxyBoundHlsUrl('https://732394a.tnmr.org/hls2/01/master.m3u8?t=abc'), true);
+      assert.strictEqual(
+        isStrictProxyBoundHlsUrl('https://edge1.cloudwindow-route.com/engine/hls2/master.m3u8'),
+        true
+      );
+      assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://archive.org/download/demo/clip.mp4'), false);
+
+      // 3. Pin IP-bound embed & CDN requests strictly to Cloud /proxy (never leak to public CORS proxies)
+      const origFetch = globalThis.fetch;
+      try {
+        setCloudBackendConfig('https://cloud.reelvault.example', 'rv-secret-key', true);
+
+        const mediaCands = buildHttpsMediaProxyCandidates(
+          'https://732394a.tnmr.org/hls2/01/seg-1.ts?t=tok',
+          { forceProxy: true, refererUrl: 'https://luluvdo.com/e/tyerbox5btgh' }
+        );
+        assert.strictEqual(mediaCands.length, 1);
+        assert.ok(
+          mediaCands[0].startsWith('https://cloud.reelvault.example/proxy?'),
+          'IP-bound CDN segments must only target Cloud /proxy when configured'
+        );
+
+        const calledUrls = [];
+        globalThis.fetch = async (reqUrl) => {
+          calledUrls.push(String(reqUrl));
+          return { ok: false, status: 502, text: async () => 'Bad Gateway' };
+        };
+
+        await assert.rejects(
+          () =>
+            fetchWithCorsFallback(
+              'https://luluvdo.com/e/tyerbox5btgh',
+              true,
+              'https://fulltaboo.tv/'
+            ),
+          /IP-bound host/i
+        );
+        assert.strictEqual(
+          calledUrls.length,
+          2,
+          'IP-bound embed fetch must retry Cloud /proxy once and stop without hitting third-party CORS proxies'
+        );
+        assert.ok(
+          calledUrls.every((u) => u.startsWith('https://cloud.reelvault.example/proxy?')),
+          'Every attempt for IP-bound embed must stay on Cloud /proxy'
+        );
+
+        // 4. HttpsProxyHlsLoader accepts raw 16-byte AES-128 .key payload served with Content-Type: text/plain
+        const rawKeyBytes = new Uint8Array(16);
+        for (let i = 0; i < 16; i++) rawKeyBytes[i] = i + 1;
+        globalThis.fetch = async () => ({
+          ok: true,
+          status: 200,
+          headers: { get: (h) => (String(h).toLowerCase() === 'content-type' ? 'text/plain' : '') },
+          arrayBuffer: async () => rawKeyBytes.buffer.slice(0)
+        });
+
+        const LoaderClass = createHttpsProxyHlsLoaderClass({
+          forceProxy: true,
+          refererUrl: 'https://luluvdo.com/e/tyerbox5btgh'
+        });
+        const loader = new LoaderClass({});
+        const loadedKey = await new Promise((resolve, reject) => {
+          loader.load(
+            {
+              url: 'https://732394a.tnmr.org/hls2/01/encryption.key',
+              type: 'key',
+              responseType: 'arraybuffer'
+            },
+            {},
+            {
+              onSuccess: (resp) => resolve(resp),
+              onError: (err) => reject(new Error(err?.text || 'key load failed'))
+            }
+          );
+        });
+        assert.strictEqual(
+          loadedKey.data.byteLength,
+          16,
+          'HttpsProxyHlsLoader must accept 16-byte AES-128 encryption.key even with text/plain Content-Type'
+        );
+      } finally {
+        clearCloudBackendConfig();
+        globalThis.fetch = origFetch;
+      }
+    });
   });
 });
+
 
