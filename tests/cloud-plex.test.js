@@ -1877,6 +1877,232 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       } catch {}
     }
   });
+
+  it('routes every public video & download through Cloud /proxy with spoofed Referer, rewrites .m3u8 HLS manifests, and detects 8s decoy bumpers (IMG_0158 Regression)', async () => {
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+    app.settings.allowNsfw = true;
+
+    // 1. Eporner end-to-end: /xhr/video/<id> receives embed Referer, and getEffectivePlaybackUrl wraps s14.eporner.com with watch-page Referer
+    const seenCloudCalls = [];
+    const hexHash = '0123456789abcdef0123456789abcdef';
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      seenCloudCalls.push(u);
+      if (u.startsWith('https://85-239-249-225.nip.io/proxy?')) {
+        const parsedProxy = new URL(u);
+        const target = parsedProxy.searchParams.get('url') || '';
+        const ref = parsedProxy.searchParams.get('referer') || '';
+        if (target.includes('eporner.com/api/v2/video/search/')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              videos: [
+                {
+                  id: 'Ep1147xyz',
+                  title: 'japanese amateur homemade.1147',
+                  length_sec: 745,
+                  hd: true,
+                  url: 'https://www.eporner.com/video-Ep1147xyz/japanese-amateur-homemade-1147/',
+                  embed: 'https://www.eporner.com/embed/Ep1147xyz/'
+                }
+              ]
+            })
+          };
+        }
+        if (target === 'https://www.eporner.com/embed/Ep1147xyz/') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              `<html><script>EP.video.player.vid = 'Ep1147xyz'; EP.video.player.hash = '${hexHash}';</script></html>`
+          };
+        }
+        if (target.includes('eporner.com/xhr/video/Ep1147xyz')) {
+          assert.strictEqual(
+            ref,
+            'https://www.eporner.com/embed/Ep1147xyz/',
+            'Eporner /xhr/video/ must spoof the embed iframe URL as Referer'
+          );
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              sources: {
+                mp4: {
+                  '720p HD': {
+                    src: 'https://s14.eporner.com/dload/Ep1147xyz/720/japanese-amateur-homemade-1147.mp4?sig=ipbound1'
+                  }
+                }
+              }
+            })
+          };
+        }
+      }
+      throw new Error(`Unexpected unproxied fetch: ${u}`);
+    };
+
+    const epItems = await app.fetchDirectEpornerVideos(
+      'amateur homemade hd',
+      3,
+      'Free Tube (amateur homemade hd)'
+    );
+    assert.strictEqual(epItems.length, 1);
+    const epClip = epItems[0];
+    // Canonical videoUrl must stay clean (no API key baked into saved Vault metadata)
+    assert.strictEqual(
+      epClip.videoUrl,
+      'https://s14.eporner.com/dload/Ep1147xyz/720/japanese-amateur-homemade-1147.mp4?sig=ipbound1'
+    );
+    const epPlayUrl = app.getEffectivePlaybackUrl(epClip);
+    assert.ok(
+      epPlayUrl.startsWith('https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url='),
+      'Eporner stream must play via Private Cloud /proxy'
+    );
+    const epPlayParsed = new URL(epPlayUrl);
+    assert.strictEqual(epPlayParsed.searchParams.get('url'), epClip.videoUrl);
+    assert.strictEqual(
+      epPlayParsed.searchParams.get('referer'),
+      'https://www.eporner.com/video-Ep1147xyz/japanese-amateur-homemade-1147/',
+      'Eporner playback must spoof the exact watch page Referer to prevent 8s decoy clip'
+    );
+
+    // 2. Universal Cloud /proxy + Referer across all public networks (Safe & 18+, MP4 & HLS .m3u8), while sparing local loopback
+    const redditHlsClip = {
+      id: 'rd-hls-1',
+      title: 'Reddit HLS Clip',
+      videoUrl: 'https://v.redd.it/abc999/HLSPlaylist.m3u8',
+      pageUrl: 'https://www.reddit.com/r/videos/comments/abc999/clip/',
+      format: 'm3u8',
+      platform: 'reddit'
+    };
+    const redditPlayUrl = app.getEffectivePlaybackUrl(redditHlsClip);
+    const redditParsed = new URL(redditPlayUrl);
+    assert.strictEqual(redditParsed.origin + redditParsed.pathname, 'https://85-239-249-225.nip.io/proxy');
+    assert.strictEqual(redditParsed.searchParams.get('url'), redditHlsClip.videoUrl);
+    assert.strictEqual(redditParsed.searchParams.get('referer'), redditHlsClip.pageUrl);
+    assert.strictEqual(redditParsed.searchParams.get('hls'), '1', '.m3u8 playback URL must set hls=1');
+
+    const localClip = {
+      id: 'local-1',
+      title: 'Local Dev Clip',
+      videoUrl: 'http://127.0.0.1:9999/test.mp4',
+      format: 'mp4'
+    };
+    assert.strictEqual(
+      app.getEffectivePlaybackUrl(localClip),
+      'http://127.0.0.1:9999/test.mp4',
+      'Loopback/LAN test URLs must not be routed to remote Cloud SSRF guard'
+    );
+
+    // Download/Vault candidate priority must put Cloud /proxy + Referer FIRST so Save to iPhone never downloads an 8s decoy
+    const dlCandidates = app.buildHttpsMediaProxyCandidates(epClip.videoUrl, {
+      refererUrl: app.getVideoRefererUrl(epClip, epClip.videoUrl)
+    });
+    assert.ok(
+      dlCandidates[0].startsWith('https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url='),
+      'Cloud /proxy must be candidate[0] for downloads when Cloud Server is connected'
+    );
+    assert.ok(
+      dlCandidates[0].includes('referer=https%3A%2F%2Fwww.eporner.com%2Fvideo-Ep1147xyz'),
+      'Download candidate[0] must include spoofed Referer'
+    );
+
+    // 3. Server-side .m3u8 manifest rewriting & CDN Referer spoofing in server/bridge.js
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://s14.eporner.com/dload/a.mp4')),
+      'https://www.eporner.com/'
+    );
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://cdn77.sb-cd.com/hls/master.m3u8')),
+      'https://spankbang.com/'
+    );
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://video.xhcdn.com/clip.mp4')),
+      'https://xhamster.com/'
+    );
+    assert.strictEqual(
+      bridge.isBinaryMediaRequest(new URL('https://v.redd.it/abc999/HLSPlaylist.m3u8'), { headers: {} }),
+      false,
+      '.m3u8 manifests on VIDEO_CDN_HOST_REGEX must route through text/HLS rewriter instead of binary pipe'
+    );
+
+    const masterSample = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:6',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,URI="HLS_AUDIO_128.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,AUDIO="audio"',
+      '720p/playlist_variant?token=xyz1'
+    ].join('\n');
+    const rewrittenMaster = bridge.rewriteM3u8ManifestForProxy(
+      masterSample,
+      'https://v.redd.it/abc999/HLSPlaylist.m3u8',
+      'https://85-239-249-225.nip.io',
+      'rv_secret_abc',
+      'https://www.reddit.com/r/videos/comments/abc999/'
+    );
+    assert.ok(
+      rewrittenMaster.includes(
+        'URI="https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url=https%3A%2F%2Fv.redd.it%2Fabc999%2FHLS_AUDIO_128.m3u8&referer=https%3A%2F%2Fwww.reddit.com%2Fr%2Fvideos%2Fcomments%2Fabc999%2F&hls=1"'
+      ),
+      '#EXT-X-MEDIA audio playlist URI must be rewritten with Referer and &hls=1'
+    );
+    assert.ok(
+      rewrittenMaster.includes(
+        'https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url=https%3A%2F%2Fv.redd.it%2Fabc999%2F720p%2Fplaylist_variant%3Ftoken%3Dxyz1&referer=https%3A%2F%2Fwww.reddit.com%2Fr%2Fvideos%2Fcomments%2Fabc999%2F&hls=1'
+      ),
+      'Extensionless #EXT-X-STREAM-INF variant URI must be rewritten with Referer and &hls=1'
+    );
+
+    const mediaSample = [
+      '#EXTM3U',
+      '#EXT-X-TARGETDURATION:4',
+      '#EXT-X-MAP:URI="init_header.mp4"',
+      '#EXTINF:4.000,',
+      'seg_001.m4s?sig=1',
+      '#EXTINF:4.000,',
+      'seg_002.m4s?sig=2',
+      '#EXT-X-ENDLIST'
+    ].join('\n');
+    const rewrittenMedia = bridge.rewriteM3u8ManifestForProxy(
+      mediaSample,
+      'https://s8.eporner.com/hls/Ep1147xyz/720p/index.m3u8',
+      'https://85-239-249-225.nip.io',
+      'rv_secret_abc',
+      'https://www.eporner.com/video-Ep1147xyz/'
+    );
+    assert.ok(
+      rewrittenMedia.includes(
+        'URI="https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url=https%3A%2F%2Fs8.eporner.com%2Fhls%2FEp1147xyz%2F720p%2Finit_header.mp4&referer=https%3A%2F%2Fwww.eporner.com%2Fvideo-Ep1147xyz%2F"'
+      ),
+      '#EXT-X-MAP fMP4 init segment must be rewritten through /proxy without &hls=1'
+    );
+    assert.ok(
+      rewrittenMedia.includes(
+        'https://85-239-249-225.nip.io/proxy?key=rv_secret_abc&url=https%3A%2F%2Fs8.eporner.com%2Fhls%2FEp1147xyz%2F720p%2Fseg_001.m4s%3Fsig%3D1&referer=https%3A%2F%2Fwww.eporner.com%2Fvideo-Ep1147xyz%2F'
+      ),
+      'Media segments must be rewritten to absolute /proxy URLs with spoofed Referer'
+    );
+    assert.ok(!rewrittenMedia.includes('seg_001.m4s%3Fsig%3D1&referer=https%3A%2F%2Fwww.eporner.com%2Fvideo-Ep1147xyz%2F&hls=1'));
+
+    // 4. Anti-hotlink 8s decoy detector
+    assert.strictEqual(
+      app.isLikelyAntiHotlinkDecoy(epClip, 8.04),
+      true,
+      '8-second bumper loaded for a 745-second video must be flagged as an anti-hotlink decoy'
+    );
+    assert.strictEqual(
+      app.isLikelyAntiHotlinkDecoy({ id: 'short-rg', duration: 14, videoUrl: 'https://thumbs4.redgifs.com/a.mp4' }, 8.2),
+      false,
+      'Legitimate short clips must never be false-positived as decoys'
+    );
+    assert.strictEqual(
+      app.isLikelyAntiHotlinkDecoy(epClip, 744.8),
+      false,
+      'Full-length playback must never be flagged as a decoy'
+    );
+  });
 });
+
 
 

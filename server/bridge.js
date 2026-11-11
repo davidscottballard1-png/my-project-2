@@ -43,7 +43,7 @@ const BINARY_MEDIA_EXT_REGEX =
   /\.(?:mp4|m4v|mov|webm|ogv|ogg|mkv|avi|mpeg|mpg|3gp|3g2|flv|f4v|wmv|ts|m2ts|m4s|aac|mp3|m4a)(?:[?#]|$)/i;
 
 const VIDEO_CDN_HOST_REGEX =
-  /(?:^|\.)(?:v\.redd\.it|redd\.it|media\.redgifs\.com|thumbs\d*\.redgifs\.com|gvideo\.eporner\.com|googlevideo\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeocdn\.com|dmcdn\.net|xhcdn\.com|xv-cdn\.com|sb-cd\.com|phncdn\.com|ypncdn\.com|commondatastorage\.googleapis\.com|upload\.wikimedia\.org)$/i;
+  /(?:^|\.)(?:v\.redd\.it|redd\.it|media\.redgifs\.com|thumbs\d*\.redgifs\.com|(?:gvideo|s\d+|v\d+|vid[\w-]*)\.eporner\.com|googlevideo\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeocdn\.com|dmcdn\.net|xhcdn\.com|xv-cdn\.com|sb-cd\.com|phncdn\.com|ypncdn\.com|commondatastorage\.googleapis\.com|upload\.wikimedia\.org)$/i;
 
 const PROXY_FIRST_METADATA_HOST_REGEX = /(?:^|\.)(?:reddit\.com|redd\.it)$/i;
 
@@ -213,6 +213,22 @@ function buildUpstreamReferer(parsedUrl, rawRefererOverride = '') {
   if (host.includes('redgifs.com')) return 'https://www.redgifs.com/';
   if (host.includes('eporner.com')) return 'https://www.eporner.com/';
   if (host.includes('redd.it') || host.includes('reddit.com')) return 'https://www.reddit.com/';
+  if (host.includes('spankbang.com') || host.endsWith('sb-cd.com')) return 'https://spankbang.com/';
+  if (host.includes('xhamster') || host.endsWith('xhcdn.com')) return 'https://xhamster.com/';
+  if (host.includes('xvideos') || host.endsWith('xv-cdn.com')) return 'https://www.xvideos.com/';
+  if (host.includes('pornhub.com') || host.endsWith('phncdn.com')) return 'https://www.pornhub.com/';
+  if (host.includes('youporn.com') || host.endsWith('ypncdn.com')) return 'https://www.youporn.com/';
+  if (host.includes('vimeo.com') || host.endsWith('vimeocdn.com')) return 'https://vimeo.com/';
+  if (host.includes('dailymotion.com') || host.endsWith('dmcdn.net')) return 'https://www.dailymotion.com/';
+  if (host.includes('tiktok.com') || host.includes('tiktokcdn') || host.endsWith('byteoversea.com')) {
+    return 'https://www.tiktok.com/';
+  }
+  if (host.includes('youtube.com') || host.endsWith('youtu.be') || host.endsWith('googlevideo.com')) {
+    return 'https://www.youtube.com/';
+  }
+  if (host.includes('bilibili.com') || host.endsWith('bilivideo.com')) return 'https://www.bilibili.com/';
+  if (host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
+  if (host.includes('pornone.com')) return 'https://pornone.com/';
   return `${parsedUrl.protocol}//${parsedUrl.host}/`;
 }
 
@@ -228,6 +244,9 @@ function extractSafeUpstreamAuth(req, parsedTarget) {
 }
 
 function isBinaryMediaRequest(parsedUrl, req) {
+  if (!req?.headers?.range && /\.m3u8$/i.test(parsedUrl.pathname)) {
+    return false;
+  }
   if (req?.headers?.range) return true;
   if (BINARY_MEDIA_EXT_REGEX.test(parsedUrl.pathname)) return true;
   if (VIDEO_CDN_HOST_REGEX.test(parsedUrl.hostname) && !/\.json$/i.test(parsedUrl.pathname)) {
@@ -358,9 +377,142 @@ async function fetchSafeWithRedirects(initialUrl, fetchOpts = {}, maxRedirects =
       currentUrl = new URL(loc, parsed.href).href;
       continue;
     }
+    try {
+      Object.defineProperty(res, '_finalUrl', { value: parsed.href, configurable: true });
+    } catch {}
     return res;
   }
   throw new Error('Too many upstream redirects');
+}
+
+function getPublicProxyOrigin(req) {
+  const fwdProto = String(req?.headers?.['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  const proto = fwdProto === 'https' || fwdProto === 'http' ? fwdProto : 'http';
+  const rawHost = String(
+    req?.headers?.['x-forwarded-host'] || req?.headers?.host || `127.0.0.1:${PORT}`
+  )
+    .split(',')[0]
+    .trim();
+  const safeHost = rawHost.replace(/[^a-zA-Z0-9.:[\]-]/g, '') || `127.0.0.1:${PORT}`;
+  return `${proto}://${safeHost}`;
+}
+
+function rewriteM3u8ManifestForProxy(
+  manifestText,
+  baseManifestUrl,
+  proxyEndpointBase,
+  apiKey,
+  refererUrl = ''
+) {
+  if (typeof manifestText !== 'string' || !manifestText.trim()) return manifestText;
+  const cleanOrigin = String(proxyEndpointBase || '').replace(/\/+$/, '');
+  const cleanReferer = String(refererUrl || '').trim();
+
+  const wrapResolvedUri = (rawUri, hintIsPlaylist = false) => {
+    const trimmed = String(rawUri || '').trim();
+    if (!trimmed || /^(?:data|blob|skd):/i.test(trimmed)) return rawUri;
+    let absUrl;
+    try {
+      absUrl = new URL(trimmed, baseManifestUrl).href;
+    } catch {
+      return rawUri;
+    }
+    if (!/^https?:\/\//i.test(absUrl)) return rawUri;
+    // Prevent accidental double-wrapping if already pointing at this /proxy
+    if (cleanOrigin && absUrl.startsWith(`${cleanOrigin}/proxy?`)) {
+      return absUrl;
+    }
+    const isChildPlaylist =
+      Boolean(hintIsPlaylist) || /\.m3u8(?:[?#]|$)/i.test(absUrl);
+    let built = `${cleanOrigin}/proxy?`;
+    if (apiKey) {
+      built += `key=${encodeURIComponent(apiKey)}&`;
+    }
+    built += `url=${encodeURIComponent(absUrl)}`;
+    if (cleanReferer && /^https?:\/\//i.test(cleanReferer)) {
+      built += `&referer=${encodeURIComponent(cleanReferer)}`;
+    }
+    if (isChildPlaylist) {
+      built += '&hls=1';
+    }
+    return built;
+  };
+
+  const lines = manifestText.split(/\r?\n/);
+  let prevTagWasStreamInf = false;
+
+  const rewritten = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+
+    if (trimmed.startsWith('#')) {
+      const isStreamInf = /^#EXT-X-STREAM-INF\b/i.test(trimmed);
+      const isPlaylistTag = /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed);
+      prevTagWasStreamInf = isStreamInf;
+
+      if (/\bURI=(["'])([^"']+)\1/i.test(line)) {
+        return line.replace(/\bURI=(["'])([^"']+)\1/gi, (_match, quote, innerUri) => {
+          const wrapped = wrapResolvedUri(innerUri, isPlaylistTag);
+          return `URI=${quote}${wrapped}${quote}`;
+        });
+      }
+      return line;
+    }
+
+    const asPlaylist = prevTagWasStreamInf;
+    prevTagWasStreamInf = false;
+    return wrapResolvedUri(trimmed, asPlaylist);
+  });
+
+  return rewritten.join('\n');
+}
+
+function maybeSendTextOrRewrittenHls(
+  req,
+  res,
+  statusCode,
+  contentType,
+  bodyBuf,
+  cacheControl,
+  hlsCtx
+) {
+  if (
+    hlsCtx?.enabled &&
+    statusCode >= 200 &&
+    statusCode < 300 &&
+    bodyBuf &&
+    bodyBuf.length > 0
+  ) {
+    const text = bodyBuf.toString('utf8');
+    if (/^\s*#EXTM3U\b/i.test(text)) {
+      const rewrittenText = rewriteM3u8ManifestForProxy(
+        text,
+        hlsCtx.baseManifestUrl,
+        hlsCtx.proxyOrigin,
+        hlsCtx.apiKey,
+        hlsCtx.referer
+      );
+      const outBuf = Buffer.from(rewrittenText, 'utf8');
+      setCorsHeaders(res);
+      res.writeHead(statusCode, {
+        'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Content-Length': outBuf.length
+      });
+      return res.end(outBuf);
+    }
+  }
+
+  setCorsHeaders(res);
+  res.writeHead(statusCode, {
+    'Content-Type': contentType,
+    'Cache-Control': cacheControl,
+    'Content-Length': bodyBuf.length
+  });
+  return res.end(bodyBuf);
 }
 
 async function handleProxyRequest(req, res, parsedReqUrl) {
@@ -377,7 +529,17 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
     parsedReqUrl.searchParams.get('referer') || ''
   );
   const upstreamAuth = extractSafeUpstreamAuth(req, parsedTarget);
-  const isMedia = isBinaryMediaRequest(parsedTarget, req);
+  const wantsHlsRewrite = parsedReqUrl.searchParams.get('hls') === '1';
+  const isMedia = wantsHlsRewrite ? false : isBinaryMediaRequest(parsedTarget, req);
+  const hlsCtx = wantsHlsRewrite
+    ? {
+        enabled: true,
+        baseManifestUrl: parsedTarget.href,
+        proxyOrigin: getPublicProxyOrigin(req),
+        apiKey: extractProvidedApiKey(req, parsedReqUrl),
+        referer
+      }
+    : null;
 
   // 1. Metadata / JSON / HTML / M3U8 path (uses Webshare Residential Proxy selectively without wasting GBs on video bytes)
   if (!isMedia && req.method === 'GET') {
@@ -387,13 +549,15 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       try {
         const proxied = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
         if (proxied.status >= 200 && proxied.status < 400 && proxied.body.length > 0) {
-          setCorsHeaders(res);
-          res.writeHead(proxied.status, {
-            'Content-Type': proxied.contentType,
-            'Cache-Control': 'public, max-age=45',
-            'Content-Length': proxied.body.length
-          });
-          return res.end(proxied.body);
+          return maybeSendTextOrRewrittenHls(
+            req,
+            res,
+            proxied.status,
+            proxied.contentType,
+            proxied.body,
+            'public, max-age=45',
+            hlsCtx
+          );
         }
       } catch {
         // Fall through to direct attempt
@@ -429,7 +593,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       clearTimeout(timer);
 
       const ct = upstream.headers.get('content-type') || 'text/plain; charset=utf-8';
-      if (/^(?:video|audio)\//i.test(ct)) {
+      if (/^(?:video|audio)\//i.test(ct) && !wantsHlsRewrite) {
         res.off('close', abortOnPrematureClose);
         return pipeUpstreamStream(req, res, upstream, controller);
       }
@@ -437,6 +601,9 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       const buf = Buffer.from(await upstream.arrayBuffer());
       res.off('close', abortOnPrematureClose);
       const sampleText = buf.subarray(0, 2400).toString('utf8');
+      if (hlsCtx && upstream._finalUrl) {
+        hlsCtx.baseManifestUrl = upstream._finalUrl;
+      }
 
       if (
         RESIDENTIAL_PROXY_URL &&
@@ -446,26 +613,30 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
         try {
           const rescued = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
           if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
-            setCorsHeaders(res);
-            res.writeHead(rescued.status, {
-              'Content-Type': rescued.contentType,
-              'Cache-Control': 'public, max-age=45',
-              'Content-Length': rescued.body.length
-            });
-            return res.end(rescued.body);
+            return maybeSendTextOrRewrittenHls(
+              req,
+              res,
+              rescued.status,
+              rescued.contentType,
+              rescued.body,
+              'public, max-age=45',
+              hlsCtx
+            );
           }
         } catch {
           // Return original response below
         }
       }
 
-      setCorsHeaders(res);
-      res.writeHead(upstream.status, {
-        'Content-Type': ct,
-        'Cache-Control': upstream.ok ? 'public, max-age=45' : 'no-store',
-        'Content-Length': buf.length
-      });
-      return res.end(buf);
+      return maybeSendTextOrRewrittenHls(
+        req,
+        res,
+        upstream.status,
+        ct,
+        buf,
+        upstream.ok ? 'public, max-age=45' : 'no-store',
+        hlsCtx
+      );
     } catch (err) {
       clearTimeout(timer);
       res.off('close', abortOnPrematureClose);
@@ -475,13 +646,15 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       if (RESIDENTIAL_PROXY_URL && !preferProxy && !res.destroyed) {
         try {
           const rescued = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
-          setCorsHeaders(res);
-          res.writeHead(rescued.status, {
-            'Content-Type': rescued.contentType,
-            'Cache-Control': 'no-store',
-            'Content-Length': rescued.body.length
-          });
-          return res.end(rescued.body);
+          return maybeSendTextOrRewrittenHls(
+            req,
+            res,
+            rescued.status,
+            rescued.contentType,
+            rescued.body,
+            'no-store',
+            hlsCtx
+          );
         } catch {}
       }
       if (!res.headersSent && !res.destroyed) {
@@ -594,7 +767,7 @@ function getHostnameClean(rawUrl) {
 
 function isIpBoundStreamUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
-  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
+  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|eporner\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
     rawUrl
   );
 }
@@ -2046,6 +2219,8 @@ module.exports = {
   extractProvidedApiKey,
   extractSafeUpstreamAuth,
   buildUpstreamReferer,
+  getPublicProxyOrigin,
+  rewriteM3u8ManifestForProxy,
   isBlockedTextPayload,
   isBinaryMediaRequest,
   shouldPreferResidentialProxyFirst,
