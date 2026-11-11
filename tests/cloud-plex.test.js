@@ -1354,5 +1354,335 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       globalThis.window = origWindow;
     }
   });
+
+  it('enforces #urlScanForm Safe Mode PIN guard, discards stale #deepSearchForm mode-switch races, and blocks #adultDirectoryList pulls after #panicSafeBtn in Headless Chrome', async (t) => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { execFileSync, spawn } = require('node:child_process');
+
+    let browserBin = [
+      process.env.CHROME_BIN,
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/google-chrome',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser'
+    ]
+      .filter(Boolean)
+      .find((b) => fs.existsSync(b));
+
+    if (!browserBin) {
+      for (const cmd of ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser']) {
+        try {
+          const found = execFileSync('which', [cmd], { encoding: 'utf8' }).trim();
+          if (found) {
+            browserBin = found;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (!browserBin) {
+      t.skip('No Chrome/Chromium binary available');
+      return;
+    }
+
+    const repoDir = path.resolve(__dirname, '..');
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-dom-races-'));
+    const mimeMap = {
+      '.html': 'text/html; charset=utf-8',
+      '.css': 'text/css; charset=utf-8',
+      '.js': 'application/javascript; charset=utf-8',
+      '.json': 'application/json; charset=utf-8',
+      '.svg': 'image/svg+xml',
+      '.png': 'image/png'
+    };
+
+    const appServer = http.createServer((req, res) => {
+      const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+      const relPath = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
+      const filePath = path.resolve(repoDir, relPath);
+      if (!filePath.startsWith(repoDir + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': mimeMap[path.extname(filePath)] || 'application/octet-stream',
+        'Cache-Control': 'no-store'
+      });
+      res.end(fs.readFileSync(filePath));
+    });
+    await new Promise((resolve) => appServer.listen(0, '127.0.0.1', resolve));
+    const port = appServer.address().port;
+
+    const chrome = spawn(
+      browserBin,
+      [
+        '--headless=new',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--no-first-run',
+        '--remote-debugging-port=0',
+        `--user-data-dir=${tempRoot}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' } }
+    );
+
+    let ws = null;
+    try {
+      const wsUrl = await new Promise((resolve, reject) => {
+        let stderr = '';
+        const timer = setTimeout(() => reject(new Error(`Chrome startup timeout: ${stderr}`)), 15000);
+        chrome.stderr.on('data', (chunk) => {
+          stderr += chunk.toString();
+          const m = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+          if (m) {
+            clearTimeout(timer);
+            resolve(m[1]);
+          }
+        });
+      });
+
+      const targets = await (await fetch(`http://127.0.0.1:${new URL(wsUrl).port}/json/list`)).json();
+      ws = new WebSocket(targets.find((tgt) => tgt.type === 'page').webSocketDebuggerUrl);
+      await new Promise((resolve, reject) => {
+        ws.addEventListener('open', resolve, { once: true });
+        ws.addEventListener('error', reject, { once: true });
+      });
+
+      let idSeq = 0;
+      const pending = new Map();
+      const listeners = new Map();
+      ws.addEventListener('message', (ev) => {
+        const msg = JSON.parse(String(ev.data));
+        if (msg.id && pending.has(msg.id)) {
+          const p = pending.get(msg.id);
+          pending.delete(msg.id);
+          if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
+          else p.resolve(msg.result);
+        } else if (msg.method && listeners.has(msg.method)) {
+          for (const fn of listeners.get(msg.method)) Promise.resolve(fn(msg.params)).catch(() => {});
+        }
+      });
+
+      const send = (method, params = {}) =>
+        new Promise((resolve, reject) => {
+          const id = ++idSeq;
+          pending.set(id, { resolve, reject });
+          ws.send(JSON.stringify({ id, method, params }));
+        });
+      const evalJs = async (expression) => {
+        const res = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+        if (res.exceptionDetails) {
+          throw new Error(`Browser eval failed: ${JSON.stringify(res.exceptionDetails)}`);
+        }
+        return res.result?.value;
+      };
+
+      let holdRedgifsLookup = null;
+      let holdSafeSearch = null;
+
+      await send('Runtime.enable');
+      await send('Page.enable');
+      await send('Fetch.enable', { patterns: [{ urlPattern: 'https://*', requestStage: 'Request' }] });
+
+      const cors = [
+        { name: 'Access-Control-Allow-Origin', value: '*' },
+        { name: 'Access-Control-Allow-Methods', value: 'GET, POST, HEAD, OPTIONS' },
+        { name: 'Access-Control-Allow-Headers', value: 'Authorization, Content-Type, Range' }
+      ];
+
+      listeners.set('Fetch.requestPaused', [
+        async ({ requestId, request }) => {
+          if (request.method === 'OPTIONS') {
+            return send('Fetch.fulfillRequest', { requestId, responseCode: 204, responseHeaders: cors, body: '' }).catch(
+              () => {}
+            );
+          }
+          const u = request.url;
+          const fulfillJson = (obj) =>
+            send('Fetch.fulfillRequest', {
+              requestId,
+              responseCode: 200,
+              responseHeaders: [{ name: 'Content-Type', value: 'application/json' }, ...cors],
+              body: Buffer.from(JSON.stringify(obj)).toString('base64')
+            }).catch(() => {});
+
+          if (/api\.redgifs\.com\/v2\/auth\/temporary/i.test(u)) {
+            return fulfillJson({ token: 'rg_test_token' });
+          }
+          if (/api\.redgifs\.com\/v2\/gifs\//i.test(u)) {
+            if (holdRedgifsLookup) await holdRedgifsLookup;
+            return fulfillJson({
+              gif: {
+                id: 'subrg1',
+                duration: 15,
+                tags: ['Explicit', 'Adult'],
+                urls: { hd: 'https://media.redgifs.com/ExplicitSubRg1.mp4' }
+              }
+            });
+          }
+          if (/reddit\.com\/r\//i.test(u)) {
+            return fulfillJson({
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: 'post1',
+                      title: 'Explicit 18+ Subreddit Clip',
+                      over_18: true,
+                      subreddit: 'RealGirls',
+                      permalink: '/r/RealGirls/comments/post1/clip/',
+                      url_overridden_by_dest: 'https://www.redgifs.com/watch/subrg1'
+                    }
+                  }
+                ]
+              }
+            });
+          }
+          if (/nasa\.gov/i.test(u)) {
+            if (holdSafeSearch) await holdSafeSearch;
+            return fulfillJson({
+              collection: {
+                items: [
+                  {
+                    data: [{ nasa_id: 'nasa_safe_1', title: 'Safe NASA Orbit Clip', media_type: 'video' }],
+                    href: 'https://images-assets.nasa.gov/video/nasa_safe_1/collection.json'
+                  }
+                ]
+              }
+            });
+          }
+          if (/images-assets\.nasa\.gov\/video\/nasa_safe_1\/collection\.json/i.test(u)) {
+            return fulfillJson(['https://images-assets.nasa.gov/video/nasa_safe_1/nasa_safe_1~orig.mp4']);
+          }
+          return fulfillJson({});
+        }
+      ]);
+
+      await send('Page.navigate', { url: `http://127.0.0.1:${port}/` });
+      await evalJs(`(async () => {
+        for (let i = 0; i < 60; i++) {
+          if (document.getElementById('bookmarkletCodeInput')?.value) return true;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        throw new Error('DOMContentLoaded initialization did not finish in time');
+      })()`);
+
+      // Unlock app gate + set 4-digit 18+ PIN (4321) while staying in Safe Mode
+      await evalJs(`(() => {
+        unlockAppGate();
+        document.querySelector('.nav-tab[data-target="view-sources"]').click();
+        document.getElementById('nsfwPinInput').value = '4321';
+        document.getElementById('saveNsfwPinBtn').click();
+      })()`);
+
+      // 1. #urlScanForm in Safe Mode must reject adult URL without rendering 18+ cards
+      const urlScanCheck = await evalJs(`(async () => {
+        document.querySelector('.nav-tab[data-target="view-search"]').click();
+        document.getElementById('urlScanInput').value = 'https://www.redgifs.com/watch/subrg1';
+        document.getElementById('urlScanForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+        await new Promise((r) => setTimeout(r, 120));
+        return {
+          allowNsfw: settings.allowNsfw,
+          cardCount: document.querySelectorAll('#searchResultsList .video-list-item').length,
+          message: document.getElementById('searchResultsList').textContent.trim()
+        };
+      })()`);
+      assert.strictEqual(urlScanCheck.allowNsfw, false);
+      assert.strictEqual(urlScanCheck.cardCount, 0, '#urlScanForm must not render adult clips in Safe Mode');
+      assert.match(urlScanCheck.message, /Enable 18\+ Mode/);
+
+      // 2. #deepSearchForm mid-flight Safe -> 18+ switch must discard stale Safe results instead of stamping them 18+
+      let releaseSafeSearch;
+      holdSafeSearch = new Promise((r) => {
+        releaseSafeSearch = r;
+      });
+      await evalJs(`(() => {
+        // Uncheck all safe engines except NASA so search deterministically waits on holdSafeSearch
+        for (const id of ['engArchive', 'engPrelinger', 'engWiki', 'engReddit', 'engPeerTube', 'engFediverse', 'engTubeSites', 'engOpenWeb']) {
+          const el = document.getElementById(id);
+          if (el) el.checked = false;
+        }
+        document.getElementById('engNasa').checked = true;
+        document.getElementById('deepSearchInput').value = 'orbit';
+        document.getElementById('deepSearchForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      })()`);
+      await new Promise((r) => setTimeout(r, 80));
+
+      // Unlock 18+ Mode with PIN 4321 while Safe search is still in-flight
+      await evalJs(`(() => {
+        document.getElementById('ageGateToggleBtn').click();
+        document.getElementById('ageGatePinInput').value = '4321';
+        document.getElementById('confirmAgeGateBtn').click();
+      })()`);
+
+      releaseSafeSearch();
+      holdSafeSearch = null;
+      await new Promise((r) => setTimeout(r, 200));
+
+      const searchRaceCheck = await evalJs(`(() => ({
+        allowNsfw: settings.allowNsfw,
+        cardTitles: [...document.querySelectorAll('#searchResultsList .vli-title')].map((el) => el.textContent.trim())
+      }))()`);
+      assert.strictEqual(searchRaceCheck.allowNsfw, true);
+      assert.ok(
+        !searchRaceCheck.cardTitles.includes('Safe NASA Orbit Clip'),
+        'Stale Safe search must be discarded when switching to 18+ Mode mid-search'
+      );
+
+      // 3. #adultDirectoryList (▶ Pull) + #panicSafeBtn Boss Key race must never overwrite Safe Mode
+      let releaseRedgifs;
+      holdRedgifsLookup = new Promise((r) => {
+        releaseRedgifs = r;
+      });
+      await evalJs(`(() => {
+        document.querySelector('.nav-tab[data-target="view-sources"]').click();
+        document.getElementById('toggleAdultDirectoryBtn').click();
+        const pullBtn = document.querySelector('#adultDirectoryList button[data-action="pull-dir-source"][data-dir-id^="dir-sub-"]');
+        pullBtn.click();
+      })()`);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Hit Boss Key (#panicSafeBtn) while RedGIFs lookup is suspended
+      await evalJs(`(() => {
+        document.getElementById('panicSafeBtn').click();
+      })()`);
+
+      releaseRedgifs();
+      holdRedgifsLookup = null;
+      await new Promise((r) => setTimeout(r, 200));
+
+      const bossKeyRaceCheck = await evalJs(`(() => ({
+        allowNsfw: settings.allowNsfw,
+        title: document.getElementById('videoTitle').textContent.trim(),
+        queueHasAdult: videoQueue.some((v) => v.isNsfw || /redgifs/i.test(v.videoUrl || ''))
+      }))()`);
+      assert.strictEqual(bossKeyRaceCheck.allowNsfw, false);
+      assert.notStrictEqual(bossKeyRaceCheck.title, 'Explicit 18+ Subreddit Clip');
+      assert.strictEqual(
+        bossKeyRaceCheck.queueHasAdult,
+        false,
+        'Late 18+ Directory pull must never push adult video into Safe Mode queue after Boss Key'
+      );
+    } finally {
+      try {
+        ws?.close();
+      } catch {}
+      try {
+        chrome.kill('SIGKILL');
+      } catch {}
+      await new Promise((resolve) => appServer.close(resolve));
+      try {
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+      } catch {}
+    }
+  });
 });
+
 
