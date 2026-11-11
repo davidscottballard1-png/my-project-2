@@ -171,7 +171,10 @@ function verifyApiKey(providedKey, expectedKey = API_KEY) {
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Api-Key, Range');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-Api-Key, X-Upstream-Authorization, Range'
+  );
   res.setHeader(
     'Access-Control-Expose-Headers',
     'Content-Length, Content-Range, Accept-Ranges, Content-Type'
@@ -190,12 +193,32 @@ function sendJson(res, statusCode, payload) {
   res.end(body);
 }
 
-function buildUpstreamReferer(parsedUrl) {
+function buildUpstreamReferer(parsedUrl, rawRefererOverride = '') {
+  const cleanOverride = String(rawRefererOverride || '').trim();
+  if (cleanOverride && !/[\r\n]/.test(cleanOverride)) {
+    try {
+      const refParsed = new URL(cleanOverride);
+      if (refParsed.protocol === 'http:' || refParsed.protocol === 'https:') {
+        return refParsed.href;
+      }
+    } catch {}
+  }
   const host = parsedUrl.hostname.toLowerCase();
   if (host.includes('redgifs.com')) return 'https://www.redgifs.com/';
   if (host.includes('eporner.com')) return 'https://www.eporner.com/';
   if (host.includes('redd.it') || host.includes('reddit.com')) return 'https://www.reddit.com/';
   return `${parsedUrl.protocol}//${parsedUrl.host}/`;
+}
+
+function extractSafeUpstreamAuth(req, parsedTarget) {
+  if (!parsedTarget || parsedTarget.hostname.toLowerCase() !== 'api.redgifs.com') {
+    return '';
+  }
+  const raw = String(req?.headers?.['x-upstream-authorization'] || '').trim();
+  if (!/^Bearer\s+[A-Za-z0-9._-]+$/i.test(raw)) return '';
+  const tokenPart = raw.replace(/^Bearer\s+/i, '').trim();
+  if (!tokenPart || verifyApiKey(tokenPart)) return '';
+  return `Bearer ${tokenPart}`;
 }
 
 function isBinaryMediaRequest(parsedUrl, req) {
@@ -218,13 +241,19 @@ function shouldPreferResidentialProxyFirst(parsedUrl) {
 function isBlockedTextPayload(status, text) {
   if ([401, 403, 429, 451, 503].includes(status)) return true;
   if (typeof text !== 'string') return false;
-  const sample = text.slice(0, 1200);
+  const sample = text.slice(0, 2400);
+  if (status === 202 && /(?:anomaly-modal|duckduckgo\.com\/anomaly\.js|cc=botnet)/i.test(sample)) {
+    return true;
+  }
+  if (/(?:cf-browser-verification|\/cdn-cgi\/challenge-platform\/)/i.test(sample)) {
+    return true;
+  }
   return /<title[^>]*>\s*(?:Just a moment\.\.\.|Attention Required!|Access denied|Whoa there,\s*pardner!|Blocked)\s*<\/title>/i.test(
     sample
   );
 }
 
-function fetchViaCurlProxy(targetUrl, referer, timeoutSec = 14) {
+function fetchViaCurlProxy(targetUrl, referer, timeoutSec = 14, upstreamAuth = '') {
   return new Promise((resolve, reject) => {
     const marker = `__RV_META_${crypto.randomBytes(6).toString('hex')}__`;
     const args = [
@@ -244,13 +273,18 @@ function fetchViaCurlProxy(targetUrl, referer, timeoutSec = 14) {
       '-H',
       'Accept-Language: en-US,en;q=0.9',
       '-e',
-      referer,
+      referer
+    ];
+    if (upstreamAuth) {
+      args.push('-H', `Authorization: ${upstreamAuth}`);
+    }
+    args.push(
       '--config',
       '-',
       '-w',
       `\n${marker}%{http_code}|%{content_type}`,
       targetUrl
-    ];
+    );
 
     const child = spawn('curl', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks = [];
@@ -322,7 +356,11 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
     return sendJson(res, 400, { ok: false, error: err.message });
   }
 
-  const referer = buildUpstreamReferer(parsedTarget);
+  const referer = buildUpstreamReferer(
+    parsedTarget,
+    parsedReqUrl.searchParams.get('referer') || ''
+  );
+  const upstreamAuth = extractSafeUpstreamAuth(req, parsedTarget);
   const isMedia = isBinaryMediaRequest(parsedTarget, req);
 
   // 1. Metadata / JSON / HTML / M3U8 path (uses Webshare Residential Proxy selectively without wasting GBs on video bytes)
@@ -331,7 +369,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
 
     if (preferProxy) {
       try {
-        const proxied = await fetchViaCurlProxy(parsedTarget.href, referer);
+        const proxied = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
         if (proxied.status >= 200 && proxied.status < 400 && proxied.body.length > 0) {
           setCorsHeaders(res);
           res.writeHead(proxied.status, {
@@ -349,16 +387,20 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 12000);
     try {
+      const metaHeaders = {
+        'User-Agent': BROWSER_UA,
+        Accept:
+          'application/json,text/html,application/xhtml+xml,application/vnd.apple.mpegurl,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Referer: referer
+      };
+      if (upstreamAuth) {
+        metaHeaders.Authorization = upstreamAuth;
+      }
       const upstream = await fetchSafeWithRedirects(parsedTarget.href, {
         method: 'GET',
         signal: controller.signal,
-        headers: {
-          'User-Agent': BROWSER_UA,
-          Accept:
-            'application/json,text/html,application/xhtml+xml,application/vnd.apple.mpegurl,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          Referer: referer
-        }
+        headers: metaHeaders
       });
       clearTimeout(timer);
 
@@ -368,7 +410,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       }
 
       const buf = Buffer.from(await upstream.arrayBuffer());
-      const sampleText = buf.subarray(0, 1200).toString('utf8');
+      const sampleText = buf.subarray(0, 2400).toString('utf8');
 
       if (
         RESIDENTIAL_PROXY_URL &&
@@ -376,7 +418,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
         isBlockedTextPayload(upstream.status, sampleText)
       ) {
         try {
-          const rescued = await fetchViaCurlProxy(parsedTarget.href, referer);
+          const rescued = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
           if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
             setCorsHeaders(res);
             res.writeHead(rescued.status, {
@@ -402,7 +444,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       clearTimeout(timer);
       if (RESIDENTIAL_PROXY_URL && !preferProxy) {
         try {
-          const rescued = await fetchViaCurlProxy(parsedTarget.href, referer);
+          const rescued = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
           setCorsHeaders(res);
           res.writeHead(rescued.status, {
             'Content-Type': rescued.contentType,
@@ -932,7 +974,7 @@ function runExecFile(cmd, args, timeoutMs = 300000) {
   });
 }
 
-async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false) {
+async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false, referer = '') {
   const args = [
     '--no-playlist',
     '--no-warnings',
@@ -945,7 +987,12 @@ async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false) {
     '--concurrent-fragments',
     '4',
     '--user-agent',
-    BROWSER_UA,
+    BROWSER_UA
+  ];
+  if (referer) {
+    args.push('--referer', referer);
+  }
+  args.push(
     '-f',
     'bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/best[ext=mp4][height<=1080]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
     '--merge-output-format',
@@ -954,7 +1001,7 @@ async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false) {
     'Merger+ffmpeg_o:-movflags +faststart',
     '-o',
     outTemplate
-  ];
+  );
   if (useProxy && RESIDENTIAL_PROXY_URL) {
     args.push('--proxy', RESIDENTIAL_PROXY_URL);
   }
@@ -1060,16 +1107,19 @@ async function processPlexSaveJob(job) {
 
     for (const candidateUrl of job.candidates) {
       const parsed = await assertSafePublicUrl(candidateUrl);
-      const preferProxy = shouldPreferResidentialProxyFirst(parsed);
+      const isDirectBinary = isBinaryMediaRequest(parsed, { headers: {} });
+      const preferProxy = !isDirectBinary && shouldPreferResidentialProxyFirst(parsed);
+      const referer = buildUpstreamReferer(parsed, job.referer || '');
       try {
-        await downloadUrlWithYtDlp(parsed.href, outTemplate, preferProxy);
+        await downloadUrlWithYtDlp(parsed.href, outTemplate, preferProxy, referer);
         downloaded = true;
         break;
       } catch (err1) {
         lastErr = err1;
-        if (RESIDENTIAL_PROXY_URL && !preferProxy) {
+        // Only retry watch-page URLs over Webshare Residential Proxy so raw .mp4 binary streams never burn proxy GBs
+        if (RESIDENTIAL_PROXY_URL && !preferProxy && !isDirectBinary) {
           try {
-            await downloadUrlWithYtDlp(parsed.href, outTemplate, true);
+            await downloadUrlWithYtDlp(parsed.href, outTemplate, true, referer);
             downloaded = true;
             break;
           } catch (err2) {
@@ -1153,6 +1203,14 @@ async function handlePlexSaveRequest(req, res) {
   const rawPageUrl = String(body.pageUrl || '').trim();
   const rawOriginalUrl = String(body.originalUrl || '').trim();
 
+  let safeReferer = '';
+  if (rawPageUrl) {
+    try {
+      const refUrl = await assertSafePublicUrl(rawPageUrl);
+      safeReferer = refUrl.href;
+    } catch {}
+  }
+
   const candidateSet = new Set();
   if (isSpecificWatchPageUrl(rawPageUrl) && /(?:reddit\.com|redgifs\.com)/i.test(rawPageUrl)) {
     candidateSet.add(rawPageUrl);
@@ -1187,6 +1245,7 @@ async function handlePlexSaveRequest(req, res) {
     fileName: null,
     plexScanned: false,
     error: null,
+    referer: safeReferer,
     candidates: validCandidates
   };
 
@@ -1256,7 +1315,7 @@ function createBridgeServer() {
     }
 
     if (pathname === '/plex/jobs' && req.method === 'GET') {
-      const publicJobs = plexJobs.map(({ candidates, ...rest }) => rest);
+      const publicJobs = plexJobs.map(({ candidates, referer, ...rest }) => rest);
       return sendJson(res, 200, { ok: true, jobs: publicJobs });
     }
 
@@ -1290,6 +1349,9 @@ module.exports = {
   assertSafePublicUrl,
   verifyApiKey,
   extractProvidedApiKey,
+  extractSafeUpstreamAuth,
+  buildUpstreamReferer,
+  isBlockedTextPayload,
   isBinaryMediaRequest,
   shouldPreferResidentialProxyFirst,
   sanitizeFilenameTitle,

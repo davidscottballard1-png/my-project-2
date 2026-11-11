@@ -255,6 +255,62 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
       await new Promise((resolve) => srv.close(resolve));
     }
   });
+
+  it('forwards X-Upstream-Authorization only to api.redgifs.com, never leaks REELVAULT_API_KEY, honors ?referer=, and detects HTTP 202 bot challenges', () => {
+    const rgTarget = new URL('https://api.redgifs.com/v2/gifs/search?search_text=trending');
+    const otherTarget = new URL('https://www.reddit.com/r/Unexpected/hot.json');
+
+    // Allows guest Bearer token to api.redgifs.com
+    assert.strictEqual(
+      bridge.extractSafeUpstreamAuth(
+        { headers: { 'x-upstream-authorization': 'Bearer rg_guest_token_xyz123456' } },
+        rgTarget
+      ),
+      'Bearer rg_guest_token_xyz123456'
+    );
+
+    // Never forwards to non-RedGIFs hosts
+    assert.strictEqual(
+      bridge.extractSafeUpstreamAuth(
+        { headers: { 'x-upstream-authorization': 'Bearer rg_guest_token_xyz123456' } },
+        otherTarget
+      ),
+      ''
+    );
+
+    // Never forwards REELVAULT_API_KEY upstream even if accidentally placed in X-Upstream-Authorization
+    assert.strictEqual(
+      bridge.extractSafeUpstreamAuth(
+        { headers: { 'x-upstream-authorization': 'Bearer rv_unit_test_secret_key_123456' } },
+        rgTarget
+      ),
+      ''
+    );
+
+    // Honors validated ?referer= override on /proxy while falling back safely on invalid values
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(
+        new URL('https://cdn.example.net/media/clip.mp4'),
+        'https://tube.example.net/watch/42'
+      ),
+      'https://tube.example.net/watch/42'
+    );
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://cdn.example.net/media/clip.mp4'), 'javascript:alert(1)'),
+      'https://cdn.example.net/'
+    );
+
+    // Detects DuckDuckGo HTTP 202 anomaly challenges & Cloudflare challenge pages for Residential Proxy escalation
+    assert.strictEqual(
+      bridge.isBlockedTextPayload(202, '<div class="anomaly-modal">Unfortunately, bots use DuckDuckGo too.</div>'),
+      true
+    );
+    assert.strictEqual(
+      bridge.isBlockedTextPayload(200, '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate"></script>'),
+      true
+    );
+    assert.strictEqual(bridge.isBlockedTextPayload(200, '<html><body><video src="a.mp4"></video></body></html>'), false);
+  });
 });
 
 describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
@@ -270,10 +326,13 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
     };
     app.clearCloudBackendConfig();
     app.settings.allowNsfw = false;
+    app.setAppState({ resetRedgifsToken: true, videoQueue: [], currentIndex: -1, lastSearchResults: [] });
   });
 
   afterEach(() => {
     app.clearCloudBackendConfig();
+    app.settings.allowNsfw = false;
+    app.setAppState({ resetRedgifsToken: true, videoQueue: [], currentIndex: -1, lastSearchResults: [] });
     globalThis.fetch = origFetch;
     globalThis.localStorage = origLocalStorage;
   });
@@ -304,6 +363,12 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       'https://85-239-249-225.nip.io/proxy?key=rv_my_key_999&url=https%3A%2F%2Fv.redd.it%2Fxyz%2FCMAF_720.mp4'
     );
     assert.strictEqual(app.unwrapProxyTargetUrl(proxied), 'https://v.redd.it/xyz/CMAF_720.mp4');
+
+    const withReferer = app.buildCloudProxyUrl(
+      'https://cdn.example.org/clip.mp4',
+      'https://watch.example.org/v/10'
+    );
+    assert.ok(withReferer.includes('&referer=https%3A%2F%2Fwatch.example.org%2Fv%2F10'));
 
     const candidates = app.buildHttpsMediaProxyCandidates('https://v.redd.it/xyz/CMAF_720.mp4', {
       forceProxy: true
@@ -412,4 +477,170 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
     assert.strictEqual(items[0].format, 'mp4');
     assert.strictEqual(items[0].sourceName, 'Vimeo (Cloud)');
   });
+
+  it('extracts the exact video from a pasted Reddit post URL (/comments/<id>) instead of dumping random subreddit hot posts', async () => {
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+
+    const hitTargets = [];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      hitTargets.push(u);
+      if (u.includes('/proxy?key=rv_secret_abc') && decodeURIComponent(u).includes('reddit.com/comments/1abc999.json')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: '1abc999',
+                      title: 'Exact Pasted Reddit Clip',
+                      subreddit: 'Unexpected',
+                      permalink: '/r/Unexpected/comments/1abc999/exact_pasted_reddit_clip/',
+                      over_18: false,
+                      secure_media: {
+                        reddit_video: {
+                          fallback_url: 'https://v.redd.it/exact999/CMAF_720.mp4?source=fallback',
+                          hls_url: 'https://v.redd.it/exact999/HLSPlaylist.m3u8',
+                          height: 720,
+                          duration: 18
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        };
+      }
+      throw new Error(`Should not hit random subreddit hot feed! Hit: ${u}`);
+    };
+
+    const pulled = await app.pullSmartInputToPlayer(
+      'https://www.reddit.com/r/Unexpected/comments/1abc999/exact_pasted_reddit_clip/'
+    );
+    assert.strictEqual(pulled.length, 1);
+    assert.strictEqual(pulled[0].title, 'Exact Pasted Reddit Clip');
+    assert.ok(pulled[0].videoUrl.includes('v.redd.it/exact999'));
+    assert.strictEqual(app.getAppState().videoQueue.length, 1);
+    assert.strictEqual(app.getAppState().currentIndex, 0);
+  });
+
+  it('routes RedGIFs API v2 calls through Cloud /proxy with X-Upstream-Authorization when guest token is Cloud-minted', async () => {
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+    app.settings.allowNsfw = true;
+
+    let sawUpstreamAuth = null;
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = String(url);
+      if (u === 'https://api.redgifs.com/v2/auth/temporary') {
+        return { ok: false, status: 403, json: async () => ({ error: 'ISP Blocked' }) };
+      }
+      if (u.includes('/proxy?key=rv_secret_abc') && decodeURIComponent(u).includes('api.redgifs.com/v2/auth/temporary')) {
+        return { ok: true, status: 200, json: async () => ({ token: 'cloud_ip_rg_token_777' }) };
+      }
+      if (u.includes('/proxy?key=rv_secret_abc') && decodeURIComponent(u).includes('api.redgifs.com/v2/gifs/search')) {
+        sawUpstreamAuth = opts.headers?.['X-Upstream-Authorization'] || null;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            gifs: [
+              {
+                id: 'cloudmatched1',
+                duration: 14,
+                tags: ['hd', 'verified'],
+                urls: { hd: 'https://media.redgifs.com/CloudMatched1.mp4?expires=9999999999&signature=ok' }
+              }
+            ]
+          })
+        };
+      }
+      throw new Error(`Unexpected RedGIFs fetch URL: ${u}`);
+    };
+
+    const items = await app.searchRedgifsVideos('trending', 5);
+    assert.strictEqual(sawUpstreamAuth, 'Bearer cloud_ip_rg_token_777');
+    assert.strictEqual(items.length, 1);
+    assert.strictEqual(items[0].id, 'rg-cloudmatched1');
+  });
+
+  it('prioritizes Private Cloud /proxy (with Referer) in rescueDeadVideoStream and polls Plex jobs until ready', async () => {
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+
+    const rescueCalls = [];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      rescueCalls.push(u);
+      if (u === 'https://tube.example.org/watch/clip77') {
+        return { ok: false, status: 403, text: async () => 'Blocked' };
+      }
+      if (u.startsWith('https://85-239-249-225.nip.io/proxy?key=rv_secret_abc')) {
+        const proxiedTarget = new URL(u).searchParams.get('url') || '';
+        if (proxiedTarget === 'https://tube.example.org/watch/clip77') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              '<!DOCTYPE html><html><head><title>Clip 77</title></head><body><main><p>Dynamic canvas player without inline mp4 source tags.</p></main></body></html>'
+          };
+        }
+        // Large progressive stream (>25 MB Content-Length) rescued via Cloud /proxy!
+        return {
+          ok: true,
+          status: 200,
+          headers: {
+            get: (h) => {
+              if (h.toLowerCase() === 'content-type') return 'video/mp4';
+              if (h.toLowerCase() === 'content-length') return String(80 * 1024 * 1024);
+              return null;
+            }
+          },
+          body: { cancel: async () => {} }
+        };
+      }
+      if (u === 'https://85-239-249-225.nip.io/plex/jobs') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            jobs: [{ id: 'job_live_1', title: 'Rescued Clip', status: 'ready', library: 'ReelVault Clips' }]
+          })
+        };
+      }
+      throw new Error(`Should not hit free public CORS proxies when Cloud /proxy succeeds! Hit: ${u}`);
+    };
+
+    const rescued = await app.rescueDeadVideoStream({
+      id: 'clip-77',
+      title: 'Hotlink Protected MP4',
+      videoUrl: 'https://cdn.example.org/protected/movie.mp4',
+      pageUrl: 'https://tube.example.org/watch/clip77',
+      format: 'mp4'
+    });
+    assert.ok(rescued?.proxiedStreamUrl?.startsWith('https://85-239-249-225.nip.io/proxy?key=rv_secret_abc'));
+    assert.ok(rescued.proxiedStreamUrl.includes('referer=https%3A%2F%2Ftube.example.org%2Fwatch%2Fclip77'));
+
+    const jobDone = await app.pollPlexJobUntilDone('job_live_1', 'ReelVault Clips', {
+      intervalMs: 5,
+      maxPolls: 3
+    });
+    assert.strictEqual(jobDone?.status, 'ready');
+
+    // Also verify batch queueing search results into Player
+    app.setAppState({
+      lastSearchResults: [
+        { id: 'sr-1', title: 'Batch 1', videoUrl: 'https://cdn.example.org/1.mp4', format: 'mp4' },
+        { id: 'sr-2', title: 'Batch 2', videoUrl: 'https://cdn.example.org/2.mp4', format: 'mp4' }
+      ]
+    });
+    const queuedCount = app.queueSearchResultsToPlayer({ startReels: false });
+    assert.strictEqual(queuedCount, 2);
+    assert.strictEqual(app.getAppState().videoQueue.length, 2);
+  });
 });
+

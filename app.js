@@ -337,6 +337,7 @@ let isBackgroundRefilling = false;
 let prebufferVideoEl = null;
 let cachedRedgifsToken = null;
 let cachedRedgifsTokenExpiry = 0;
+let cachedRedgifsTokenViaProxy = false;
 const httpOnlyHosts = new Set();
 let cloudConfig = {
   backendUrl: '',
@@ -384,11 +385,16 @@ function isCloudBackendConfigured() {
   );
 }
 
-function buildCloudProxyUrl(targetUrl) {
+function buildCloudProxyUrl(targetUrl, refererUrl = '') {
   if (!isCloudBackendConfigured() || !targetUrl) return '';
-  return `${cloudConfig.backendUrl}/proxy?key=${encodeURIComponent(
+  let built = `${cloudConfig.backendUrl}/proxy?key=${encodeURIComponent(
     cloudConfig.apiKey
   )}&url=${encodeURIComponent(targetUrl)}`;
+  const cleanRef = String(refererUrl || '').trim();
+  if (cleanRef && /^https?:\/\//i.test(cleanRef)) {
+    built += `&referer=${encodeURIComponent(cleanRef)}`;
+  }
+  return built;
 }
 
 function isSecurePageOrigin() {
@@ -1786,8 +1792,16 @@ function setCloudBackendConfig(rawUrl, rawKey, enabled = true) {
   return true;
 }
 
+let lastCloudStatusOverride = null;
+let activePlexPollTimer = null;
+
 function clearCloudBackendConfig() {
   cloudConfig = { backendUrl: '', apiKey: '', enabled: false };
+  lastCloudStatusOverride = null;
+  if (activePlexPollTimer) {
+    clearTimeout(activePlexPollTimer);
+    activePlexPollTimer = null;
+  }
   sourcePoolCache.clear();
   saveCloudConfig();
   if (typeof document !== 'undefined') {
@@ -1804,12 +1818,21 @@ function clearCloudBackendConfig() {
   syncCloudBackendUI();
 }
 
-function syncCloudBackendUI(statusOverride = null) {
+function syncCloudBackendUI(statusOverride = undefined) {
+  if (statusOverride !== undefined) {
+    lastCloudStatusOverride = statusOverride;
+  }
   if (typeof document === 'undefined') return;
   const active = isCloudBackendConfigured();
+  if (!active && !statusOverride) {
+    lastCloudStatusOverride = null;
+  }
+  const effectiveStatus = statusOverride !== undefined ? statusOverride : lastCloudStatusOverride;
+
   const urlInput = document.getElementById('cloudBackendUrlInput');
   const keyInput = document.getElementById('cloudApiKeyInput');
   const badgeEl = document.getElementById('cloudStatusBadge');
+  const playerPillEl = document.getElementById('playerCloudBadgeBtn');
   const plexRow = document.getElementById('plexActionRow');
   const sendBtn = document.getElementById('sendToPlexBtn');
   const reelsPlexBtn = document.getElementById('reelsPlexBtn');
@@ -1828,20 +1851,45 @@ function syncCloudBackendUI(statusOverride = null) {
   jobsBtn?.classList?.toggle('hidden', !active);
   clearBtn?.classList?.toggle('hidden', !active);
 
-  if (sendBtn) {
+  if (sendBtn && !sendBtn.dataset?.plexPolling) {
     sendBtn.disabled = !videoQueue[currentIndex];
   }
 
   if (badgeEl) {
     badgeEl.classList?.remove('cloud-badge-ok', 'cloud-badge-warn');
-    if (statusOverride && statusOverride.text) {
-      badgeEl.textContent = statusOverride.text;
-      badgeEl.classList?.add(statusOverride.ok ? 'cloud-badge-ok' : 'cloud-badge-warn');
+    if (effectiveStatus && effectiveStatus.text) {
+      badgeEl.textContent = effectiveStatus.text;
+      badgeEl.classList?.add(effectiveStatus.ok ? 'cloud-badge-ok' : 'cloud-badge-warn');
     } else if (active) {
       badgeEl.textContent = '🟢 Cloud & Plex Connected';
       badgeEl.classList?.add('cloud-badge-ok');
     } else {
       badgeEl.textContent = '⚪ Optional • Not Connected';
+    }
+  }
+
+  if (playerPillEl) {
+    playerPillEl.classList?.remove('connected', 'warn');
+    if (effectiveStatus && effectiveStatus.text) {
+      if (effectiveStatus.ok) {
+        const hasPlex = /Plex Ready/i.test(effectiveStatus.text);
+        const hasProxy = /Proxy On/i.test(effectiveStatus.text);
+        playerPillEl.textContent =
+          hasPlex && hasProxy
+            ? '🟢 Cloud • Plex • Proxy'
+            : hasPlex
+            ? '🟢 Cloud • Plex Ready'
+            : '🟢 Cloud Connected';
+        playerPillEl.classList?.add('connected');
+      } else {
+        playerPillEl.textContent = '⚠️ Cloud Check';
+        playerPillEl.classList?.add('warn');
+      }
+    } else if (active) {
+      playerPillEl.textContent = '🟢 Cloud + Plex';
+      playerPillEl.classList?.add('connected');
+    } else {
+      playerPillEl.textContent = '☁️ Connect Cloud';
     }
   }
 
@@ -1895,6 +1943,75 @@ async function testCloudBackendConnection(rawUrl = cloudConfig.backendUrl, rawKe
     syncCloudBackendUI({ text: `⚠️ ${errMsg}`, ok: false });
     return { ok: false, error: errMsg };
   }
+}
+
+async function pollPlexJobUntilDone(jobId, libLabel = 'Plex', opts = {}) {
+  if (!jobId || !isCloudBackendConfigured()) return null;
+  const intervalMs = typeof opts.intervalMs === 'number' ? opts.intervalMs : 2500;
+  const maxAttempts = typeof opts.maxAttempts === 'number' ? opts.maxAttempts : 36;
+  if (activePlexPollTimer) {
+    clearTimeout(activePlexPollTimer);
+    activePlexPollTimer = null;
+  }
+
+  const setSendBtnLabel = (label, polling = false) => {
+    if (typeof document === 'undefined') return;
+    const sendBtn = document.getElementById('sendToPlexBtn');
+    if (!sendBtn) return;
+    if (sendBtn.dataset) {
+      if (polling) sendBtn.dataset.plexPolling = '1';
+      else delete sendBtn.dataset.plexPolling;
+    }
+    sendBtn.textContent = label;
+    if (!polling) {
+      sendBtn.disabled = !videoQueue[currentIndex];
+    }
+  };
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0 && intervalMs > 0) {
+      await new Promise((resolve) => {
+        activePlexPollTimer = setTimeout(resolve, intervalMs);
+        activePlexPollTimer.unref?.();
+      });
+    }
+    if (!isCloudBackendConfigured()) break;
+
+    const jobs = await fetchPlexJobs();
+    const match = Array.isArray(jobs) ? jobs.find((j) => j && j.id === jobId) : null;
+    if (!match) continue;
+
+    if (match.status === 'ready') {
+      const mb = match.sizeBytes ? ` • ${(match.sizeBytes / (1024 * 1024)).toFixed(1)} MB` : '';
+      setSendBtnLabel(`✅ Saved in ${libLabel}!`, false);
+      showToast(`✅ Ready in Plex (${libLabel}${mb})!`);
+      if (intervalMs > 0) {
+        const resetTimer = setTimeout(() => {
+          setSendBtnLabel('🎬 Send Video to My Plex Server', false);
+        }, 3200);
+        resetTimer.unref?.();
+      }
+      return match;
+    }
+
+    if (match.status === 'error') {
+      const errDetail = match.error ? `: ${String(match.error).slice(0, 80)}` : '';
+      setSendBtnLabel('🎬 Send Video to My Plex Server', false);
+      showToast(`⚠️ Plex save failed${errDetail}`);
+      return match;
+    }
+
+    if (match.status === 'optimizing') {
+      setSendBtnLabel('⚙️ Optimizing Direct-Play MP4 for Plex...', true);
+    } else if (match.status === 'scanning') {
+      setSendBtnLabel('📡 Refreshing Plex Library...', true);
+    } else {
+      setSendBtnLabel('⏳ Downloading Video to Cloud Plex...', true);
+    }
+  }
+
+  setSendBtnLabel('🎬 Send Video to My Plex Server', false);
+  return null;
 }
 
 async function sendVideoToPlex(videoItem) {
@@ -1953,11 +2070,19 @@ async function sendVideoToPlex(videoItem) {
     }
 
     const libLabel = data.library || (isNsfw ? 'ReelVault 18+ Vault' : 'ReelVault Clips');
-    showToast(`🎬 Queued for Plex (${libLabel})!`);
+    showToast(`🎬 Queued for Plex (${libLabel}) — saving in background!`);
 
-    const jobsBox = typeof document !== 'undefined' ? document.getElementById('cloudJobsBox') : null;
-    if (jobsBox && !jobsBox.classList?.contains('hidden')) {
-      fetchPlexJobs().catch(() => {});
+    if (
+      data.jobId &&
+      typeof document !== 'undefined' &&
+      document.getElementById('sendToPlexBtn')
+    ) {
+      pollPlexJobUntilDone(data.jobId, libLabel).catch(() => {});
+    } else {
+      const jobsBox = typeof document !== 'undefined' ? document.getElementById('cloudJobsBox') : null;
+      if (jobsBox && !jobsBox.classList?.contains('hidden')) {
+        fetchPlexJobs().catch(() => {});
+      }
     }
     return data;
   } catch {
@@ -3874,6 +3999,7 @@ async function getRedgifsTempToken() {
       if (data?.token) {
         cachedRedgifsToken = data.token;
         cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+        cachedRedgifsTokenViaProxy = false;
         return cachedRedgifsToken;
       }
     }
@@ -3886,9 +4012,71 @@ async function getRedgifsTempToken() {
     if (data?.token) {
       cachedRedgifsToken = data.token;
       cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+      cachedRedgifsTokenViaProxy = isCloudBackendConfigured();
       return cachedRedgifsToken;
     }
   } catch {}
+
+  return null;
+}
+
+async function fetchRedgifsApiJson(apiUrl, token) {
+  const tryCloudRedgifsFetch = async (bearerTok) => {
+    const cloudProxyUrl = buildCloudProxyUrl(apiUrl);
+    if (!cloudProxyUrl) return null;
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 7000) : null;
+    timer?.unref?.();
+    try {
+      const reqHeaders = bearerTok ? { 'X-Upstream-Authorization': `Bearer ${bearerTok}` } : {};
+      const cRes = controller
+        ? await fetch(cloudProxyUrl, { headers: reqHeaders, signal: controller.signal })
+        : await fetch(cloudProxyUrl, { headers: reqHeaders });
+      if (cRes && cRes.ok) {
+        return await cRes.json();
+      }
+    } catch {} finally {
+      if (timer) clearTimeout(timer);
+    }
+    return null;
+  };
+
+  // If the guest token was minted via the Cloud/Residential Proxy IP, route the API call via Cloud /proxy too
+  if (cachedRedgifsTokenViaProxy && isCloudBackendConfigured()) {
+    const viaCloud = await tryCloudRedgifsFetch(token);
+    if (viaCloud) return viaCloud;
+  }
+
+  // Standard direct RedGIFs API v2 request
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  timer.unref?.();
+  let directStatus = 0;
+  try {
+    const res = await fetch(apiUrl, { headers, signal: controller.signal });
+    directStatus = Number(res?.status) || 0;
+    if (res && res.ok) {
+      return await res.json();
+    }
+  } catch {
+    directStatus = 0;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // If direct browser fetch was blocked/401/403/429 and Cloud Server is connected, mint a Cloud-IP token and rescue via /proxy
+  if (isCloudBackendConfigured() && (directStatus === 0 || directStatus === 401 || directStatus === 403 || directStatus === 429)) {
+    try {
+      const proxyAuth = await fetchWithCorsFallback('https://api.redgifs.com/v2/auth/temporary', false);
+      if (proxyAuth?.token) {
+        cachedRedgifsToken = proxyAuth.token;
+        cachedRedgifsTokenExpiry = Date.now() + 45 * 60 * 1000;
+        cachedRedgifsTokenViaProxy = true;
+      }
+    } catch {}
+    return await tryCloudRedgifsFetch(cachedRedgifsToken || token);
+  }
 
   return null;
 }
@@ -3897,22 +4085,12 @@ async function resolveRedgifsUrlToMp4(rawUrl, fallbackTitle = 'RedGIFs HD Clip')
   const rgId = extractRedgifsId(rawUrl);
   if (!rgId) return null;
 
-  // 1. Try RedGIFs API v2 with temporary guest bearer token
+  // 1. Try RedGIFs API v2 with temporary guest bearer token (direct or Cloud /proxy IP-matched)
   try {
     const token = await getRedgifsTempToken();
     const apiUrl = `https://api.redgifs.com/v2/gifs/${encodeURIComponent(rgId.toLowerCase())}`;
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    timer.unref?.();
-    let res;
-    try {
-      res = await fetch(apiUrl, { headers, signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (res.ok) {
-      const data = await res.json();
+    const data = await fetchRedgifsApiJson(apiUrl, token);
+    if (data) {
       const gif = data?.gif;
       const hdUrl = gif?.urls?.hd || null;
       const sdUrl = gif?.urls?.sd || null;
@@ -4224,33 +4402,21 @@ async function searchRedgifsVideos(keyword, limit = 6) {
     }
   };
 
-  const fetchRedgifsWithTimeout = async (targetUrl, reqHeaders) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    timer.unref?.();
-    try {
-      return await fetch(targetUrl, { headers: reqHeaders, signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-
   try {
     const token = await getRedgifsTempToken();
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
 
     // 1. Primary search on RedGIFs API v2
     const searchUrl = `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(
       cleanKw
     )}&order=trending&count=${limit}`;
-    const res = await fetchRedgifsWithTimeout(searchUrl, headers);
-    if (res.ok) {
-      const data = await res.json();
+    const data = await fetchRedgifsApiJson(searchUrl, token);
+    if (data) {
       appendGifsFromList(data?.gifs);
     }
 
     // 2. Niche/creator keywords (or when trending returns 0) fall back to 'best' and creator feeds
     if (results.length === 0) {
+      const activeToken = cachedRedgifsToken || token;
       const fallbackUrls = [
         `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(cleanKw)}&order=best&count=${limit}`
       ];
@@ -4260,11 +4426,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
         );
       }
       const settled = await Promise.allSettled(
-        fallbackUrls.map(async (u) => {
-          const r = await fetchRedgifsWithTimeout(u, headers);
-          if (r.ok) return await r.json();
-          return null;
-        })
+        fallbackUrls.map((u) => fetchRedgifsApiJson(u, activeToken))
       );
       for (const s of settled) {
         if (s.status === 'fulfilled' && s.value) {
@@ -4954,6 +5116,53 @@ function isKnownNsfwUrl(rawUrl) {
   return KNOWN_NSFW_DOMAIN_REGEX.test(rawUrl);
 }
 
+const CLOUD_DIRECT_EXTRACT_URL_REGEX =
+  /(?:^|[./])(?:vimeo\.com\/\d+|dailymotion\.com\/video\/|dai\.ly\/|streamable\.com\/|(?:x|twitter)\.com\/[^/]+\/status\/|youtu\.be\/|youtube\.com\/(?:watch|shorts)\/|tiktok\.com\/|instagram\.com\/(?:reel|reels|p)\/|clips\.twitch\.tv\/|twitch\.tv\/[^/]+\/clip\/)/i;
+
+const SINGLE_WATCH_URL_HINT_REGEX =
+  /(?:\/watch\/|\/video[s/-]|\/v\/|\/post\/|\/reel\/|\bviewkey=)/i;
+
+async function fetchCloudExtractedItems(targetUrl, customLabel, pageTitle = null, markScannedNsfw = false) {
+  if (!isCloudBackendConfigured() || !/^https?:\/\//i.test(targetUrl)) {
+    return [];
+  }
+  const extracted = [];
+  try {
+    const extractEndpoint = `${cloudConfig.backendUrl}/extract?url=${encodeURIComponent(targetUrl)}`;
+    const res = await fetchWithTimeout(extractEndpoint, 18000, {
+      headers: { Authorization: `Bearer ${cloudConfig.apiKey}` }
+    });
+    if (res && res.ok) {
+      const data = await res.json();
+      if (data?.ok && Array.isArray(data.items)) {
+        for (const cItem of data.items) {
+          if (!cItem?.videoUrl) continue;
+          const fmt = detectVideoFormat(cItem.videoUrl, cItem.format || 'mp4').ext;
+          if (!isFormatAllowedBySettings(fmt)) continue;
+          extracted.push({
+            id: cItem.id || `cloud-${Date.now()}-${extracted.length}`,
+            title: cItem.title || pageTitle || 'Extracted Video',
+            videoUrl: cItem.videoUrl,
+            originalUrl: cItem.originalUrl || targetUrl,
+            convertedUrl: cItem.convertedUrl || null,
+            format: fmt,
+            isAutoConverted: false,
+            duration: Number(cItem.duration) || 0,
+            isHd: Boolean(cItem.isHd),
+            tags: Array.isArray(cItem.tags) ? cItem.tags : [],
+            ...(markScannedNsfw || isKnownNsfwUrl(cItem.videoUrl) ? { isNsfw: true } : {}),
+            sourceName: cItem.sourceName || `${customLabel} (Cloud)`,
+            pageUrl: cItem.pageUrl || targetUrl
+          });
+        }
+      }
+    }
+  } catch {
+    // Cloud extractor optional fallback
+  }
+  return extracted;
+}
+
 // 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
 async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSubpageCrawl = true) {
   const trimmed = targetUrl.trim();
@@ -4989,10 +5198,37 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     ];
   }
 
-  if (trimmed.includes('reddit.com/r/')) {
+  // Specific Reddit post permalink or redd.it shortlink -> extract exact post video(s), not random subreddit hot feed
+  const redditPostMatch =
+    trimmed.match(/reddit\.com\/(?:r\/[^/?#]+\/|u(?:ser)?\/[^/?#]+\/)?comments\/([a-z0-9]+)/i) ||
+    trimmed.match(/^https?:\/\/(?:www\.)?redd\.it\/([a-z0-9]+)(?:[/?#]|$)/i);
+  if (redditPostMatch?.[1]) {
+    try {
+      const postId = redditPostMatch[1];
+      const postJsonUrl = `https://www.reddit.com/comments/${encodeURIComponent(postId)}.json?raw_json=1`;
+      const postJson = await fetchWithCorsFallback(postJsonUrl, false);
+      const listing = Array.isArray(postJson) ? postJson[0] : postJson;
+      const postVideos = extractRedditVideosFromListing(listing, customLabel, true);
+      if (postVideos.length > 0) {
+        return await upgradeUnsignedRedgifsItems(postVideos);
+      }
+    } catch {
+      // Fall through to Cloud /extract or HTML scanner if Reddit JSON fails
+    }
+  } else if (trimmed.includes('reddit.com/r/') && !/reddit\.com\/r\/[^/?#]+\/s\//i.test(trimmed)) {
     const match = trimmed.match(/reddit\.com\/r\/([^/?#]+)/i);
     if (match?.[1]) {
       return await fetchSubredditVideos(match[1]);
+    }
+  }
+
+  // Fast-path Cloud yt-dlp extraction for SPA watch URLs (Vimeo, Streamable, X/Twitter, YouTube, TikTok, etc.)
+  let triedCloudExtract = false;
+  if (allowSubpageCrawl && isCloudBackendConfigured() && CLOUD_DIRECT_EXTRACT_URL_REGEX.test(trimmed)) {
+    triedCloudExtract = true;
+    const fastItems = await fetchCloudExtractedItems(trimmed, customLabel, null, markScannedNsfw);
+    if (fastItems.length > 0) {
+      return fastItems;
     }
   }
 
@@ -5070,8 +5306,27 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
     }
   }
 
+  // When scanning a single watch page with Cloud connected, run yt-dlp /extract BEFORE crawling random sidebar subpages
+  if (
+    !triedCloudExtract &&
+    results.length === 0 &&
+    allowSubpageCrawl &&
+    isCloudBackendConfigured() &&
+    SINGLE_WATCH_URL_HINT_REGEX.test(trimmed)
+  ) {
+    triedCloudExtract = true;
+    const cloudWatchItems = await fetchCloudExtractedItems(trimmed, customLabel, pageTitle, markScannedNsfw);
+    results.push(...cloudWatchItems);
+  }
+
   // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 4 randomized watch pages
-  if (allowSubpageCrawl && results.length < 2 && typeof rawText === 'string' && rawText.length > 0) {
+  if (
+    allowSubpageCrawl &&
+    results.length < 2 &&
+    !(triedCloudExtract && results.length > 0) &&
+    typeof rawText === 'string' &&
+    rawText.length > 0
+  ) {
     const candidateLinks = [];
     const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
     let lm;
@@ -5131,44 +5386,14 @@ async function scanUrlForVideos(targetUrl, customLabel = 'Web Scanner', allowSub
 
   // Cloud yt-dlp Extractor Fallback: unlock 1,800+ websites when connected to Private Cloud Server
   if (
+    !triedCloudExtract &&
     results.length === 0 &&
     allowSubpageCrawl &&
     isCloudBackendConfigured() &&
     /^https?:\/\//i.test(trimmed)
   ) {
-    try {
-      const extractEndpoint = `${cloudConfig.backendUrl}/extract?url=${encodeURIComponent(trimmed)}`;
-      const res = await fetchWithTimeout(extractEndpoint, 18000, {
-        headers: { Authorization: `Bearer ${cloudConfig.apiKey}` }
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.ok && Array.isArray(data.items)) {
-          for (const cItem of data.items) {
-            if (!cItem?.videoUrl) continue;
-            const fmt = detectVideoFormat(cItem.videoUrl, cItem.format || 'mp4').ext;
-            if (!isFormatAllowedBySettings(fmt)) continue;
-            results.push({
-              id: cItem.id || `cloud-${Date.now()}-${results.length}`,
-              title: cItem.title || pageTitle || 'Extracted Video',
-              videoUrl: cItem.videoUrl,
-              originalUrl: cItem.originalUrl || trimmed,
-              convertedUrl: cItem.convertedUrl || null,
-              format: fmt,
-              isAutoConverted: false,
-              duration: Number(cItem.duration) || 0,
-              isHd: Boolean(cItem.isHd),
-              tags: Array.isArray(cItem.tags) ? cItem.tags : [],
-              ...(markScannedNsfw || isKnownNsfwUrl(cItem.videoUrl) ? { isNsfw: true } : {}),
-              sourceName: cItem.sourceName || `${customLabel} (Cloud)`,
-              pageUrl: cItem.pageUrl || trimmed
-            });
-          }
-        }
-      }
-    } catch {
-      // Cloud extractor optional fallback
-    }
+    const cloudFallbackItems = await fetchCloudExtractedItems(trimmed, customLabel, pageTitle, markScannedNsfw);
+    results.push(...cloudFallbackItems);
   }
 
   if (markScannedNsfw) {
@@ -5729,6 +5954,7 @@ let continuousPullPromise = null;
 let continuousSourceCursor = 0;
 
 function setPlayerLoading(isLoading, message = 'Pulling random video...') {
+  if (typeof document === 'undefined') return;
   const overlay = document.getElementById('playerLoading');
   const textEl = document.getElementById('playerLoadingText');
   const emptyEl = document.getElementById('playerEmpty');
@@ -6430,6 +6656,7 @@ async function startProxiedHlsPlayback(videoEl, videoItem, m3u8Url, opts = {}) {
 }
 
 function updatePlayerUI() {
+  if (typeof document === 'undefined') return;
   const videoEl = document.getElementById('mainVideo');
   const titleEl = document.getElementById('videoTitle');
   const badgeEl = document.getElementById('videoSourceBadge');
@@ -6993,6 +7220,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
     if (rgId) {
       cachedRedgifsToken = null;
       cachedRedgifsTokenExpiry = 0;
+      cachedRedgifsTokenViaProxy = false;
       const resolvedRg = await resolveRedgifsUrlToMp4(
         `https://www.redgifs.com/watch/${encodeURIComponent(rgId.toLowerCase())}`,
         videoItem.title || 'RedGIFs HD Clip'
@@ -7023,6 +7251,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
           if (/redgifs\.com/i.test(destUrl)) {
             cachedRedgifsToken = null;
             cachedRedgifsTokenExpiry = 0;
+            cachedRedgifsTokenViaProxy = false;
             const rgFromPost = await resolveRedgifsUrlToMp4(destUrl, videoItem.title);
             const rgCandidates = [rgFromPost?.videoUrl, rgFromPost?.convertedUrl].filter(isUsableRescueUrl);
             if (rgCandidates.length > 0) {
@@ -7256,7 +7485,7 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
         }
 
         const encodedHotlinkTarget = encodeURIComponent(hotlinkTarget);
-        const proxyUrls = isLocalDevOrigin()
+        const freeProxyUrls = isLocalDevOrigin()
           ? [
               `https://corsproxy.io/?${encodedHotlinkTarget}`,
               `https://api.cors.lol/?url=${encodedHotlinkTarget}`,
@@ -7267,10 +7496,19 @@ async function rescueDeadVideoStream(videoItem, opts = {}) {
               `https://api.codetabs.com/v1/proxy?quest=${encodedHotlinkTarget}`,
               `https://corsproxy.io/?${encodedHotlinkTarget}`
             ];
+        const cloudProxyCandidate = isCloudBackendConfigured()
+          ? buildCloudProxyUrl(hotlinkTarget, pageUrl)
+          : '';
+        const proxyUrls = cloudProxyCandidate
+          ? [cloudProxyCandidate, ...freeProxyUrls]
+          : freeProxyUrls;
 
         for (const proxyUrl of proxyUrls) {
+          const isCloudCandidate = Boolean(cloudProxyCandidate && proxyUrl === cloudProxyCandidate);
           const proxyController = typeof AbortController !== 'undefined' ? new AbortController() : null;
-          const proxyTimer = proxyController ? setTimeout(() => proxyController.abort(), 2500) : null;
+          const proxyTimer = proxyController
+            ? setTimeout(() => proxyController.abort(), isCloudCandidate ? 5000 : 2500)
+            : null;
           proxyTimer?.unref?.();
           try {
             const pRes = proxyController
@@ -7922,11 +8160,140 @@ function renderSourcesList() {
     .join('');
 }
 
+const BARE_URL_PULL_REGEX =
+  /^(?:www\.|(?:[\w-]+\.)?(?:reddit\.com|redd\.it|redgifs\.com|vimeo\.com|dailymotion\.com|dai\.ly|streamable\.com|x\.com|twitter\.com|youtube\.com|youtu\.be|tiktok\.com|instagram\.com|eporner\.com|spankbang\.com|xhamster\.com|xvideos\.com|pornhub\.com|archive\.org)\/)\S+/i;
+
+async function pullSmartInputToPlayer(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return [];
+
+  // 1. Direct URL or watch-page link pasted into the Player bar
+  const isHttpUrl = /^https?:\/\/\S+/i.test(trimmed);
+  const isBareWatchUrl = !isHttpUrl && !/\s/.test(trimmed) && BARE_URL_PULL_REGEX.test(trimmed);
+  if (isHttpUrl || isBareWatchUrl) {
+    const targetUrl = isHttpUrl ? trimmed : `https://${trimmed}`;
+    if (!settings.allowNsfw && isKnownNsfwUrl(targetUrl)) {
+      showToast('🔒 Enable 18+ Mode in Sources to pull adult links');
+      return [];
+    }
+    const pullGen = modeGeneration;
+    switchTab('view-discover');
+    setPlayerLoading(true);
+    try {
+      const found = await scanUrlForVideos(targetUrl, 'Direct Pull');
+      if (pullGen !== modeGeneration) return [];
+      const allowed = (Array.isArray(found) ? found : []).filter(
+        (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+      );
+      if (allowed.length === 0) {
+        showToast(
+          isCloudBackendConfigured()
+            ? 'No playable video stream found on that link.'
+            : 'No direct stream found — connect Cloud Server for 1,800+ site extraction!'
+        );
+        return [];
+      }
+      const startIdx = videoQueue.length;
+      for (const item of allowed) {
+        videoQueue.push(item);
+        seenUrls.add(item.videoUrl);
+      }
+      currentIndex = startIdx;
+      updatePlayerUI();
+      showToast(
+        allowed.length === 1
+          ? `🎬 Pulled "${allowed[0].title || 'Video'}"`
+          : `🎬 Pulled ${allowed.length} videos into Player!`
+      );
+      return allowed;
+    } catch {
+      showToast('Could not pull video from that URL.');
+      return [];
+    } finally {
+      setPlayerLoading(false);
+    }
+  }
+
+  // 2. Direct r/Subreddit shorthand (e.g. "r/Unexpected" or "/r/oddlysatisfying")
+  const subMatch = trimmed.match(/^\/?r\/([A-Za-z0-9_+]+)$/i);
+  if (subMatch?.[1]) {
+    const subName = subMatch[1];
+    const pullGen = modeGeneration;
+    switchTab('view-discover');
+    setPlayerLoading(true);
+    try {
+      const subVideos = await fetchSubredditVideos(subName);
+      if (pullGen !== modeGeneration) return [];
+      const fresh = shuffleArray(
+        (Array.isArray(subVideos) ? subVideos : []).filter(
+          (item) => item && item.videoUrl && !seenUrls.has(item.videoUrl) && (settings.allowNsfw || !item.isNsfw)
+        )
+      ).slice(0, 10);
+      const batch = fresh.length > 0 ? fresh : (subVideos || []).slice(0, 5);
+      if (batch.length > 0) {
+        const startIdx = videoQueue.length;
+        for (const item of batch) {
+          videoQueue.push(item);
+          seenUrls.add(item.videoUrl);
+        }
+        currentIndex = startIdx;
+        updatePlayerUI();
+        showToast(`📡 Pulled ${batch.length} clip${batch.length === 1 ? '' : 's'} from r/${subName}`);
+        return batch;
+      }
+    } catch {
+      // fall through to keyword search
+    } finally {
+      setPlayerLoading(false);
+    }
+    return await pullRandomVideos(1, subName);
+  }
+
+  // 3. Standard keyword / topic search across active engines
+  return await pullRandomVideos(1, trimmed);
+}
+
+function queueSearchResultsToPlayer(opts = {}) {
+  const startReels = Boolean(opts.startReels);
+  if (!Array.isArray(lastSearchResults) || lastSearchResults.length === 0) {
+    showToast('Search or scan a URL first to load results');
+    return 0;
+  }
+  const allowed = lastSearchResults.filter(
+    (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+  );
+  if (allowed.length === 0) {
+    showToast('No playable videos in current search results');
+    return 0;
+  }
+  const startIdx = videoQueue.length;
+  for (const item of allowed) {
+    videoQueue.push(item);
+    seenUrls.add(item.videoUrl);
+  }
+  currentIndex = startIdx;
+  switchTab('view-discover');
+  updatePlayerUI();
+  if (startReels && !isReelsFullscreen) {
+    toggleReelsFullscreen(true);
+  }
+  showToast(
+    startReels
+      ? `📱 Swiping ${allowed.length} search clip${allowed.length === 1 ? '' : 's'} in Reels`
+      : `▶ Queued ${allowed.length} search clip${allowed.length === 1 ? '' : 's'} in Player`
+  );
+  return allowed.length;
+}
+
 function renderSearchResults(items) {
   lastSearchResults = items;
   const countEl = document.getElementById('searchResultsCount');
   const listEl = document.getElementById('searchResultsList');
+  const actionsBarEl = document.getElementById('searchResultsActionsBar');
   if (countEl) countEl.textContent = `${items.length} video${items.length === 1 ? '' : 's'}`;
+  if (actionsBarEl) {
+    actionsBarEl.classList?.toggle('hidden', items.length === 0);
+  }
   if (!listEl) return;
 
   if (items.length === 0) {
@@ -8095,6 +8462,7 @@ async function renderVaultList() {
 }
 
 function switchTab(targetId) {
+  if (typeof document === 'undefined') return;
   document.querySelectorAll('.tab-view').forEach((sec) => {
     sec.classList.toggle('active', sec.id === targetId);
   });
@@ -8286,6 +8654,9 @@ if (typeof document !== 'undefined') {
   if (vaultFilterSelect) vaultFilterSelect.value = settings.vaultFilter || 'all';
   syncAgeGateUI();
   syncCloudBackendUI();
+  if (isCloudBackendConfigured()) {
+    testCloudBackendConnection().catch(() => {});
+  }
   if (autoPlayToggle) autoPlayToggle.checked = Boolean(settings.autoPlay);
   if (formatModeSelect) formatModeSelect.value = settings.formatMode || 'all';
   if (autoConvertToggle) autoConvertToggle.checked = settings.autoConvert !== false;
@@ -8612,13 +8983,34 @@ if (typeof document !== 'undefined') {
     });
   });
 
-  // Quick Keyword Search on Player Tab
+  // Smart Pull Bar on Player Tab (Keyword, r/Subreddit, or Pasted Video/Page URL)
   document.getElementById('quickSearchForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const input = document.getElementById('quickSearchInput');
     const kw = input?.value?.trim();
     if (!kw) return;
-    await pullRandomVideos(1, kw);
+    await pullSmartInputToPlayer(kw);
+  });
+
+  document.getElementById('quickPasteBtn')?.addEventListener('click', async () => {
+    const input = document.getElementById('quickSearchInput');
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.readText) {
+      try {
+        const clipText = (await navigator.clipboard.readText())?.trim();
+        if (clipText) {
+          if (input) input.value = clipText;
+          await pullSmartInputToPlayer(clipText);
+          return;
+        }
+        showToast('Clipboard is empty — copy a video link or topic first');
+        input?.focus?.();
+        return;
+      } catch {
+        // iOS Safari may require manual paste if clipboard read permission was dismissed
+      }
+    }
+    input?.focus?.();
+    showToast('Tap the box and hit Paste, then press Pull');
   });
 
   // Player Controls: Shuffle, Next, Prev
@@ -8942,6 +9334,15 @@ if (typeof document !== 'undefined') {
       renderSearchResults([]);
       showToast('Could not scan that URL due to site security restrictions.');
     }
+  });
+
+  // Batch Play / Swipe All Search Results in Player
+  document.getElementById('playAllSearchBtn')?.addEventListener('click', () => {
+    queueSearchResultsToPlayer({ startReels: false });
+  });
+
+  document.getElementById('reelsAllSearchBtn')?.addEventListener('click', () => {
+    queueSearchResultsToPlayer({ startReels: true });
   });
 
   // Delegate clicks on Search Results list
@@ -9568,6 +9969,15 @@ if (typeof document !== 'undefined') {
     showToast('Disconnected Private Cloud Server');
   });
 
+  document.getElementById('playerCloudBadgeBtn')?.addEventListener('click', async () => {
+    switchTab('view-sources');
+    document.getElementById('cloudServerSection')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    if (isCloudBackendConfigured()) {
+      await testCloudBackendConnection().catch(() => {});
+      await fetchPlexJobs().catch(() => {});
+    }
+  });
+
   document.getElementById('vaultList')?.addEventListener('click', async (e) => {
     const btn = e.target.closest('button[data-action]');
     if (!btn) return;
@@ -9668,6 +10078,7 @@ if (typeof module !== 'undefined' && module.exports) {
     searchInternetArchive,
     searchWikimediaVideos,
     extractRedgifsId,
+    fetchRedgifsApiJson,
     resolveRedgifsUrlToMp4,
     getSubredditNicheQuery,
     fetchDirectEpornerVideos,
@@ -9690,6 +10101,8 @@ if (typeof module !== 'undefined' && module.exports) {
     interleaveVideoBuckets,
     pullFromSource,
     pullRandomVideos,
+    pullSmartInputToPlayer,
+    queueSearchResultsToPlayer,
     runContinuousPullCycle,
     startContinuousBackgroundPuller,
     stopContinuousBackgroundPuller,
@@ -9790,6 +10203,7 @@ if (typeof module !== 'undefined' && module.exports) {
     clearCloudBackendConfig,
     syncCloudBackendUI,
     testCloudBackendConnection,
+    pollPlexJobUntilDone,
     sendVideoToPlex,
     fetchPlexJobs,
     renderPlexJobsBox,
@@ -9810,8 +10224,10 @@ if (typeof module !== 'undefined' && module.exports) {
       if (patch.resetRedgifsToken) {
         cachedRedgifsToken = null;
         cachedRedgifsTokenExpiry = 0;
+        cachedRedgifsTokenViaProxy = false;
       }
       if (patch.cloudConfig && typeof patch.cloudConfig === 'object') {
+        lastCloudStatusOverride = null;
         const normUrl = normalizeCloudBackendUrl(patch.cloudConfig.backendUrl || '');
         const cleanKey = String(patch.cloudConfig.apiKey || '').trim();
         cloudConfig = {
@@ -9865,3 +10281,4 @@ if (typeof module !== 'undefined' && module.exports) {
     }
   };
 }
+

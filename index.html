@@ -22,7 +22,7 @@
   <link rel="preconnect" href="https://gvideo.eporner.com" crossorigin />
   <link rel="dns-prefetch" href="https://www.reddit.com" />
   <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
-  <link rel="stylesheet" href="./styles.css?v=27" />
+  <link rel="stylesheet" href="./styles.css?v=28" />
 </head>
 <body class="app-locked">
   <!-- Full-Screen Passcode Gate Overlay -->
@@ -97,14 +97,23 @@
     <main class="app-main">
       <!-- TAB 1: DISCOVER / PLAYER -->
       <section id="view-discover" class="tab-view active">
-        <!-- Quick Keyword Search Bar -->
+        <!-- Quick Keyword / Subreddit / Paste Link Bar -->
         <form id="quickSearchForm" class="quick-search-bar">
           <input
             type="search"
             id="quickSearchInput"
-            placeholder="Search any keyword/topic across the web..."
+            placeholder="Keyword, r/sub, or paste any video URL..."
             autocomplete="off"
           />
+          <button
+            type="button"
+            id="quickPasteBtn"
+            class="btn-secondary btn-compact"
+            title="Paste video link or keyword from clipboard"
+            aria-label="Paste from clipboard"
+          >
+            📋 Paste
+          </button>
           <button type="submit" class="btn-primary btn-compact">Pull</button>
         </form>
 
@@ -213,7 +222,7 @@
             <div id="playerEmpty" class="player-overlay">
               <div class="empty-icon">🎲</div>
               <h2>Ready to Pull Videos</h2>
-              <p>Tap <strong>Shuffle Random</strong> below or enter any keyword above to pull &amp; download free videos.</p>
+              <p>Tap <strong>Shuffle Random</strong>, paste any video/post link above, or enter a keyword to pull videos.</p>
             </div>
           </div>
 
@@ -225,6 +234,14 @@
                   <span class="source-badge" id="videoSourceBadge">Ready</span>
                   <span class="format-badge hidden" id="videoFormatBadge">MP4</span>
                   <span class="prebuffer-badge hidden" id="prebufferBadge">⚡ Next Preloaded</span>
+                  <button
+                    type="button"
+                    id="playerCloudBadgeBtn"
+                    class="cloud-pill-btn"
+                    title="Cloud + Proxy + Plex Status (Tap to view server &amp; Plex queue)"
+                  >
+                    ☁️ Connect Cloud
+                  </button>
                 </div>
                 <span class="queue-counter" id="queueCounter">0 in queue</span>
               </div>
@@ -437,6 +454,14 @@
             <h2>Search &amp; Scan Results</h2>
             <span id="searchResultsCount" class="badge-subtle">0 videos</span>
           </div>
+          <div id="searchResultsActionsBar" class="vault-playback-bar hidden">
+            <button type="button" id="playAllSearchBtn" class="btn-accent btn-mini">
+              ▶ Watch All in Player
+            </button>
+            <button type="button" id="reelsAllSearchBtn" class="btn-secondary btn-mini">
+              📱 Swipe Results in Reels
+            </button>
+          </div>
           <div id="searchResultsList" class="video-grid-list">
             <p class="muted-center">Run a keyword search or webpage scan above to see matching videos.</p>
           </div>
@@ -445,6 +470,44 @@
 
       <!-- TAB 3: CUSTOM SOURCES MENU -->
       <section id="view-sources" class="tab-view">
+        <div class="card-section" id="cloudServerSection">
+          <div class="section-header-row">
+            <h2>☁️ Private Cloud Server &amp; Plex Vault</h2>
+            <span id="cloudStatusBadge" class="badge-subtle">⚪ Optional • Not Connected</span>
+          </div>
+          <p class="section-desc">
+            Connect your private Contabo + Webshare + Plex server for rate-limit-free residential proxy pulls, 1,800+ site <code>yt-dlp</code> extraction, and 1-tap <strong>🎬 Send to Plex</strong> (auto-sorted into <em>ReelVault Clips</em> or hidden <em>ReelVault 18+ Vault</em>).
+          </p>
+          <div class="stack-form">
+            <input
+              type="url"
+              id="cloudBackendUrlInput"
+              placeholder="Backend HTTPS URL (e.g. https://85-239-249-225.nip.io)"
+              autocomplete="off"
+              aria-label="Cloud Backend HTTPS URL"
+            />
+            <input
+              type="password"
+              id="cloudApiKeyInput"
+              placeholder="API Secret Key (e.g. rv_...)"
+              autocomplete="off"
+              aria-label="Cloud API Secret Key"
+            />
+            <div class="cloud-actions-row">
+              <button type="button" id="saveCloudConfigBtn" class="btn-accent btn-mini">
+                🔌 Connect &amp; Test Server
+              </button>
+              <button type="button" id="refreshPlexJobsBtn" class="btn-secondary btn-mini hidden">
+                📋 Plex Queue
+              </button>
+              <button type="button" id="clearCloudConfigBtn" class="btn-text-danger hidden">
+                Disconnect
+              </button>
+            </div>
+            <div id="cloudJobsBox" class="cloud-jobs-box hidden" aria-live="polite"></div>
+          </div>
+        </div>
+
         <div class="card-section">
           <h2>➕ Add Custom Source</h2>
           <p class="section-desc">
@@ -531,44 +594,6 @@
             Toggle which sources <strong>Shuffle Random</strong> pulls from. When <strong>🔞 18+ On</strong> is active, all safe sources are hidden and only 18+ sources are used.
           </p>
           <div id="sourcesList" class="sources-list"></div>
-        </div>
-
-        <div class="card-section" id="cloudServerSection">
-          <div class="section-header-row">
-            <h2>☁️ Private Cloud Server &amp; Plex Vault</h2>
-            <span id="cloudStatusBadge" class="badge-subtle">⚪ Optional • Not Connected</span>
-          </div>
-          <p class="section-desc">
-            Connect your private Contabo + Webshare + Plex server for rate-limit-free residential proxy pulls, 1,800+ site <code>yt-dlp</code> extraction, and 1-tap <strong>🎬 Send to Plex</strong> (auto-sorted into <em>ReelVault Clips</em> or hidden <em>ReelVault 18+ Vault</em>).
-          </p>
-          <div class="stack-form">
-            <input
-              type="url"
-              id="cloudBackendUrlInput"
-              placeholder="Backend HTTPS URL (e.g. https://85-239-249-225.nip.io)"
-              autocomplete="off"
-              aria-label="Cloud Backend HTTPS URL"
-            />
-            <input
-              type="password"
-              id="cloudApiKeyInput"
-              placeholder="API Secret Key (e.g. rv_...)"
-              autocomplete="off"
-              aria-label="Cloud API Secret Key"
-            />
-            <div class="cloud-actions-row">
-              <button type="button" id="saveCloudConfigBtn" class="btn-accent btn-mini">
-                🔌 Connect &amp; Test Server
-              </button>
-              <button type="button" id="refreshPlexJobsBtn" class="btn-secondary btn-mini hidden">
-                📋 Plex Queue
-              </button>
-              <button type="button" id="clearCloudConfigBtn" class="btn-text-danger hidden">
-                Disconnect
-              </button>
-            </div>
-            <div id="cloudJobsBox" class="cloud-jobs-box hidden" aria-live="polite"></div>
-          </div>
         </div>
 
         <div class="card-section">
@@ -863,6 +888,6 @@
     </div>
   </div>
 
-  <script src="./app.js?v=27"></script>
+  <script src="./app.js?v=28"></script>
 </body>
 </html>
