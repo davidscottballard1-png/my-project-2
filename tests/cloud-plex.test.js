@@ -503,6 +503,286 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
       await new Promise((resolve) => server.close(resolve));
     }
   });
+
+  it('rejects null, array, non-primitive fields, and >64KB payloads on POST /plex/save with HTTP 400 without crashing or ECONNRESET', async () => {
+    const server = bridge.createBridgeServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const base = `http://127.0.0.1:${port}`;
+    const headers = {
+      Authorization: 'Bearer rv_unit_test_secret_key_123456',
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      for (const badBody of [
+        'null',
+        '[]',
+        '{"url":{"toString":null}}',
+        '{"url":"https://1.1.1.1/clip.mp4","title":{"bad":1},"sourceName":["arr"]}'
+      ]) {
+        const res = await fetch(`${base}/plex/save`, { method: 'POST', headers, body: badBody });
+        assert.ok(res.status === 400 || res.status === 202, `Unexpected status ${res.status} for ${badBody}`);
+        if (badBody === 'null' || badBody === '[]' || badBody.includes('toString')) {
+          assert.strictEqual(res.status, 400);
+        }
+      }
+
+      // 200 KB oversized payload must return clean HTTP 400 JSON rather than ECONNRESET
+      const hugePayload = JSON.stringify({
+        url: 'https://example.com/video.mp4',
+        title: 'A'.repeat(200 * 1024)
+      });
+      const hugeRes = await fetch(`${base}/plex/save`, {
+        method: 'POST',
+        headers,
+        body: hugePayload
+      });
+      assert.strictEqual(hugeRes.status, 400);
+      const hugeJson = await hugeRes.json();
+      assert.strictEqual(hugeJson.ok, false);
+      assert.match(hugeJson.error, /too large/i);
+
+      // Server must remain alive and responsive afterwards
+      const alive = await fetch(`${base}/health`);
+      assert.strictEqual(alive.status, 200);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('aborts extensionless video/* upstream downloads on client disconnect, blocks SSRF redirects before curl fallback, and rejects failed curl (HTTP 000)', async () => {
+    const { spawn } = require('node:child_process');
+    const net = require('node:net');
+
+    let upstreamChunksSent = 0;
+    let upstreamAborted = false;
+
+    const mockUpstream = http.createServer((req, res) => {
+      if (req.url === '/ssrf-redirect') {
+        res.writeHead(302, { Location: 'http://127.0.0.1:32400/:/prefs' });
+        return res.end();
+      }
+      if (req.url === '/reset-meta') {
+        req.socket.destroy();
+        return;
+      }
+      if (req.url === '/dynamic-video-stream') {
+        res.writeHead(200, { 'Content-Type': 'video/mp4' });
+        const iv = setInterval(() => {
+          if (res.destroyed) {
+            clearInterval(iv);
+            return;
+          }
+          upstreamChunksSent++;
+          res.write(Buffer.alloc(16384, 0x41));
+          if (upstreamChunksSent >= 30) {
+            clearInterval(iv);
+            res.end();
+          }
+        }, 25);
+        req.on('close', () => {
+          if (upstreamChunksSent < 30) upstreamAborted = true;
+          clearInterval(iv);
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockUpstream.listen(0, '127.0.0.1', resolve));
+    const upPort = mockUpstream.address().port;
+
+    // Pick a guaranteed-closed port for RESIDENTIAL_PROXY_URL so curl exits non-zero with http_code 000
+    const closedProxyPort = await new Promise((resolve) => {
+      const s = net.createServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = s.address().port;
+        s.close(() => resolve(p));
+      });
+    });
+
+    const bridgePort = await new Promise((resolve) => {
+      const s = net.createServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = s.address().port;
+        s.close(() => resolve(p));
+      });
+    });
+
+    // Spawn child bridge with custom DNS preload mapping safe-public.example -> 127.0.0.1 only at connect time
+    // while dns.promises.lookup returns public 93.184.216.34 so assertSafePublicUrl passes for initial hop
+    const preloadCode = `
+      const dns = require('node:dns');
+      const origLookup = dns.promises.lookup;
+      dns.promises.lookup = async (host, opts) => {
+        if (host === 'safe-public.example') {
+          return opts && opts.all ? [{ address: '93.184.216.34', family: 4 }] : { address: '93.184.216.34', family: 4 };
+        }
+        return origLookup.call(dns.promises, host, opts);
+      };
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (input, init) => {
+        const u = new URL(String(input));
+        if (u.hostname === 'safe-public.example') {
+          u.hostname = '127.0.0.1';
+          u.port = '${upPort}';
+          return origFetch(u.href, init);
+        }
+        return origFetch(input, init);
+      };
+    `;
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const tmpPreload = path.join(os.tmpdir(), `rv-bridge-preload-${process.pid}-${Date.now()}.cjs`);
+    fs.writeFileSync(tmpPreload, preloadCode);
+
+    const child = spawn(process.execPath, ['-r', tmpPreload, 'server/bridge.js'], {
+      env: {
+        ...process.env,
+        PORT: String(bridgePort),
+        REELVAULT_API_KEY: 'rv_child_test_key',
+        RESIDENTIAL_PROXY_URL: `http://user:pass@127.0.0.1:${closedProxyPort}`,
+        MEDIA_SAFE_DIR: path.join(os.tmpdir(), `rv-safe-${process.pid}`),
+        MEDIA_NSFW_DIR: path.join(os.tmpdir(), `rv-nsfw-${process.pid}`)
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('bridge startup timeout')), 5000);
+      child.stdout.on('data', (b) => {
+        if (b.toString().includes('Listening on')) {
+          clearTimeout(t);
+          resolve();
+        }
+      });
+      child.once('exit', (c) => {
+        clearTimeout(t);
+        reject(new Error(`bridge exited ${c}`));
+      });
+    });
+
+    try {
+      const base = `http://127.0.0.1:${bridgePort}`;
+
+      // 1. SSRF redirect to 127.0.0.1:32400 must return HTTP 400 (never fall back to curl or return 200)
+      const ssrfRedir = await fetch(
+        `${base}/proxy?key=rv_child_test_key&url=${encodeURIComponent('http://safe-public.example/ssrf-redirect')}`
+      );
+      assert.strictEqual(ssrfRedir.status, 400);
+
+      // 2. Upstream TCP reset + failed curl (http_code 000) must return HTTP 502 (never false HTTP 200)
+      const failedCurl = await fetch(
+        `${base}/proxy?key=rv_child_test_key&url=${encodeURIComponent('http://safe-public.example/reset-meta')}`
+      );
+      assert.strictEqual(failedCurl.status, 502);
+
+      // 3. Extensionless video/mp4 stream in Path 1 must abort upstream when client disconnects early
+      await new Promise((resolve, reject) => {
+        const req = http.get(
+          `${base}/proxy?key=rv_child_test_key&url=${encodeURIComponent('http://safe-public.example/dynamic-video-stream')}`,
+          (res) => {
+            assert.strictEqual(res.statusCode, 200);
+            res.once('data', () => {
+              req.destroy();
+              resolve();
+            });
+          }
+        );
+        req.on('error', () => resolve());
+        setTimeout(() => reject(new Error('stream timeout')), 4000).unref();
+      });
+
+      await new Promise((r) => setTimeout(r, 200));
+      assert.strictEqual(upstreamAborted, true, 'Upstream stream must abort immediately when client disconnects');
+      assert.ok(upstreamChunksSent < 10, `Expected <10 chunks sent after disconnect, got ${upstreamChunksSent}`);
+    } finally {
+      child.kill('SIGTERM');
+      try {
+        fs.unlinkSync(tmpPreload);
+      } catch {}
+      await new Promise((resolve) => mockUpstream.close(resolve));
+    }
+  });
+
+  it('handles literal % in direct video filenames without URIError and refreshes cloudSearchCache when limit increases', async () => {
+    // 1. Literal % in direct adult .mp4 URL
+    const pctItems = await bridge.executeCloudKeywordSearch(
+      'percentclip',
+      { isNsfw: true, limit: 4 },
+      {
+        assertSafeUrl: async (u) => new URL(u),
+        fetchText: async (url) => {
+          if (url.includes('html.duckduckgo.com')) {
+            return '<a href="https://cdn.spankbang.com/clips/100%_real_nsfw_hd.mp4">Direct Adult MP4</a>';
+          }
+          return '';
+        },
+        runYtDlpUrl: async () => ({})
+      }
+    );
+    assert.strictEqual(pctItems.length, 1);
+    assert.strictEqual(pctItems[0].title, '100%_real_nsfw_hd.mp4');
+
+    // 2. Small limit=1 query followed by limit=4 must not return truncated 1-item cache
+    let searchCalls = 0;
+    const mockDeps = {
+      assertSafeUrl: async (u) => new URL(u),
+      fetchText: async () => '',
+      runYtDlpSearch: async (_q, count) => {
+        searchCalls++;
+        const entries = [];
+        for (let i = 1; i <= count; i++) {
+          entries.push({
+            id: `lim_${i}`,
+            title: `Clip ${i}`,
+            webpage_url: `https://www.youtube.com/watch?v=lim_${i}`,
+            age_limit: 0,
+            duration: 30,
+            extractor_key: 'Youtube',
+            formats: [
+              {
+                url: `https://rr1---sn.googlevideo.com/videoplayback?id=${i}`,
+                ext: 'mp4',
+                vcodec: 'avc1.42001E',
+                acodec: 'mp4a.40.2',
+                height: 360
+              }
+            ]
+          });
+        }
+        return { entries };
+      }
+    };
+
+    const uniqueQuery = `cache_limit_regression_${Date.now()}`;
+    const smallHit = await bridge.executeCloudKeywordSearch(
+      uniqueQuery,
+      { isNsfw: false, limit: 1, forceCache: true },
+      mockDeps
+    );
+    assert.strictEqual(smallHit.length, 1);
+    assert.strictEqual(searchCalls, 1);
+
+    const largerHit = await bridge.executeCloudKeywordSearch(
+      uniqueQuery,
+      { isNsfw: false, limit: 4, forceCache: true },
+      mockDeps
+    );
+    assert.strictEqual(largerHit.length, 4, 'limit=4 after limit=1 must fetch full 4 items rather than serving 1-item cache');
+    assert.strictEqual(searchCalls, 2);
+
+    const cachedHit = await bridge.executeCloudKeywordSearch(
+      uniqueQuery,
+      { isNsfw: false, limit: 3, forceCache: true },
+      mockDeps
+    );
+    assert.strictEqual(cachedHit.length, 3);
+    assert.strictEqual(searchCalls, 2, 'limit=3 after limit=4 must be served from cache');
+  });
 });
 
 describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
@@ -973,6 +1253,106 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
     const strictRedditHits = await app.searchRedditVideosByKeyword('yoga');
     assert.strictEqual(strictRedditHits.length, 1, 'over_18: false Reddit posts must never leak into 18+ keyword search');
     assert.ok(strictRedditHits[0].videoUrl.includes('v.redd.it/nsfw999'));
+  });
+
+  it('strips /search suffix in normalizeCloudBackendUrl, unsticks #sendToPlexBtn on mid-poll Disconnect, and blocks adult ?scan= links & mode races in Safe Mode', async () => {
+    // 1. /search suffix normalization (v29 endpoint)
+    assert.strictEqual(
+      app.normalizeCloudBackendUrl('https://85-239-249-225.nip.io/search'),
+      'https://85-239-249-225.nip.io'
+    );
+    assert.strictEqual(
+      app.normalizeCloudBackendUrl('http://127.0.0.1:8787/search/'),
+      'http://127.0.0.1:8787'
+    );
+
+    // 2. Disconnecting Cloud Server mid-poll resolves pollPlexJobUntilDone immediately and resets #sendToPlexBtn
+    const origDocument = globalThis.document;
+    const origWindow = globalThis.window;
+    const mockSendBtn = {
+      dataset: {},
+      textContent: '🎬 Send Video to My Plex Server',
+      disabled: false
+    };
+    const mockSearchList = { innerHTML: '' };
+    const mockScanInput = { value: '' };
+
+    globalThis.document = {
+      getElementById: (id) => {
+        if (id === 'sendToPlexBtn') return mockSendBtn;
+        if (id === 'searchResultsList') return mockSearchList;
+        if (id === 'urlScanInput') return mockScanInput;
+        return null;
+      },
+      querySelectorAll: () => []
+    };
+
+    try {
+      app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+      app.setAppState({
+        videoQueue: [{ id: 'v1', title: 'Clip', videoUrl: 'https://cdn.example.org/a.mp4' }],
+        currentIndex: 0
+      });
+
+      globalThis.fetch = async (url) => {
+        if (String(url).endsWith('/plex/jobs')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              jobs: [{ id: 'job_hang_test', status: 'downloading', library: 'ReelVault Clips' }]
+            })
+          };
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      };
+
+      const pollPromise = app.pollPlexJobUntilDone('job_hang_test', 'ReelVault Clips', {
+        intervalMs: 30000,
+        maxAttempts: 5
+      });
+
+      // Wait briefly for attempt 0 to set dataset.plexPolling = '1' and enter 30s timer
+      await new Promise((r) => setTimeout(r, 30));
+      assert.strictEqual(mockSendBtn.dataset.plexPolling, '1');
+      assert.match(mockSendBtn.textContent, /Downloading Video to Cloud Plex/);
+
+      // Disconnect mid-poll: pollPromise must resolve immediately (<100ms, NOT hang 30s) and reset button
+      const t0 = Date.now();
+      app.clearCloudBackendConfig();
+      const pollResult = await pollPromise;
+      const elapsed = Date.now() - t0;
+
+      assert.strictEqual(pollResult, null);
+      assert.ok(elapsed < 500, `Expected immediate cancellation on Disconnect, took ${elapsed}ms`);
+      assert.strictEqual(mockSendBtn.dataset.plexPolling, undefined);
+      assert.strictEqual(mockSendBtn.textContent, '🎬 Send Video to My Plex Server');
+
+      // 3. ?scan= bookmarklet / deep link must block known adult URLs in Safe Mode without scanning
+      app.settings.allowNsfw = false;
+      let scanFetchCalled = false;
+      globalThis.fetch = async () => {
+        scanFetchCalled = true;
+        return { ok: true, status: 200, text: async () => '' };
+      };
+      globalThis.window = {
+        location: {
+          search: '?scan=' + encodeURIComponent('https://www.redgifs.com/watch/testadultclip'),
+          origin: 'https://davidscottballard1-png.github.io',
+          pathname: '/my-project-2/'
+        }
+      };
+
+      const handled = app.initBookmarkletAndUrlParams();
+      assert.strictEqual(handled, true);
+      assert.strictEqual(scanFetchCalled, false, 'Safe Mode must block adult ?scan= URLs before fetching');
+      assert.strictEqual(app.getAppState().lastSearchResults.length, 0);
+      assert.match(mockSearchList.innerHTML, /Enable 18\+ Mode/);
+    } finally {
+      globalThis.document = origDocument;
+      globalThis.window = origWindow;
+    }
   });
 });
 

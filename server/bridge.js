@@ -95,19 +95,25 @@ function isPrivateOrReservedIp(ip) {
   return true;
 }
 
+function createSsrfError(message) {
+  const err = new Error(message);
+  err.isSsrfBlock = true;
+  return err;
+}
+
 async function assertSafePublicUrl(rawUrl) {
   let parsed;
   try {
     parsed = new URL(String(rawUrl || '').trim());
   } catch {
-    throw new Error('Invalid target URL');
+    throw createSsrfError('Invalid target URL');
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Only http:// and https:// URLs are supported');
+    throw createSsrfError('Only http:// and https:// URLs are supported');
   }
   if (parsed.username || parsed.password) {
-    throw new Error('Credentials in target URL are not permitted');
+    throw createSsrfError('Credentials in target URL are not permitted');
   }
 
   const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -118,12 +124,12 @@ async function assertSafePublicUrl(rawUrl) {
     host.endsWith('.internal') ||
     host.endsWith('.localhost')
   ) {
-    throw new Error('Blocked internal hostname');
+    throw createSsrfError('Blocked internal hostname');
   }
 
   if (net.isIP(host)) {
     if (isPrivateOrReservedIp(host)) {
-      throw new Error('Blocked private or reserved IP address');
+      throw createSsrfError('Blocked private or reserved IP address');
     }
     return parsed;
   }
@@ -141,7 +147,7 @@ async function assertSafePublicUrl(rawUrl) {
 
   for (const rec of records) {
     if (!rec?.address || isPrivateOrReservedIp(rec.address)) {
-      throw new Error('Target resolves to a private or reserved IP address');
+      throw createSsrfError('Target resolves to a private or reserved IP address');
     }
   }
 
@@ -259,6 +265,10 @@ function fetchViaCurlProxy(targetUrl, referer, timeoutSec = 14, upstreamAuth = '
     const args = [
       '-sS',
       '-L',
+      '--proto',
+      '=http,https',
+      '--proto-redir',
+      '=http,https',
       '--max-redirs',
       '4',
       '--max-time',
@@ -303,17 +313,23 @@ function fetchViaCurlProxy(targetUrl, referer, timeoutSec = 14, upstreamAuth = '
       const full = Buffer.concat(chunks);
       const markerBuf = Buffer.from(`\n${marker}`);
       const idx = full.lastIndexOf(markerBuf);
-      if (code !== 0 && idx < 0) {
-        return reject(new Error(errText.trim() || `curl exited with code ${code}`));
-      }
       if (idx < 0) {
+        if (code !== 0) {
+          return reject(new Error(errText.trim() || `curl exited with code ${code}`));
+        }
         return resolve({ status: 200, contentType: 'text/plain; charset=utf-8', body: full });
       }
       const body = full.subarray(0, idx);
       const meta = full.subarray(idx + markerBuf.length).toString('utf8').trim();
       const [codeStr, ct] = meta.split('|');
+      const statusNum = Number(codeStr);
+      if (code !== 0 || !Number.isFinite(statusNum) || statusNum < 100) {
+        return reject(
+          new Error(errText.trim() || `curl proxy request failed (exit ${code}, http ${codeStr || '000'})`)
+        );
+      }
       resolve({
-        status: Number(codeStr) || 200,
+        status: statusNum,
         contentType: ct || 'text/plain; charset=utf-8',
         body
       });
@@ -386,6 +402,14 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 12000);
+    const abortOnPrematureClose = () => {
+      if (!res.writableFinished) {
+        try {
+          controller.abort();
+        } catch {}
+      }
+    };
+    res.once('close', abortOnPrematureClose);
     try {
       const metaHeaders = {
         'User-Agent': BROWSER_UA,
@@ -406,10 +430,12 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
 
       const ct = upstream.headers.get('content-type') || 'text/plain; charset=utf-8';
       if (/^(?:video|audio)\//i.test(ct)) {
-        return pipeUpstreamStream(req, res, upstream);
+        res.off('close', abortOnPrematureClose);
+        return pipeUpstreamStream(req, res, upstream, controller);
       }
 
       const buf = Buffer.from(await upstream.arrayBuffer());
+      res.off('close', abortOnPrematureClose);
       const sampleText = buf.subarray(0, 2400).toString('utf8');
 
       if (
@@ -442,7 +468,11 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       return res.end(buf);
     } catch (err) {
       clearTimeout(timer);
-      if (RESIDENTIAL_PROXY_URL && !preferProxy) {
+      res.off('close', abortOnPrematureClose);
+      if (err?.isSsrfBlock) {
+        return sendJson(res, 400, { ok: false, error: err.message });
+      }
+      if (RESIDENTIAL_PROXY_URL && !preferProxy && !res.destroyed) {
         try {
           const rescued = await fetchViaCurlProxy(parsedTarget.href, referer, 14, upstreamAuth);
           setCorsHeaders(res);
@@ -454,18 +484,24 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
           return res.end(rescued.body);
         } catch {}
       }
-      return sendJson(res, 502, { ok: false, error: err.message || 'Upstream fetch failed' });
+      if (!res.headersSent && !res.destroyed) {
+        return sendJson(res, 502, { ok: false, error: err.message || 'Upstream fetch failed' });
+      }
+      return;
     }
   }
 
   // 2. Direct Unmetered Contabo Fiber Video Streaming (supports Range / 206 Partial Content for iOS Safari <video>)
   const controller = new AbortController();
   const connectTimer = setTimeout(() => controller.abort(), 18000);
-  req.on('close', () => {
-    try {
-      controller.abort();
-    } catch {}
-  });
+  const abortMediaOnClose = () => {
+    if (!res.writableFinished) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+  };
+  res.once('close', abortMediaOnClose);
 
   try {
     const headers = {
@@ -483,17 +519,20 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
       signal: controller.signal
     });
     clearTimeout(connectTimer);
-    return pipeUpstreamStream(req, res, upstream);
+    res.off('close', abortMediaOnClose);
+    return pipeUpstreamStream(req, res, upstream, controller);
   } catch (err) {
     clearTimeout(connectTimer);
-    if (!res.headersSent) {
-      return sendJson(res, 502, { ok: false, error: err.message || 'Upstream stream error' });
+    res.off('close', abortMediaOnClose);
+    if (!res.headersSent && !res.destroyed) {
+      const code = err?.isSsrfBlock ? 400 : 502;
+      return sendJson(res, code, { ok: false, error: err.message || 'Upstream stream error' });
     }
     res.destroy();
   }
 }
 
-function pipeUpstreamStream(req, res, upstream) {
+function pipeUpstreamStream(req, res, upstream, controller = null) {
   setCorsHeaders(res);
   const outHeaders = {
     'Content-Type': upstream.headers.get('content-type') || 'video/mp4',
@@ -510,6 +549,16 @@ function pipeUpstreamStream(req, res, upstream) {
     return res.end();
   }
   const nodeStream = Readable.fromWeb(upstream.body);
+  res.once('close', () => {
+    if (!res.writableFinished) {
+      try {
+        controller?.abort();
+      } catch {}
+      try {
+        nodeStream.destroy();
+      } catch {}
+    }
+  });
   nodeStream.on('error', () => {
     if (!res.writableEnded) res.destroy();
   });
@@ -762,14 +811,16 @@ async function fetchTextWithProxyFallback(targetUrl, timeoutMs = 9000) {
     const buf = Buffer.from(await res.arrayBuffer());
     const text = buf.toString('utf8');
     if (RESIDENTIAL_PROXY_URL && !preferProxy && isBlockedTextPayload(res.status, text)) {
-      const rescued = await fetchViaCurlProxy(parsed.href, referer, Math.ceil(timeoutMs / 1000));
-      if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
-        return rescued.body.toString('utf8');
-      }
+      try {
+        const rescued = await fetchViaCurlProxy(parsed.href, referer, Math.ceil(timeoutMs / 1000));
+        if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
+          return rescued.body.toString('utf8');
+        }
+      } catch {}
     }
     return res.ok ? text : '';
-  } catch {
-    if (RESIDENTIAL_PROXY_URL && !preferProxy) {
+  } catch (err) {
+    if (!err?.isSsrfBlock && RESIDENTIAL_PROXY_URL && !preferProxy) {
       try {
         const rescued = await fetchViaCurlProxy(parsed.href, referer, Math.ceil(timeoutMs / 1000));
         if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
@@ -963,6 +1014,15 @@ function selectDiverseUrlsByHost(urls, maxTotal = 5, maxPerHost = 2) {
   return chosen;
 }
 
+function safeDecodeUriComponent(rawStr) {
+  const s = String(rawStr || '');
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 const cloudSearchCache = new Map();
 const CLOUD_SEARCH_CACHE_TTL_MS = 180_000;
 
@@ -972,12 +1032,18 @@ async function executeCloudKeywordSearch(rawQuery, opts = {}, deps = {}) {
 
   const isStrictNsfw = Boolean(opts.isNsfw);
   const limit = Math.max(1, Math.min(12, Number(opts.limit) || 6));
-  const useCache = !deps.fetchText && !deps.runYtDlpUrl && !deps.runYtDlpSearch && !deps.assertSafeUrl;
+  const useCache =
+    Boolean(opts.forceCache) ||
+    (!deps.fetchText && !deps.runYtDlpUrl && !deps.runYtDlpSearch && !deps.assertSafeUrl);
   const cacheKey = `${isStrictNsfw ? '18' : 'sfw'}:${cleanQuery.toLowerCase()}`;
 
   if (useCache) {
     const hit = cloudSearchCache.get(cacheKey);
-    if (hit && Date.now() - hit.timestamp < CLOUD_SEARCH_CACHE_TTL_MS) {
+    if (
+      hit &&
+      Date.now() - hit.timestamp < CLOUD_SEARCH_CACHE_TTL_MS &&
+      (hit.items.length >= limit || (hit.fetchedLimit || 0) >= limit)
+    ) {
       return hit.items.slice(0, limit);
     }
   }
@@ -1011,7 +1077,7 @@ async function executeCloudKeywordSearch(rawQuery, opts = {}, deps = {}) {
       const ext = extMatch ? extMatch[1].toLowerCase() : 'mp4';
       const item = {
         id: `cloud-direct-${crypto.randomBytes(4).toString('hex')}`,
-        title: decodeURIComponent(parsed.pathname.split('/').pop() || 'Web Video'),
+        title: safeDecodeUriComponent(parsed.pathname.split('/').pop() || 'Web Video') || 'Web Video',
         videoUrl: parsed.href,
         originalUrl: parsed.href,
         convertedUrl: null,
@@ -1152,11 +1218,15 @@ async function executeCloudKeywordSearch(rawQuery, opts = {}, deps = {}) {
   }
 
   if (useCache && collected.length > 0) {
-    if (cloudSearchCache.size >= 60) {
+    if (cloudSearchCache.size >= 60 && !cloudSearchCache.has(cacheKey)) {
       const oldestKey = cloudSearchCache.keys().next().value;
       if (oldestKey) cloudSearchCache.delete(oldestKey);
     }
-    cloudSearchCache.set(cacheKey, { timestamp: Date.now(), items: collected });
+    cloudSearchCache.set(cacheKey, {
+      timestamp: Date.now(),
+      items: collected,
+      fetchedLimit: limit
+    });
   }
 
   return collected.slice(0, limit);
@@ -1737,20 +1807,39 @@ async function processPlexSaveJob(job) {
   }
 }
 
+function toSafePrimitiveString(val) {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+  return '';
+}
+
 function readJsonBody(req, maxBytes = 64 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > maxBytes) {
-        reject(new Error('Request body too large'));
-        req.destroy();
+        if (!settled) {
+          settled = true;
+          const err = new Error('Request body too large');
+          err.tooLarge = true;
+          reject(err);
+        }
+        // Drain modest oversized bodies so HTTP 400 flushes without TCP ECONNRESET; pause multi-MB floods
+        if (size > 2 * 1024 * 1024) {
+          req.pause();
+        }
         return;
       }
-      chunks.push(chunk);
+      if (!settled) {
+        chunks.push(chunk);
+      }
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       try {
         const raw = Buffer.concat(chunks).toString('utf8');
         resolve(raw ? JSON.parse(raw) : {});
@@ -1758,7 +1847,12 @@ function readJsonBody(req, maxBytes = 64 * 1024) {
         reject(new Error('Invalid JSON body'));
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
   });
 }
 
@@ -1767,12 +1861,28 @@ async function handlePlexSaveRequest(req, res) {
   try {
     body = await readJsonBody(req);
   } catch (err) {
+    if (err?.tooLarge) {
+      res.setHeader('Connection', 'close');
+      res.once('finish', () => {
+        if (!req.complete) {
+          setTimeout(() => {
+            try {
+              req.destroy();
+            } catch {}
+          }, 50).unref?.();
+        }
+      });
+    }
     return sendJson(res, 400, { ok: false, error: err.message });
   }
 
-  const rawUrl = String(body.url || '').trim();
-  const rawPageUrl = String(body.pageUrl || '').trim();
-  const rawOriginalUrl = String(body.originalUrl || '').trim();
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return sendJson(res, 400, { ok: false, error: 'JSON body must be an object' });
+  }
+
+  const rawUrl = toSafePrimitiveString(body.url).trim();
+  const rawPageUrl = toSafePrimitiveString(body.pageUrl).trim();
+  const rawOriginalUrl = toSafePrimitiveString(body.originalUrl).trim();
 
   let safeReferer = '';
   if (rawPageUrl) {
@@ -1805,8 +1915,8 @@ async function handlePlexSaveRequest(req, res) {
   const isNsfw = Boolean(body.isNsfw);
   const job = {
     id: crypto.randomBytes(4).toString('hex'),
-    title: sanitizeFilenameTitle(body.title || 'ReelVault Clip'),
-    sourceName: String(body.sourceName || 'ReelVault').slice(0, 80),
+    title: sanitizeFilenameTitle(toSafePrimitiveString(body.title) || 'ReelVault Clip'),
+    sourceName: (toSafePrimitiveString(body.sourceName) || 'ReelVault').slice(0, 80),
     isNsfw,
     library: isNsfw ? 'ReelVault 18+ Vault' : 'ReelVault Clips',
     status: 'queued',
@@ -1834,67 +1944,76 @@ async function handlePlexSaveRequest(req, res) {
 
 function createBridgeServer() {
   return http.createServer(async (req, res) => {
-    if (req.method === 'OPTIONS') {
-      setCorsHeaders(res);
-      res.writeHead(204);
-      return res.end();
-    }
-
-    let parsedUrl;
     try {
-      parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    } catch {
-      return sendJson(res, 400, { ok: false, error: 'Malformed request URI' });
-    }
-
-    const pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
-    const providedKey = extractProvidedApiKey(req, parsedUrl);
-
-    if (pathname === '/health' || pathname === '/') {
-      if (!providedKey) {
-        return sendJson(res, 200, { ok: true, service: 'reelvault-bridge' });
+      if (req.method === 'OPTIONS') {
+        setCorsHeaders(res);
+        res.writeHead(204);
+        return res.end();
       }
+
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+      } catch {
+        return sendJson(res, 400, { ok: false, error: 'Malformed request URI' });
+      }
+
+      const pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
+      const providedKey = extractProvidedApiKey(req, parsedUrl);
+
+      if (pathname === '/health' || pathname === '/') {
+        if (!providedKey) {
+          return sendJson(res, 200, { ok: true, service: 'reelvault-bridge' });
+        }
+        if (!verifyApiKey(providedKey)) {
+          return sendJson(res, 401, { ok: false, error: 'Invalid API Secret Key' });
+        }
+        const forceRefresh = parsedUrl.searchParams.get('refreshPlex') === '1';
+        const plex = await ensurePlexLibraries({ forceRefresh });
+        return sendJson(res, 200, {
+          ok: true,
+          authenticated: true,
+          service: 'reelvault-bridge',
+          residentialProxy: Boolean(RESIDENTIAL_PROXY_URL),
+          plex,
+          activeJobs: activeWorkers + jobQueue.length
+        });
+      }
+
       if (!verifyApiKey(providedKey)) {
-        return sendJson(res, 401, { ok: false, error: 'Invalid API Secret Key' });
+        return sendJson(res, 401, { ok: false, error: 'Unauthorized: missing or invalid API Secret Key' });
       }
-      const forceRefresh = parsedUrl.searchParams.get('refreshPlex') === '1';
-      const plex = await ensurePlexLibraries({ forceRefresh });
-      return sendJson(res, 200, {
-        ok: true,
-        authenticated: true,
-        service: 'reelvault-bridge',
-        residentialProxy: Boolean(RESIDENTIAL_PROXY_URL),
-        plex,
-        activeJobs: activeWorkers + jobQueue.length
-      });
-    }
 
-    if (!verifyApiKey(providedKey)) {
-      return sendJson(res, 401, { ok: false, error: 'Unauthorized: missing or invalid API Secret Key' });
-    }
+      if (pathname === '/proxy' && (req.method === 'GET' || req.method === 'HEAD')) {
+        return await handleProxyRequest(req, res, parsedUrl);
+      }
 
-    if (pathname === '/proxy' && (req.method === 'GET' || req.method === 'HEAD')) {
-      return handleProxyRequest(req, res, parsedUrl);
-    }
+      if (pathname === '/extract' && req.method === 'GET') {
+        return await handleExtractRequest(res, parsedUrl);
+      }
 
-    if (pathname === '/extract' && req.method === 'GET') {
-      return handleExtractRequest(res, parsedUrl);
-    }
+      if (pathname === '/search' && req.method === 'GET') {
+        return await handleSearchRequest(res, parsedUrl);
+      }
 
-    if (pathname === '/search' && req.method === 'GET') {
-      return handleSearchRequest(res, parsedUrl);
-    }
+      if (pathname === '/plex/save' && req.method === 'POST') {
+        return await handlePlexSaveRequest(req, res);
+      }
 
-    if (pathname === '/plex/save' && req.method === 'POST') {
-      return handlePlexSaveRequest(req, res);
-    }
+      if (pathname === '/plex/jobs' && req.method === 'GET') {
+        const publicJobs = plexJobs.map(({ candidates, referer, ...rest }) => rest);
+        return sendJson(res, 200, { ok: true, jobs: publicJobs });
+      }
 
-    if (pathname === '/plex/jobs' && req.method === 'GET') {
-      const publicJobs = plexJobs.map(({ candidates, referer, ...rest }) => rest);
-      return sendJson(res, 200, { ok: true, jobs: publicJobs });
+      return sendJson(res, 404, { ok: false, error: 'Endpoint not found' });
+    } catch (err) {
+      if (!res.headersSent && !res.destroyed) {
+        return sendJson(res, 500, { ok: false, error: err?.message || 'Internal server error' });
+      }
+      if (!res.writableEnded) {
+        res.destroy();
+      }
     }
-
-    return sendJson(res, 404, { ok: false, error: 'Endpoint not found' });
   });
 }
 

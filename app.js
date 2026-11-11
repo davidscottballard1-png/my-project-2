@@ -366,7 +366,7 @@ function normalizeCloudBackendUrl(rawUrl) {
     const parsed = new URL(clean);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
     const strippedPath = parsed.pathname
-      .replace(/\/+(?:health|proxy|extract|plex\/save|plex\/jobs)?\/?$/i, '')
+      .replace(/\/+(?:health|proxy|extract|search|plex\/save|plex\/jobs)?\/?$/i, '')
       .replace(/\/+$/, '');
     return `${parsed.origin}${strippedPath}`;
   } catch {
@@ -1794,14 +1794,36 @@ function setCloudBackendConfig(rawUrl, rawKey, enabled = true) {
 
 let lastCloudStatusOverride = null;
 let activePlexPollTimer = null;
+let activePlexPollCancel = null;
+let plexPollGeneration = 0;
 
-function clearCloudBackendConfig() {
-  cloudConfig = { backendUrl: '', apiKey: '', enabled: false };
-  lastCloudStatusOverride = null;
+function cancelActivePlexPoll() {
+  plexPollGeneration++;
   if (activePlexPollTimer) {
     clearTimeout(activePlexPollTimer);
     activePlexPollTimer = null;
   }
+  if (typeof activePlexPollCancel === 'function') {
+    const resolveFn = activePlexPollCancel;
+    activePlexPollCancel = null;
+    resolveFn();
+  }
+  if (typeof document !== 'undefined') {
+    const sendBtn = document.getElementById('sendToPlexBtn');
+    if (sendBtn) {
+      if (sendBtn.dataset) {
+        delete sendBtn.dataset.plexPolling;
+      }
+      sendBtn.textContent = '🎬 Send Video to My Plex Server';
+      sendBtn.disabled = !videoQueue[currentIndex];
+    }
+  }
+}
+
+function clearCloudBackendConfig() {
+  cloudConfig = { backendUrl: '', apiKey: '', enabled: false };
+  lastCloudStatusOverride = null;
+  cancelActivePlexPoll();
   sourcePoolCache.clear();
   saveCloudConfig();
   if (typeof document !== 'undefined') {
@@ -1948,14 +1970,18 @@ async function testCloudBackendConnection(rawUrl = cloudConfig.backendUrl, rawKe
 async function pollPlexJobUntilDone(jobId, libLabel = 'Plex', opts = {}) {
   if (!jobId || !isCloudBackendConfigured()) return null;
   const intervalMs = typeof opts.intervalMs === 'number' ? opts.intervalMs : 2500;
-  const maxAttempts = typeof opts.maxAttempts === 'number' ? opts.maxAttempts : 36;
-  if (activePlexPollTimer) {
-    clearTimeout(activePlexPollTimer);
-    activePlexPollTimer = null;
-  }
+  const maxAttempts =
+    typeof opts.maxAttempts === 'number'
+      ? opts.maxAttempts
+      : typeof opts.maxPolls === 'number'
+      ? opts.maxPolls
+      : 36;
+
+  cancelActivePlexPoll();
+  const myPollGen = plexPollGeneration;
 
   const setSendBtnLabel = (label, polling = false) => {
-    if (typeof document === 'undefined') return;
+    if (myPollGen !== plexPollGeneration || typeof document === 'undefined') return;
     const sendBtn = document.getElementById('sendToPlexBtn');
     if (!sendBtn) return;
     if (sendBtn.dataset) {
@@ -1971,13 +1997,19 @@ async function pollPlexJobUntilDone(jobId, libLabel = 'Plex', opts = {}) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0 && intervalMs > 0) {
       await new Promise((resolve) => {
-        activePlexPollTimer = setTimeout(resolve, intervalMs);
+        activePlexPollCancel = resolve;
+        activePlexPollTimer = setTimeout(() => {
+          activePlexPollTimer = null;
+          activePlexPollCancel = null;
+          resolve();
+        }, intervalMs);
         activePlexPollTimer.unref?.();
       });
     }
-    if (!isCloudBackendConfigured()) break;
+    if (myPollGen !== plexPollGeneration || !isCloudBackendConfigured()) break;
 
     const jobs = await fetchPlexJobs();
+    if (myPollGen !== plexPollGeneration || !isCloudBackendConfigured()) break;
     const match = Array.isArray(jobs) ? jobs.find((j) => j && j.id === jobId) : null;
     if (!match) continue;
 
@@ -8645,6 +8677,15 @@ function initBookmarkletAndUrlParams() {
     const urlScanInput = document.getElementById('urlScanInput');
     if (urlScanInput) urlScanInput.value = scanTarget;
     const listEl = document.getElementById('searchResultsList');
+    const normalizedScanTarget = /^https?:\/\//i.test(scanTarget) ? scanTarget : `https://${scanTarget}`;
+    if (!settings.allowNsfw && isKnownNsfwUrl(normalizedScanTarget)) {
+      renderSearchResults([]);
+      if (listEl) {
+        listEl.innerHTML = `<p class="muted-center">🔒 Enable 18+ Mode in Sources to scan adult websites.</p>`;
+      }
+      showToast('🔒 Enable 18+ Mode in Sources to scan adult links');
+      return true;
+    }
     if (listEl) {
       listEl.innerHTML = `<p class="muted-center">Scanning "${escapeHtml(scanTarget)}" for downloadable videos...</p>`;
     }
@@ -8652,19 +8693,22 @@ function initBookmarkletAndUrlParams() {
     const scanAllowNsfw = Boolean(settings.allowNsfw);
     scanUrlForVideos(scanTarget, 'Safari Bookmarklet')
       .then((found) => {
-        if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+        if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
           return;
         }
-        if (scanAllowNsfw || settings.allowNsfw) {
-          found.forEach((item) => {
-            if (item) item.isNsfw = true;
-          });
-        }
-        renderSearchResults(found);
-        showToast(`Found ${found.length} video(s) from Safari page!`);
+        const safeOrAdultFound = (Array.isArray(found) ? found : []).filter((item) => {
+          if (!item?.videoUrl) return false;
+          if (scanAllowNsfw) {
+            item.isNsfw = true;
+            return true;
+          }
+          return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
+        });
+        renderSearchResults(safeOrAdultFound);
+        showToast(`Found ${safeOrAdultFound.length} video(s) from Safari page!`);
       })
       .catch(() => {
-        if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+        if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
           return;
         }
         renderSearchResults([]);
@@ -9366,6 +9410,17 @@ if (typeof document !== 'undefined') {
     const query = document.getElementById('deepSearchInput')?.value?.trim();
     if (!query) return;
 
+    const listEl = document.getElementById('searchResultsList');
+    const isDirectUrlQuery = /^https?:\/\//i.test(query);
+    if (isDirectUrlQuery && !settings.allowNsfw && isKnownNsfwUrl(query)) {
+      renderSearchResults([]);
+      if (listEl) {
+        listEl.innerHTML = `<p class="muted-center">🔒 Enable 18+ Mode in Sources to scan adult websites.</p>`;
+      }
+      showToast('🔒 Enable 18+ Mode in Sources to scan adult links');
+      return;
+    }
+
     const useArchive = document.getElementById('engArchive')?.checked;
     const usePrelinger = document.getElementById('engPrelinger')?.checked;
     const useWiki = document.getElementById('engWikimedia')?.checked;
@@ -9377,15 +9432,17 @@ if (typeof document !== 'undefined') {
     const useOpenWeb = document.getElementById('engOpenWeb')?.checked;
     const useRedgifs = document.getElementById('engRedgifs')?.checked;
 
-    const listEl = document.getElementById('searchResultsList');
+    const searchGen = modeGeneration;
+    const searchAllowNsfw = Boolean(settings.allowNsfw);
+
     if (listEl) {
-      listEl.innerHTML = `<p class="muted-center">Searching ${settings.allowNsfw ? '18+ tube sites &amp; open web' : 'open video networks, tube sites &amp; public web'} for "${escapeHtml(query)}"...</p>`;
+      listEl.innerHTML = `<p class="muted-center">Searching ${searchAllowNsfw ? '18+ tube sites &amp; open web' : 'open video networks, tube sites &amp; public web'} for "${escapeHtml(query)}"...</p>`;
     }
 
     const tasks = [];
-    if (/^https?:\/\//i.test(query)) {
+    if (isDirectUrlQuery) {
       tasks.push(scanUrlForVideos(query, 'Scanned Link'));
-    } else if (settings.allowNsfw) {
+    } else if (searchAllowNsfw) {
       // 18+ Only Mode: exclude safe engines (Archive.org, Prelinger, Wikimedia, NASA, Fediverse, YouTube)
       if (isCloudBackendConfigured() && (useOpenWeb !== false || useTubeSites !== false)) {
         tasks.push(searchCloudVideos(query, 8));
@@ -9411,14 +9468,17 @@ if (typeof document !== 'undefined') {
     }
 
     const settled = await Promise.allSettled(tasks);
+    if (searchGen !== modeGeneration || Boolean(settings.allowNsfw) !== searchAllowNsfw) {
+      return;
+    }
+
     const combined = [];
     const seenUrlsInSearch = new Set();
-    const isDirectUrlQuery = /^https?:\/\//i.test(query);
     for (const r of settled) {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
         for (const item of r.value) {
           if (item?.videoUrl && !seenUrlsInSearch.has(item.videoUrl)) {
-            if (settings.allowNsfw) {
+            if (searchAllowNsfw) {
               if (
                 !isDirectUrlQuery &&
                 (isMainstreamSfwClientUrl(item.pageUrl) || isMainstreamSfwClientUrl(item.videoUrl))
@@ -9451,6 +9511,16 @@ if (typeof document !== 'undefined') {
     if (!urlInput) return;
 
     const listEl = document.getElementById('searchResultsList');
+    const normalizedScanTarget = /^https?:\/\//i.test(urlInput) ? urlInput : `https://${urlInput}`;
+    if (!settings.allowNsfw && isKnownNsfwUrl(normalizedScanTarget)) {
+      renderSearchResults([]);
+      if (listEl) {
+        listEl.innerHTML = `<p class="muted-center">🔒 Enable 18+ Mode in Sources to scan adult websites.</p>`;
+      }
+      showToast('🔒 Enable 18+ Mode in Sources to scan adult links');
+      return;
+    }
+
     if (listEl) {
       listEl.innerHTML = `<p class="muted-center">Scanning page for downloadable video files (.mp4, .mov, .webm, .mkv, .ogv, etc.)...</p>`;
     }
@@ -9459,20 +9529,23 @@ if (typeof document !== 'undefined') {
     const scanAllowNsfw = Boolean(settings.allowNsfw);
     try {
       const found = await scanUrlForVideos(urlInput, 'Scanned Page');
-      if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+      if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
         return;
       }
-      if (scanAllowNsfw || settings.allowNsfw) {
-        found.forEach((item) => {
-          if (item) item.isNsfw = true;
-        });
-      }
-      renderSearchResults(found);
-      if (found.length > 0) {
-        showToast(`Found ${found.length} video(s) on page!`);
+      const safeOrAdultFound = (Array.isArray(found) ? found : []).filter((item) => {
+        if (!item?.videoUrl) return false;
+        if (scanAllowNsfw) {
+          item.isNsfw = true;
+          return true;
+        }
+        return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
+      });
+      renderSearchResults(safeOrAdultFound);
+      if (safeOrAdultFound.length > 0) {
+        showToast(`Found ${safeOrAdultFound.length} video(s) on page!`);
       }
     } catch {
-      if (scanAllowNsfw && (!settings.allowNsfw || scanGen !== modeGeneration)) {
+      if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
         return;
       }
       renderSearchResults([]);
@@ -9496,6 +9569,14 @@ if (typeof document !== 'undefined') {
     const idx = Number(btn.dataset.index);
     const item = lastSearchResults[idx];
     if (!item) return;
+
+    if (
+      !settings.allowNsfw &&
+      (item.isNsfw || isKnownNsfwUrl(item.pageUrl) || isKnownNsfwUrl(item.videoUrl))
+    ) {
+      showToast('🔒 Enable 18+ Mode in Sources first');
+      return;
+    }
 
     if (btn.dataset.action === 'play-search-item') {
       videoQueue.push(item);
@@ -9637,13 +9718,17 @@ if (typeof document !== 'undefined') {
         );
       }
     } else if (btn.dataset.action === 'pull-dir-source') {
+      if (!settings.allowNsfw) return;
       const entry = findDirectoryEntry(dirId);
       if (!entry) return;
+      const pullGen = modeGeneration;
+      const isStaleAdultPull = () => pullGen !== modeGeneration || !settings.allowNsfw;
       switchTab('view-discover');
       if (entry.type === 'subreddit') {
         setPlayerLoading(true, `Pulling from r/${entry.value}...`);
         try {
           const items = await fetchSubredditVideos(entry.value);
+          if (isStaleAdultPull()) return;
           if (items.length > 0) {
             const pick = items[Math.floor(Math.random() * items.length)];
             videoQueue.push(pick);
@@ -9654,14 +9739,18 @@ if (typeof document !== 'undefined') {
             await pullRandomVideos(1, entry.value);
           }
         } catch {
+          if (isStaleAdultPull()) return;
           await pullRandomVideos(1, entry.value);
         } finally {
-          setPlayerLoading(false);
+          if (!isStaleAdultPull()) {
+            setPlayerLoading(false);
+          }
         }
       } else if (entry.type === 'url') {
         setPlayerLoading(true, `Scanning ${entry.label}...`);
         try {
           const items = await scanUrlForVideos(entry.value, entry.label || 'FullTaboo.tv');
+          if (isStaleAdultPull()) return;
           if (items.length > 0) {
             items.forEach((i) => {
               i.isNsfw = true;
@@ -9675,11 +9764,15 @@ if (typeof document !== 'undefined') {
             await pullRandomVideos(1, entry.label);
           }
         } catch {
+          if (isStaleAdultPull()) return;
           await pullRandomVideos(1, entry.label);
         } finally {
-          setPlayerLoading(false);
+          if (!isStaleAdultPull()) {
+            setPlayerLoading(false);
+          }
         }
       } else {
+        if (isStaleAdultPull()) return;
         await pullRandomVideos(1, entry.value);
       }
     }
