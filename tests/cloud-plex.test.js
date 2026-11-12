@@ -1565,18 +1565,26 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
         '--disable-gpu',
         '--disable-dev-shm-usage',
         '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-component-update',
         '--remote-debugging-port=0',
         `--user-data-dir=${tempRoot}`,
         'about:blank'
       ],
-      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' } }
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/dev/nonexistent' }
+      }
     );
 
     let ws = null;
     try {
       const wsUrl = await new Promise((resolve, reject) => {
         let stderr = '';
-        const timer = setTimeout(() => reject(new Error(`Chrome startup timeout: ${stderr}`)), 15000);
+        const timer = setTimeout(() => reject(new Error(`Chrome startup timeout: ${stderr}`)), 35000);
         chrome.stderr.on('data', (chunk) => {
           stderr += chunk.toString();
           const m = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);

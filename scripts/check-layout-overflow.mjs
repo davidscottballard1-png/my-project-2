@@ -114,7 +114,7 @@ const chrome = spawn(
   ],
   {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' }
+    env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/dev/nonexistent' }
   }
 );
 
