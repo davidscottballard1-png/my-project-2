@@ -861,17 +861,32 @@ function isVerifiedSafePublicItem(item, htmlSample = '') {
   return true;
 }
 
-function runYtDlpJson(targetUrl, useResidentialProxy = false, timeoutMs = 28000) {
+function shouldForceIpv4ForYtDlp(targetUrl) {
+  try {
+    const u = new URL(String(targetUrl || '').trim());
+    const cleanHost = u.hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(cleanHost) === 6) return false;
+  } catch {}
+  return true;
+}
+
+function runYtDlpJson(targetUrl, useResidentialProxy = false, timeoutMs = 28000, referer = '') {
   return new Promise((resolve, reject) => {
     const args = [
+      ...(shouldForceIpv4ForYtDlp(targetUrl) ? ['-4'] : []),
       '--dump-single-json',
       '--no-playlist',
       '--no-warnings',
       '--socket-timeout',
       '14',
       '--user-agent',
-      BROWSER_UA
+      BROWSER_UA,
+      '--add-header',
+      'Accept-Language: en-US,en;q=0.9'
     ];
+    if (referer) {
+      args.push('--referer', referer);
+    }
     if (useResidentialProxy && RESIDENTIAL_PROXY_URL) {
       args.push('--proxy', RESIDENTIAL_PROXY_URL);
     }
@@ -1165,6 +1180,459 @@ function extractDirectStreamsFromHtmlServer(rawHtml, baseUrl) {
   const mp4s = found.filter((u) => /\.mp4(?:[?#]|$)/i.test(u));
   const others = found.filter((u) => !/\.mp4(?:[?#]|$)/i.test(u));
   return [...mp4s, ...others];
+}
+
+const BYSE_SERVER_EMBED_REGEX =
+  /^https?:\/\/(?:www\.)?(?:klcams|filemoon|byse[\w-]*|n1mwq)\.[a-z]{2,}\/(?:e|d|[a-z0-9]{2,8})\/([a-z0-9]{8,})/i;
+const DEAD_LEGACY_EMBED_SERVER_REGEX =
+  /(?:^|\.)(?:sbfull|streamsb|sbembed|sbplay\d*|watchsb|lvturbo)\.[a-z]{2,}$/i;
+
+function cleanServerPageTitle(rawTitle) {
+  const decoded = String(rawTitle || '')
+    .replace(/&#8211;|&ndash;/gi, '-')
+    .replace(/&#8212;|&mdash;/gi, '-')
+    .replace(/&#8217;|&#039;|&apos;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!decoded) return '';
+  return decoded
+    .replace(/\s*(?:\||-|\u2013|\u2014)\s*(?:FullTaboo(?:\.tv)?|LuluStream|LuluVid|VOE)\s*$/i, '')
+    .trim();
+}
+
+function extractEmbedMetaHintsServer(rawHtml) {
+  if (!rawHtml || typeof rawHtml !== 'string') {
+    return { duration: 0, isHd: false };
+  }
+  const sample = rawHtml.slice(0, 32768);
+  let duration = 0;
+  const secMatch = sample.match(
+    /<meta[^>]+(?:property|name)=["'](?:og:)?video:duration["'][^>]+content=["'](\d+)["']/i
+  );
+  if (secMatch?.[1]) {
+    duration = Number(secMatch[1]) || 0;
+  } else {
+    const isoMatch = sample.match(
+      /itemprop=["']duration["'][^>]+content=["']PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?["']/i
+    );
+    if (isoMatch) {
+      duration =
+        (Number(isoMatch[1]) || 0) * 3600 +
+        (Number(isoMatch[2]) || 0) * 60 +
+        (Number(isoMatch[3]) || 0);
+    }
+  }
+  const heightMatch = sample.match(
+    /<meta[^>]+(?:property=["']og:video:height["']|itemprop=["']height["'])[^>]+content=["'](\d+)["']/i
+  );
+  const isHd = (Number(heightMatch?.[1]) || 0) >= 720;
+  return { duration, isHd };
+}
+
+async function fetchEmbedTextDirectServer(
+  targetUrl,
+  refererOverride = '',
+  timeoutMs = 10000,
+  deps = {},
+  extraHeaders = {}
+) {
+  const assertSafe = deps.assertSafeUrl || assertSafePublicUrl;
+  const fetchImpl = deps.fetchImpl || fetch;
+
+  let currentUrl = targetUrl;
+  let parsed = await assertSafe(currentUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+
+  try {
+    for (let hop = 0; hop <= 4; hop++) {
+      parsed = await assertSafe(currentUrl);
+      const referer = buildUpstreamReferer(parsed, refererOverride);
+      const res = await fetchImpl(parsed.href, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': BROWSER_UA,
+          Accept: 'text/html,application/xhtml+xml,application/json,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Referer: referer,
+          ...extraHeaders
+        }
+      });
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const loc = res.headers?.get?.('location');
+        try {
+          await res.body?.cancel?.();
+        } catch {}
+        if (!loc) {
+          return { ok: false, status: res.status, finalUrl: parsed.href, text: '' };
+        }
+        currentUrl = new URL(loc, parsed.href).href;
+        continue;
+      }
+      const text =
+        typeof res.arrayBuffer === 'function'
+          ? Buffer.from(await res.arrayBuffer()).toString('utf8')
+          : typeof res.text === 'function'
+          ? await res.text()
+          : '';
+      if (
+        !deps.fetchImpl &&
+        RESIDENTIAL_PROXY_URL &&
+        !isIpBoundStreamUrl(parsed.href) &&
+        isBlockedTextPayload(res.status, text)
+      ) {
+        try {
+          const rescued = await fetchViaCurlProxy(
+            parsed.href,
+            referer,
+            Math.ceil(timeoutMs / 1000)
+          );
+          if (rescued.status >= 200 && rescued.status < 400 && rescued.body.length > 0) {
+            return {
+              ok: true,
+              status: rescued.status,
+              finalUrl: parsed.href,
+              text: rescued.body.toString('utf8')
+            };
+          }
+        } catch {}
+      }
+      return { ok: Boolean(res.ok), status: res.status || 0, finalUrl: parsed.href, text };
+    }
+    return { ok: false, status: 0, finalUrl: parsed.href, text: '' };
+  } catch {
+    return { ok: false, status: 0, finalUrl: parsed.href, text: '' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Resolve Byse Frontend SPA embeds ONLY when un-gated (captcha_required === false).
+// Never calls /captcha* endpoints or computes CAPTCHA / proof-of-work challenges.
+async function resolveByseEmbedStreamsServer(embedUrl, parentReferer = '', deps = {}) {
+  const assertSafe = deps.assertSafeUrl || assertSafePublicUrl;
+  let parsedEmbed;
+  try {
+    parsedEmbed = await assertSafe(embedUrl);
+  } catch {
+    return { urls: [], captchaRequired: false, title: '', referer: '' };
+  }
+  const codeMatch = parsedEmbed.pathname.match(
+    /\/(?:e|d|[a-z0-9]{2,8})\/([a-z0-9]{8,})(?:[/?#]|$)/i
+  );
+  const code = codeMatch?.[1] || '';
+  if (!code) {
+    return { urls: [], captchaRequired: false, title: '', referer: parsedEmbed.href };
+  }
+
+  let parentOriginHost = '';
+  let parentRefRoot = '';
+  if (parentReferer && /^https?:\/\//i.test(parentReferer)) {
+    try {
+      const pUrl = new URL(parentReferer.trim());
+      parentOriginHost = pUrl.hostname;
+      parentRefRoot = `${pUrl.origin}/`;
+    } catch {}
+  }
+
+  const byseHeaders = {
+    Accept: 'application/json',
+    ...(parentOriginHost ? { 'X-Embed-Origin': parentOriginHost } : {}),
+    ...(parentRefRoot ? { 'X-Embed-Referer': parentRefRoot } : {}),
+    'X-Embed-Parent': parsedEmbed.href
+  };
+
+  const fetchByseJson = async (apiUrl) => {
+    const r = await fetchEmbedTextDirectServer(
+      apiUrl,
+      parentReferer || parsedEmbed.href,
+      6000,
+      deps,
+      byseHeaders
+    );
+    if (!r.ok || !r.text) return null;
+    try {
+      return JSON.parse(r.text);
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    const details = await fetchByseJson(
+      `${parsedEmbed.origin}/api/videos/${encodeURIComponent(code)}/embed/details`
+    );
+    if (!details || typeof details !== 'object') {
+      return { urls: [], captchaRequired: false, title: '', referer: parsedEmbed.href };
+    }
+    const embedTitle = cleanServerPageTitle(details?.title || '');
+    let frameOrigin = parsedEmbed.origin;
+    let frameEmbedUrl = parsedEmbed.href;
+    if (
+      typeof details?.embed_frame_url === 'string' &&
+      /^https?:\/\//i.test(details.embed_frame_url)
+    ) {
+      try {
+        const safeFrame = await assertSafe(details.embed_frame_url);
+        frameOrigin = safeFrame.origin;
+        frameEmbedUrl = safeFrame.href;
+      } catch {}
+    }
+
+    const settingsData = await fetchByseJson(
+      `${frameOrigin}/api/videos/${encodeURIComponent(code)}/embed/settings`
+    );
+    if (!settingsData || typeof settingsData !== 'object') {
+      return { urls: [], captchaRequired: false, title: embedTitle, referer: frameEmbedUrl };
+    }
+    if (
+      settingsData?.captcha_required ||
+      settingsData?.recaptcha_required ||
+      settingsData?.pow_required ||
+      settingsData?.turnstile_required
+    ) {
+      return { urls: [], captchaRequired: true, title: embedTitle, referer: frameEmbedUrl };
+    }
+
+    const playbackData = await fetchByseJson(
+      `${frameOrigin}/api/videos/${encodeURIComponent(code)}/embed/playback`
+    );
+    if (!playbackData || typeof playbackData !== 'object') {
+      return { urls: [], captchaRequired: false, title: embedTitle, referer: frameEmbedUrl };
+    }
+
+    let sources = Array.isArray(playbackData?.sources) ? playbackData.sources : null;
+    const enc = playbackData?.playback || playbackData?.payload || playbackData;
+    if (
+      !sources &&
+      enc &&
+      typeof enc.iv === 'string' &&
+      typeof enc.payload === 'string' &&
+      Array.isArray(enc.key_parts) &&
+      enc.key_parts.length > 0
+    ) {
+      const decodeB64Url = (s) =>
+        Buffer.from(String(s || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+      const ivBuf = decodeB64Url(enc.iv);
+      const cipherAndTag = decodeB64Url(enc.payload);
+      const keyBuf = Buffer.concat(enc.key_parts.map(decodeB64Url));
+      if ([16, 24, 32].includes(keyBuf.length) && ivBuf.length > 0 && cipherAndTag.length > 16) {
+        const authTag = cipherAndTag.subarray(cipherAndTag.length - 16);
+        const ciphertext = cipherAndTag.subarray(0, cipherAndTag.length - 16);
+        const decipher = crypto.createDecipheriv(`aes-${keyBuf.length * 8}-gcm`, keyBuf, ivBuf);
+        decipher.setAuthTag(authTag);
+        const plainJson = JSON.parse(
+          Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8')
+        );
+        if (Array.isArray(plainJson?.sources)) {
+          sources = plainJson.sources;
+        }
+      }
+    }
+
+    const urls = [];
+    if (Array.isArray(sources)) {
+      for (const s of sources) {
+        const u = typeof s === 'string' ? s.trim() : String(s?.url || s?.file || '').trim();
+        if (
+          u &&
+          /^https?:\/\//i.test(u) &&
+          !/(?:preview|trailer|thumb|sprite|banner|preroll|adserver)/i.test(u) &&
+          !urls.includes(u)
+        ) {
+          urls.push(u);
+        }
+      }
+    }
+    return { urls, captchaRequired: false, title: embedTitle, referer: frameEmbedUrl };
+  } catch {
+    return { urls: [], captchaRequired: false, title: '', referer: parsedEmbed.href };
+  }
+}
+
+async function resolveFreshEmbedStreamsServer(
+  targetUrl,
+  refererHint = '',
+  deps = {},
+  _depth = 0
+) {
+  const assertSafe = deps.assertSafeUrl || assertSafePublicUrl;
+  let parsed;
+  try {
+    parsed = await assertSafe(targetUrl);
+  } catch {
+    return { streams: [], title: '', duration: 0, isHd: false, captchaRequired: false };
+  }
+
+  if (BYSE_SERVER_EMBED_REGEX.test(parsed.href)) {
+    const byseDirect = await resolveByseEmbedStreamsServer(parsed.href, refererHint, deps);
+    return {
+      streams: byseDirect.urls.map((url) => ({
+        url,
+        referer: byseDirect.referer || parsed.href
+      })),
+      title: byseDirect.title || '',
+      duration: 0,
+      isHd: byseDirect.urls.length > 0,
+      captchaRequired: Boolean(byseDirect.captchaRequired)
+    };
+  }
+
+  const fetched = await fetchEmbedTextDirectServer(parsed.href, refererHint, 10000, deps);
+  let effectiveUrl = fetched.finalUrl || parsed.href;
+  let html = fetched.text || '';
+  if (!html) {
+    return { streams: [], title: '', duration: 0, isHd: false, captchaRequired: false };
+  }
+
+  let directUrls = extractDirectStreamsFromHtmlServer(html, effectiveUrl);
+
+  // Follow single-hop client-side JS redirects (e.g. voe.sx/e/<id> -> mirror player domain)
+  if (directUrls.length === 0 && html.length < 24576) {
+    const jsRedirMatch = html.match(
+      /window\.location(?:\.href)?\s*=\s*["'](https?:\/\/[^"'\s<>]+)["']|window\.location\.replace\(\s*["'](https?:\/\/[^"'\s<>]+)["']\s*\)/i
+    );
+    const redirectTarget = (jsRedirMatch?.[1] || jsRedirMatch?.[2] || '').trim();
+    if (
+      redirectTarget &&
+      redirectTarget !== effectiveUrl &&
+      !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver)/i.test(
+        redirectTarget
+      )
+    ) {
+      const redirFetched = await fetchEmbedTextDirectServer(
+        redirectTarget,
+        refererHint || parsed.href,
+        10000,
+        deps
+      );
+      if (redirFetched.text) {
+        effectiveUrl = redirFetched.finalUrl || redirectTarget;
+        html = redirFetched.text;
+        directUrls = extractDirectStreamsFromHtmlServer(html, effectiveUrl);
+      }
+    }
+  }
+
+  let captchaRequired = false;
+  let byseTitle = '';
+  if (directUrls.length === 0 && /<title[^>]*>\s*Byse Frontend\s*<\/title>/i.test(html)) {
+    const byseRes = await resolveByseEmbedStreamsServer(
+      effectiveUrl,
+      refererHint || parsed.href,
+      deps
+    );
+    captchaRequired = Boolean(byseRes.captchaRequired);
+    byseTitle = byseRes.title || '';
+    if (byseRes.urls.length > 0) {
+      return {
+        streams: byseRes.urls.map((url) => ({
+          url,
+          referer: byseRes.referer || effectiveUrl
+        })),
+        title: byseTitle,
+        duration: 0,
+        isHd: true,
+        captchaRequired: false
+      };
+    }
+  }
+
+  const rawTitleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  const rawPageTitle = cleanServerPageTitle(rawTitleMatch?.[1] || '');
+  const pageTitle = /^Byse Frontend$/i.test(rawPageTitle) ? byseTitle : rawPageTitle || byseTitle;
+  const metaHints = extractEmbedMetaHintsServer(html);
+
+  if (directUrls.length > 0) {
+    return {
+      streams: directUrls.map((url) => ({ url, referer: effectiveUrl })),
+      title: pageTitle,
+      duration: metaHints.duration,
+      isHd: Boolean(metaHints.isHd || directUrls.some((u) => /(?:1080|720|_h\/)/i.test(u))),
+      captchaRequired: false
+    };
+  }
+
+  if (_depth === 0) {
+    const iframeLinks = [];
+    const considerEmbed = (rawCandidate) => {
+      if (!rawCandidate || iframeLinks.length >= 3) return;
+      try {
+        const frameUrl = new URL(rawCandidate.replace(/&amp;/g, '&'), effectiveUrl).href;
+        if (
+          /^https?:\/\//i.test(frameUrl) &&
+          frameUrl !== parsed.href &&
+          frameUrl !== effectiveUrl &&
+          !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver|facebook|twitter|recaptcha|cloudflare)/i.test(
+            frameUrl
+          )
+        ) {
+          const frameHost = getHostnameClean(frameUrl);
+          if (frameHost && DEAD_LEGACY_EMBED_SERVER_REGEX.test(frameHost)) {
+            return;
+          }
+          if (!iframeLinks.includes(frameUrl)) {
+            iframeLinks.push(frameUrl);
+          }
+        }
+      } catch {}
+    };
+
+    const iframeRegex = /<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/gi;
+    let im;
+    while ((im = iframeRegex.exec(html)) !== null && iframeLinks.length < 3) {
+      considerEmbed(im[1]);
+    }
+    const metaEmbedRegex =
+      /<meta[^>]+itemprop=["']embedUrl["'][^>]+content=["']([^"']+)["']/gi;
+    while ((im = metaEmbedRegex.exec(html)) !== null && iframeLinks.length < 3) {
+      considerEmbed(im[1]);
+    }
+
+    if (iframeLinks.length > 0) {
+      const childResults = await Promise.allSettled(
+        iframeLinks.map((fUrl) => resolveFreshEmbedStreamsServer(fUrl, effectiveUrl, deps, 1))
+      );
+      const mergedStreams = [];
+      const seenUrls = new Set();
+      let childTitle = '';
+      let childDuration = 0;
+      let childIsHd = false;
+      for (const s of childResults) {
+        if (s.status !== 'fulfilled' || !s.value) continue;
+        if (s.value.captchaRequired) captchaRequired = true;
+        if (!childTitle && s.value.title) childTitle = s.value.title;
+        if (!childDuration && s.value.duration) childDuration = s.value.duration;
+        if (s.value.isHd) childIsHd = true;
+        for (const entry of s.value.streams || []) {
+          if (entry?.url && !seenUrls.has(entry.url)) {
+            seenUrls.add(entry.url);
+            mergedStreams.push(entry);
+          }
+        }
+      }
+      return {
+        streams: mergedStreams,
+        title: pageTitle || childTitle,
+        duration: metaHints.duration || childDuration,
+        isHd: Boolean(metaHints.isHd || childIsHd),
+        captchaRequired
+      };
+    }
+  }
+
+  return {
+    streams: [],
+    title: pageTitle,
+    duration: metaHints.duration,
+    isHd: metaHints.isHd,
+    captchaRequired
+  };
 }
 
 function extractSearchCandidatesFromHtmlServer(rawHtml, isStrictNsfw = false) {
@@ -1531,22 +1999,76 @@ async function handleExtractRequest(res, parsedReqUrl) {
   }
 
   const preferProxy = shouldPreferResidentialProxyFirst(parsedTarget);
+  let ytErr = null;
   try {
     let info;
     try {
       info = await runYtDlpJson(parsedTarget.href, preferProxy);
     } catch (firstErr) {
-      if (RESIDENTIAL_PROXY_URL && !preferProxy) {
+      if (
+        RESIDENTIAL_PROXY_URL &&
+        !preferProxy &&
+        !isIpBoundStreamUrl(parsedTarget.href) &&
+        !/Unsupported URL/i.test(firstErr?.message || '')
+      ) {
         info = await runYtDlpJson(parsedTarget.href, true);
       } else {
         throw firstErr;
       }
     }
     const items = pickPlayableItemsFromYtDlp(info, parsedTarget.href);
-    return sendJson(res, 200, { ok: true, items });
+    if (items.length > 0) {
+      return sendJson(res, 200, { ok: true, items });
+    }
   } catch (err) {
-    return sendJson(res, 200, { ok: false, items: [], error: err.message });
+    ytErr = err;
   }
+
+  try {
+    const resolved = await resolveFreshEmbedStreamsServer(parsedTarget.href);
+    if (resolved.streams.length > 0) {
+      const primary = resolved.streams[0];
+      const secondary = resolved.streams[1]?.url || null;
+      const isM3u8 = /\.m3u8(?:[?#]|$)/i.test(primary.url);
+      const extMatch = primary.url.match(/\.(mp4|m4v|mov|webm|m3u8)(?:[?#]|$)/i);
+      const ext = isM3u8 ? 'm3u8' : (extMatch?.[1] || 'mp4').toLowerCase();
+      return sendJson(res, 200, {
+        ok: true,
+        items: [
+          {
+            id: `cloud-embed-${Date.now()}`,
+            title: resolved.title || 'Extracted Video',
+            videoUrl: primary.url,
+            originalUrl: parsedTarget.href,
+            convertedUrl: secondary,
+            ...(primary.referer ? { streamReferer: primary.referer } : {}),
+            format: ext,
+            duration: resolved.duration || 0,
+            isHd: Boolean(resolved.isHd),
+            proxyRequired: isIpBoundStreamUrl(primary.url),
+            ...(isKnownAdultHost(parsedTarget.href) || isKnownAdultHost(primary.url)
+              ? { isNsfw: true }
+              : {}),
+            sourceName: 'Cloud Embed Extractor',
+            pageUrl: parsedTarget.href
+          }
+        ]
+      });
+    }
+    if (resolved.captchaRequired) {
+      return sendJson(res, 200, {
+        ok: false,
+        items: [],
+        error: 'Embed host requires interactive CAPTCHA verification'
+      });
+    }
+  } catch {}
+
+  return sendJson(res, 200, {
+    ok: false,
+    items: [],
+    error: ytErr?.message || 'No playable media streams found'
+  });
 }
 
 async function handleSearchRequest(res, parsedReqUrl) {
@@ -1906,6 +2428,7 @@ function runExecFile(cmd, args, timeoutMs = 300000) {
 
 async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false, referer = '') {
   const args = [
+    ...(shouldForceIpv4ForYtDlp(targetUrl) ? ['-4'] : []),
     '--no-playlist',
     '--no-warnings',
     '--socket-timeout',
@@ -1917,7 +2440,9 @@ async function downloadUrlWithYtDlp(targetUrl, outTemplate, useProxy = false, re
     '--concurrent-fragments',
     '4',
     '--user-agent',
-    BROWSER_UA
+    BROWSER_UA,
+    '--add-header',
+    'Accept-Language: en-US,en;q=0.9'
   ];
   if (referer) {
     args.push('--referer', referer);
@@ -2034,33 +2559,106 @@ async function processPlexSaveJob(job) {
   try {
     let downloaded = false;
     let lastErr = null;
+    let primaryMediaErr = null;
+    const triedStreamUrls = new Set();
 
     for (const candidateUrl of job.candidates) {
       const parsed = await assertSafePublicUrl(candidateUrl);
-      const isDirectBinary = isBinaryMediaRequest(parsed, { headers: {} });
-      const preferProxy = !isDirectBinary && shouldPreferResidentialProxyFirst(parsed);
+      triedStreamUrls.add(parsed.href);
+      const isDirectOrIpBoundMedia =
+        isBinaryMediaRequest(parsed, { headers: {} }) ||
+        /\.m3u8(?:[?#]|$)/i.test(parsed.pathname) ||
+        isIpBoundStreamUrl(parsed.href);
+      const preferProxy = !isDirectOrIpBoundMedia && shouldPreferResidentialProxyFirst(parsed);
       const referer = buildUpstreamReferer(parsed, job.referer || '');
       try {
         await downloadUrlWithYtDlp(parsed.href, outTemplate, preferProxy, referer);
         downloaded = true;
         break;
       } catch (err1) {
-        lastErr = err1;
-        // Only retry watch-page URLs over Webshare Residential Proxy so raw .mp4 binary streams never burn proxy GBs
-        if (RESIDENTIAL_PROXY_URL && !preferProxy && !isDirectBinary) {
+        const isUnsupportedErr = /Unsupported URL/i.test(err1?.message || '');
+        if (isDirectOrIpBoundMedia || !isUnsupportedErr) {
+          primaryMediaErr = primaryMediaErr || err1;
+        }
+        if (!isUnsupportedErr || !primaryMediaErr) {
+          lastErr = err1;
+        }
+        // Only retry supported watch-page URLs over Webshare Residential Proxy so .mp4/.m3u8/IP-bound streams never burn proxy GBs or break IP-bound tokens
+        if (
+          RESIDENTIAL_PROXY_URL &&
+          !preferProxy &&
+          !isDirectOrIpBoundMedia &&
+          !isUnsupportedErr
+        ) {
           try {
             await downloadUrlWithYtDlp(parsed.href, outTemplate, true, referer);
             downloaded = true;
             break;
           } catch (err2) {
-            lastErr = err2;
+            if (!/Unsupported URL/i.test(err2?.message || '')) {
+              primaryMediaErr = primaryMediaErr || err2;
+              lastErr = err2;
+            }
+          }
+        }
+      }
+    }
+
+    // Fresh embed stream recovery: if a queued .m3u8/.mp4 token expired (403) or yt-dlp hit Unsupported URL on an embed wrapper page (FullTaboo / LuluVid / VOE / un-gated Byse), mint a fresh VPS-bound stream URL directly on the server
+    if (!downloaded) {
+      const refreshTargets = [];
+      const addRefreshTarget = (rawTarget, refHint = '') => {
+        if (!rawTarget || !isSpecificWatchPageUrl(rawTarget)) return;
+        try {
+          const u = new URL(rawTarget);
+          if (
+            isBinaryMediaRequest(u, { headers: {} }) ||
+            /\.m3u8(?:[?#]|$)/i.test(u.pathname)
+          ) {
+            return;
+          }
+          if (!refreshTargets.some((t) => t.url === u.href)) {
+            refreshTargets.push({ url: u.href, refererHint: refHint });
+          }
+        } catch {}
+      };
+
+      addRefreshTarget(job.streamReferer, job.pageUrl || '');
+      addRefreshTarget(job.pageUrl, '');
+      for (const c of job.candidates) {
+        addRefreshTarget(c, job.pageUrl || '');
+      }
+
+      for (const target of refreshTargets) {
+        if (downloaded) break;
+        const resolved = await resolveFreshEmbedStreamsServer(target.url, target.refererHint);
+        for (const streamEntry of resolved.streams.slice(0, 3)) {
+          if (!streamEntry?.url || triedStreamUrls.has(streamEntry.url)) continue;
+          triedStreamUrls.add(streamEntry.url);
+          let freshParsed;
+          try {
+            freshParsed = await assertSafePublicUrl(streamEntry.url);
+          } catch {
+            continue;
+          }
+          const freshRef = buildUpstreamReferer(
+            freshParsed,
+            streamEntry.referer || job.referer || target.url
+          );
+          try {
+            await downloadUrlWithYtDlp(freshParsed.href, outTemplate, false, freshRef);
+            downloaded = true;
+            break;
+          } catch (freshErr) {
+            primaryMediaErr = freshErr;
+            lastErr = freshErr;
           }
         }
       }
     }
 
     if (!downloaded) {
-      throw lastErr || new Error('Could not download media stream');
+      throw primaryMediaErr || lastErr || new Error('Could not download media stream');
     }
 
     const files = fs
@@ -2203,14 +2801,21 @@ async function handlePlexSaveRequest(req, res) {
   const rawStreamReferer = toSafePrimitiveString(body.streamReferer).trim();
   const rawOriginalUrl = toSafePrimitiveString(body.originalUrl).trim();
 
-  let safeReferer = '';
-  const preferredRefRaw = rawStreamReferer || rawPageUrl;
-  if (preferredRefRaw) {
+  let safePageUrl = '';
+  if (rawPageUrl) {
     try {
-      const refUrl = await assertSafePublicUrl(preferredRefRaw);
-      safeReferer = refUrl.href;
+      safePageUrl = (await assertSafePublicUrl(rawPageUrl)).href;
     } catch {}
   }
+
+  let safeStreamReferer = '';
+  if (rawStreamReferer) {
+    try {
+      safeStreamReferer = (await assertSafePublicUrl(rawStreamReferer)).href;
+    } catch {}
+  }
+
+  const safeReferer = safeStreamReferer || safePageUrl;
 
   const candidateSet = new Set();
   if (isSpecificWatchPageUrl(rawPageUrl) && /(?:reddit\.com|redgifs\.com)/i.test(rawPageUrl)) {
@@ -2248,6 +2853,8 @@ async function handlePlexSaveRequest(req, res) {
     plexScanned: false,
     error: null,
     referer: safeReferer,
+    pageUrl: safePageUrl,
+    streamReferer: safeStreamReferer,
     candidates: validCandidates
   };
 
@@ -2322,7 +2929,9 @@ function createBridgeServer() {
       }
 
       if (pathname === '/plex/jobs' && req.method === 'GET') {
-        const publicJobs = plexJobs.map(({ candidates, referer, ...rest }) => rest);
+        const publicJobs = plexJobs.map(
+          ({ candidates, referer, pageUrl, streamReferer, ...rest }) => rest
+        );
         return sendJson(res, 200, { ok: true, jobs: publicJobs });
       }
 
@@ -2374,6 +2983,7 @@ module.exports = {
   sanitizeFilenameTitle,
   isSpecificWatchPageUrl,
   isIpBoundStreamUrl,
+  shouldForceIpv4ForYtDlp,
   isMainstreamSfwHost,
   isKnownAdultHost,
   hasAdultContentSignals,
@@ -2381,6 +2991,7 @@ module.exports = {
   isVerifiedSafePublicItem,
   extractSearchCandidatesFromHtmlServer,
   extractDirectStreamsFromHtmlServer,
+  resolveFreshEmbedStreamsServer,
   pickPlayableItemsFromYtDlp,
   executeCloudKeywordSearch,
   isGenericContainerOrVpsName,

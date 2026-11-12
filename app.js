@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v38';
+const APP_BUILD_VERSION = 'v39';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -2710,7 +2710,7 @@ async function pollPlexJobUntilDone(jobId, libLabel = 'Plex', opts = {}) {
       ? opts.maxAttempts
       : typeof opts.maxPolls === 'number'
       ? opts.maxPolls
-      : 36;
+      : 144;
 
   cancelActivePlexPoll();
   const myPollGen = plexPollGeneration;
@@ -6424,12 +6424,16 @@ function mapCloudExtractedItem(cItem, customLabel, fallbackUrl, pageTitle = null
   const fmt = detectVideoFormat(cItem.videoUrl, cItem.format || 'mp4').ext;
   if (!isFormatAllowedBySettings(fmt)) return null;
   const pageRef = cItem.pageUrl || cItem.originalUrl || fallbackUrl || '';
+  const streamRef =
+    typeof cItem.streamReferer === 'string' && /^https?:\/\//i.test(cItem.streamReferer)
+      ? cItem.streamReferer
+      : '';
   const needsCloudProxy =
     Boolean(cItem.proxyRequired) ||
     /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(cItem.videoUrl);
   const proxiedStreamUrl =
     needsCloudProxy && isCloudBackendConfigured()
-      ? buildCloudProxyUrl(cItem.videoUrl, pageRef)
+      ? buildCloudProxyUrl(cItem.videoUrl, streamRef || pageRef)
       : null;
 
   const isAdult =
@@ -6443,6 +6447,7 @@ function mapCloudExtractedItem(cItem, customLabel, fallbackUrl, pageTitle = null
     videoUrl: cItem.videoUrl,
     originalUrl: cItem.originalUrl || fallbackUrl || cItem.videoUrl,
     convertedUrl: cItem.convertedUrl || null,
+    ...(streamRef ? { streamReferer: streamRef } : {}),
     ...(proxiedStreamUrl ? { proxiedStreamUrl } : {}),
     format: fmt,
     isAutoConverted: false,

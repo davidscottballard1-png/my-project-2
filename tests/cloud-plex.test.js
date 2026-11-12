@@ -2420,7 +2420,423 @@ exit 0
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
   });
+
+  it("saves FullTaboo/LuluVid HLS streams to Plex with -4 + Accept-Language + streamReferer, never routes .m3u8 over residential proxy, and resolves fresh embed streams on server (IMG_0168 regression)", async () => {
+    const crypto = require('node:crypto');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+
+    // 1. Verify resolveFreshEmbedStreamsServer unpacks FullTaboo -> LuluVid iframe (skipping dead sbfull.com),
+    //    VOE JS redirects, and un-gated Byse AES-GCM while stopping cleanly on CAPTCHA-gated Byse embeds.
+    const packedLuluScript =
+      `<script>eval(function(p,a,c,k,e,d){while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+c.toString(a)+'\\\\b','g'),k[c])}}return p}` +
+      `('2.3({4:[{5:"0://6.7.8/9/a/b/c.d?t=e&s=f"}]});',16,16,'https||jwplayer|setup|sources|file|iihbzqjhkqull|tnmr|org|hls2|03|2mqr4bnonsmo_h|master|m3u8|fresh_vps_hmac|1760000000'.split('|'),0,{}))</script>`;
+
+    const encodeVoeMockPayload = (obj) => {
+      const b64Inner = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
+      const rev = b64Inner.split('').reverse().join('');
+      let plus3 = '';
+      for (let i = 0; i < rev.length; i++) {
+        plus3 += String.fromCharCode(rev.charCodeAt(i) + 3);
+      }
+      const b64Outer = Buffer.from(plus3, 'utf8').toString('base64');
+      return b64Outer.replace(/[a-zA-Z]/g, (c) => {
+        const base = c <= 'Z' ? 65 : 97;
+        return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+      });
+    };
+    const voeEncoded = encodeVoeMockPayload({
+      source: 'https://cdn-node.cloudwindow-route.com/engine/hls2/01/master.m3u8?t=voe_sig'
+    });
+
+    const byseKeyPart1 = crypto.randomBytes(16);
+    const byseKeyPart2 = crypto.randomBytes(16);
+    const byseFullKey = Buffer.concat([byseKeyPart1, byseKeyPart2]);
+    const byseIv = crypto.randomBytes(12);
+    const byseCipher = crypto.createCipheriv('aes-256-gcm', byseFullKey, byseIv);
+    const bysePlain = JSON.stringify({
+      sources: [{ url: 'https://edge-hls.cdn.example.net/hls/byse_1080p/master.m3u8?sig=ok' }]
+    });
+    const byseEncrypted = Buffer.concat([
+      byseCipher.update(bysePlain, 'utf8'),
+      byseCipher.final(),
+      byseCipher.getAuthTag()
+    ]);
+    const toB64Url = (buf) =>
+      buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+
+    const hitServerUrls = [];
+    const mockEmbedDeps = {
+      assertSafeUrl: async (u) => new URL(u),
+      fetchImpl: async (url, opts = {}) => {
+        const u = String(url);
+        hitServerUrls.push({ url: u, headers: opts.headers || {} });
+        if (u === 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => `<!doctype html><html><head>
+              <title>Mandy Madison &#8211; Daddy&#8217;s Gone - FullTaboo.tv</title>
+              <meta itemprop="duration" content="PT0H16M0S" />
+              <meta property="og:video:height" content="720" />
+              <meta itemprop="embedUrl" content="https://sbfull.com/e/deadlegacy123" />
+            </head><body>
+              <iframe src="https://luluvid.com/e/2mqr4bnonsmo"></iframe>
+            </body></html>`
+          };
+        }
+        if (u === 'https://luluvid.com/e/2mqr4bnonsmo') {
+          assert.strictEqual(opts.headers?.['Accept-Language'], 'en-US,en;q=0.9');
+          return {
+            ok: true,
+            status: 200,
+            text: async () => `<html><head><title>LuluVid</title></head><body>${packedLuluScript}</body></html>`
+          };
+        }
+        if (u === 'https://voe.sx/e/voetest999') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              `<script>window.location.href = 'https://susanexpectcare.com/e/voetest999';</script>`
+          };
+        }
+        if (u === 'https://susanexpectcare.com/e/voetest999') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              `<html><head><title>VOE Episode</title></head><body><script type="application/json">["${voeEncoded}"]</script></body></html>`
+          };
+        }
+        if (u === 'https://klcams.com/api/videos/ungated12345/embed/details') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                title: 'Un-gated Byse Episode',
+                embed_frame_url: 'https://n1mwq.com/e/ungated12345'
+              })
+          };
+        }
+        if (u === 'https://n1mwq.com/api/videos/ungated12345/embed/settings') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ captcha_required: false, pow_required: false })
+          };
+        }
+        if (u === 'https://n1mwq.com/api/videos/ungated12345/embed/playback') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                playback: {
+                  iv: toB64Url(byseIv),
+                  payload: toB64Url(byseEncrypted),
+                  key_parts: [toB64Url(byseKeyPart1), toB64Url(byseKeyPart2)]
+                }
+              })
+          };
+        }
+        if (u === 'https://klcams.com/api/videos/gated999999/embed/details') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ title: 'Gated Byse Episode' })
+          };
+        }
+        if (u === 'https://klcams.com/api/videos/gated999999/embed/settings') {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ captcha_required: true })
+          };
+        }
+        throw new Error(`Unexpected server embed fetch: ${u}`);
+      }
+    };
+
+    const ftResolved = await bridge.resolveFreshEmbedStreamsServer(
+      'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+      '',
+      mockEmbedDeps
+    );
+    assert.strictEqual(ftResolved.title, "Mandy Madison - Daddy's Gone");
+    assert.strictEqual(ftResolved.duration, 960);
+    assert.strictEqual(ftResolved.isHd, true);
+    assert.strictEqual(ftResolved.streams.length, 1);
+    assert.strictEqual(
+      ftResolved.streams[0].url,
+      'https://iihbzqjhkqull.tnmr.org/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=fresh_vps_hmac&s=1760000000'
+    );
+    assert.strictEqual(ftResolved.streams[0].referer, 'https://luluvid.com/e/2mqr4bnonsmo');
+    assert.ok(
+      !hitServerUrls.some((h) => h.url.includes('sbfull.com')),
+      'Dead sbfull.com legacy iframe must be skipped'
+    );
+
+    const voeResolved = await bridge.resolveFreshEmbedStreamsServer(
+      'https://voe.sx/e/voetest999',
+      'https://fulltaboo.tv/voe-post/',
+      mockEmbedDeps
+    );
+    assert.strictEqual(voeResolved.streams.length, 1);
+    assert.strictEqual(
+      voeResolved.streams[0].url,
+      'https://cdn-node.cloudwindow-route.com/engine/hls2/01/master.m3u8?t=voe_sig'
+    );
+    assert.strictEqual(voeResolved.streams[0].referer, 'https://susanexpectcare.com/e/voetest999');
+
+    const byseOk = await bridge.resolveFreshEmbedStreamsServer(
+      'https://klcams.com/e/ungated12345',
+      'https://fulltaboo.tv/byse-post/',
+      mockEmbedDeps
+    );
+    assert.strictEqual(byseOk.captchaRequired, false);
+    assert.strictEqual(
+      byseOk.streams[0]?.url,
+      'https://edge-hls.cdn.example.net/hls/byse_1080p/master.m3u8?sig=ok'
+    );
+    assert.strictEqual(byseOk.streams[0]?.referer, 'https://n1mwq.com/e/ungated12345');
+
+    const byseGated = await bridge.resolveFreshEmbedStreamsServer(
+      'https://klcams.com/e/gated999999',
+      'https://fulltaboo.tv/byse-gated/',
+      mockEmbedDeps
+    );
+    assert.strictEqual(byseGated.captchaRequired, true);
+    assert.deepStrictEqual(byseGated.streams, []);
+    assert.ok(
+      !hitServerUrls.some((h) => h.url.includes('/captcha')),
+      'Must never request /captcha endpoints on CAPTCHA-gated embeds'
+    );
+
+    // 2. Verify mapCloudExtractedItem preserves streamReferer from Cloud /extract items
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('/proxy?')) {
+        return { ok: true, status: 200, text: async () => '<html><body></body></html>' };
+      }
+      if (u.startsWith('https://85-239-249-225.nip.io/extract?')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            items: [
+              {
+                id: 'cloud-embed-1',
+                title: "Mandy Madison - Daddy's Gone",
+                videoUrl: 'https://iihbzqjhkqull.tnmr.org/hls2/03/master.m3u8?t=abc',
+                originalUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+                streamReferer: 'https://luluvid.com/e/2mqr4bnonsmo',
+                format: 'm3u8',
+                duration: 960,
+                isHd: true,
+                proxyRequired: true,
+                isNsfw: true,
+                pageUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/'
+              }
+            ]
+          })
+        };
+      }
+      throw new Error(`Unexpected fetch: ${u}`);
+    };
+    const cloudExtracted = await app.scanUrlForVideos('https://example.net/watch/embed-wrapper');
+    assert.strictEqual(cloudExtracted.length, 1);
+    assert.strictEqual(cloudExtracted[0].streamReferer, 'https://luluvid.com/e/2mqr4bnonsmo');
+    assert.ok(
+      cloudExtracted[0].proxiedStreamUrl.includes(
+        encodeURIComponent('https://luluvid.com/e/2mqr4bnonsmo')
+      ),
+      'proxiedStreamUrl must carry streamReferer instead of outer pageUrl'
+    );
+    globalThis.fetch = origFetch;
+
+    // 3. End-to-end POST /plex/save verification with strict mock yt-dlp enforcing -4, Accept-Language, Referer, and NO --proxy on .m3u8
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-plex-fulltaboo-'));
+    const binDir = path.join(testRoot, 'bin');
+    const safeDir = path.join(testRoot, 'safe');
+    const nsfwDir = path.join(testRoot, 'nsfw');
+    const argsLogFile = path.join(testRoot, 'ytdlp_args.jsonl');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(safeDir, { recursive: true });
+    fs.mkdirSync(nsfwDir, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(binDir, 'yt-dlp'),
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(argsLogFile)}, JSON.stringify(args) + '\\n');
+const target = args[args.length - 1] || '';
+if (target.includes('watch-wrapper')) {
+  process.stderr.write('ERROR: Unsupported URL: ' + target + '\\n');
+  process.exit(1);
+}
+if (target.includes('expired.m3u8')) {
+  process.stderr.write('ERROR: [generic] master.m3u8: HTTP Error 403: Forbidden\\n');
+  process.exit(1);
+}
+const hasIpv4 = args.includes('-4');
+const hdrIdx = args.indexOf('--add-header');
+const hasAcceptLang = hdrIdx >= 0 && String(args[hdrIdx + 1] || '').includes('Accept-Language: en-US,en;q=0.9');
+const refIdx = args.indexOf('--referer');
+const refVal = refIdx >= 0 ? String(args[refIdx + 1] || '') : '';
+const hasProxy = args.includes('--proxy');
+if (!hasIpv4 || !hasAcceptLang || hasProxy || !refVal.includes('/e/2mqr4bnonsmo')) {
+  process.stderr.write('ERROR: [generic] master.m3u8: HTTP Error 403: Forbidden\\n');
+  process.exit(1);
+}
+const outIdx = args.indexOf('-o');
+const outTpl = args[outIdx + 1];
+fs.writeFileSync(outTpl.replace('%(ext)s', 'mp4'), 'H264_FULLTABOO_DIRECT_PLAY_MP4');
+process.exit(0);
+`,
+      { mode: 0o755 }
+    );
+    fs.writeFileSync(path.join(binDir, 'ffprobe'), '#!/usr/bin/env bash\necho "h264"\n', {
+      mode: 0o755
+    });
+
+    const prevPath = process.env.PATH;
+    const prevKey = process.env.REELVAULT_API_KEY;
+    const prevProxy = process.env.RESIDENTIAL_PROXY_URL;
+    const prevSafe = process.env.MEDIA_SAFE_DIR;
+    const prevNsfw = process.env.MEDIA_NSFW_DIR;
+    const prevPlexUrl = process.env.PLEX_URL;
+    const prevPlexTok = process.env.PLEX_TOKEN;
+
+    process.env.PATH = `${binDir}:${prevPath}`;
+    process.env.REELVAULT_API_KEY = 'rv_unit_test_secret_key_123456';
+    process.env.RESIDENTIAL_PROXY_URL = 'http://127.0.0.1:19999';
+    process.env.MEDIA_SAFE_DIR = safeDir;
+    process.env.MEDIA_NSFW_DIR = nsfwDir;
+    process.env.PLEX_URL = '';
+    process.env.PLEX_TOKEN = '';
+
+    const bridgePath = require.resolve('../server/bridge.js');
+    delete require.cache[bridgePath];
+    const isolatedBridge = require(bridgePath);
+    const srv = isolatedBridge.createBridgeServer();
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const port = srv.address().port;
+
+    try {
+      // 3a. Valid LuluVid/FullTaboo .m3u8 succeeds with -4 + Accept-Language + streamReferer and NEVER uses --proxy
+      const saveRes = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=valid_hmac',
+          originalUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
+          pageUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
+          streamReferer: 'http://93.184.216.34/e/2mqr4bnonsmo',
+          title: "Mandy Madison - Daddy's Gone",
+          sourceName: '🔞 FullTaboo.tv Full-Length',
+          isNsfw: true
+        })
+      });
+      const saveJson = await saveRes.json();
+      let doneJob = null;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
+          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+        });
+        const jd = await jr.json();
+        const found = jd.jobs.find((j) => j.id === saveJson.jobId);
+        if (found && (found.status === 'error' || found.status === 'ready')) {
+          doneJob = found;
+          break;
+        }
+      }
+      assert.strictEqual(doneJob?.status, 'ready');
+      assert.strictEqual(doneJob?.pageUrl, undefined, 'Internal pageUrl must be stripped from /plex/jobs');
+      assert.strictEqual(
+        doneJob?.streamReferer,
+        undefined,
+        'Internal streamReferer must be stripped from /plex/jobs'
+      );
+      const savedFiles = fs.readdirSync(nsfwDir);
+      assert.strictEqual(savedFiles.length, 1);
+      assert.ok(savedFiles[0].startsWith("Mandy Madison - Daddy's Gone ["));
+
+      // 3b. When an .m3u8 genuinely 403s and watch-wrapper returns Unsupported URL, job reports the real 403 media error instead of Unsupported URL
+      const errRes = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/hls2/03/expired.m3u8?t=bad',
+          originalUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
+          pageUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
+          streamReferer: 'http://93.184.216.34/e/2mqr4bnonsmo',
+          title: 'Expired Token Clip',
+          isNsfw: true
+        })
+      });
+      const errJson = await errRes.json();
+      let failedJob = null;
+      for (let i = 0; i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
+          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+        });
+        const jd = await jr.json();
+        const found = jd.jobs.find((j) => j.id === errJson.jobId);
+        if (found && (found.status === 'error' || found.status === 'ready')) {
+          failedJob = found;
+          break;
+        }
+      }
+      assert.strictEqual(failedJob?.status, 'error');
+      assert.ok(
+        !/Unsupported URL/i.test(failedJob?.error || ''),
+        `Fallback Unsupported URL must never mask real stream error, got: ${failedJob?.error}`
+      );
+      assert.match(failedJob?.error || '', /403/);
+
+      const allInvocations = fs
+        .readFileSync(argsLogFile, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      const m3u8Calls = allInvocations.filter((a) => String(a[a.length - 1]).includes('.m3u8'));
+      assert.ok(m3u8Calls.length >= 2);
+      for (const call of m3u8Calls) {
+        assert.ok(!call.includes('--proxy'), '.m3u8 streams must never be routed over RESIDENTIAL_PROXY_URL');
+      }
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+      process.env.PATH = prevPath;
+      process.env.REELVAULT_API_KEY = prevKey;
+      if (prevProxy === undefined) delete process.env.RESIDENTIAL_PROXY_URL;
+      else process.env.RESIDENTIAL_PROXY_URL = prevProxy;
+      if (prevSafe === undefined) delete process.env.MEDIA_SAFE_DIR;
+      else process.env.MEDIA_SAFE_DIR = prevSafe;
+      if (prevNsfw === undefined) delete process.env.MEDIA_NSFW_DIR;
+      else process.env.MEDIA_NSFW_DIR = prevNsfw;
+      if (prevPlexUrl === undefined) delete process.env.PLEX_URL;
+      else process.env.PLEX_URL = prevPlexUrl;
+      if (prevPlexTok === undefined) delete process.env.PLEX_TOKEN;
+      else process.env.PLEX_TOKEN = prevPlexTok;
+      fs.rmSync(testRoot, { recursive: true, force: true });
+    }
+  });
 });
+
 
 
 
