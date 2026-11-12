@@ -11,6 +11,10 @@ const crypto = require('node:crypto');
 const { Readable } = require('node:stream');
 const { spawn, execFile } = require('node:child_process');
 
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
 const PORT = Number(process.env.PORT) || 8787;
 const API_KEY = String(process.env.REELVAULT_API_KEY || '').trim();
 const RESIDENTIAL_PROXY_URL = String(process.env.RESIDENTIAL_PROXY_URL || '').trim();
@@ -46,7 +50,7 @@ const VIDEO_CDN_HOST_REGEX =
   /(?:^|\.)(?:v\.redd\.it|redd\.it|media\.redgifs\.com|thumbs\d*\.redgifs\.com|(?:gvideo|s\d+|v\d+|vid[\w-]*)\.eporner\.com|googlevideo\.com|tiktokcdn[\w-]*\.com|byteoversea\.com|vimeocdn\.com|dmcdn\.net|xhcdn\.com|xv-cdn\.com|sb-cd\.com|phncdn\.com|ypncdn\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|commondatastorage\.googleapis\.com|upload\.wikimedia\.org)$/i;
 
 const IP_BOUND_EMBED_OR_CDN_HOST_REGEX =
-  /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com|cloudwindow-route\.com)$/i;
+  /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com|cloudwindow-route\.com)$/i;
 
 const PROXY_FIRST_METADATA_HOST_REGEX = /(?:^|\.)(?:reddit\.com|redd\.it)$/i;
 
@@ -230,10 +234,23 @@ function buildUpstreamReferer(parsedUrl, rawRefererOverride = '') {
     return 'https://www.youtube.com/';
   }
   if (host.includes('bilibili.com') || host.endsWith('bilivideo.com')) return 'https://www.bilibili.com/';
-  if (/(?:^|\.)[\w-]*tnmr\.org$/i.test(host) || host.includes('luluvid.com') || host.includes('luluvdo.com') || host.includes('lulustream.com')) {
-    return host.includes('luluvdo.com') ? 'https://luluvdo.com/' : 'https://luluvid.com/';
+  if (
+    /(?:^|\.)[\w-]*tnmr\.org$/i.test(host) ||
+    host.includes('luluvid.com') ||
+    host.includes('luluvdo.com') ||
+    host.includes('lulustream.com') ||
+    host.includes('lulust.com')
+  ) {
+    if (host.includes('lulust.com')) return 'https://lulust.com/';
+    if (host.includes('luluvdo.com')) return 'https://luluvdo.com/';
+    return 'https://luluvid.com/';
   }
-  if (host.endsWith('cloudwindow-route.com') || host.includes('voe.sx') || host.includes('hentaisword.com')) {
+  if (
+    host.endsWith('cloudwindow-route.com') ||
+    host.includes('voe.sx') ||
+    host.includes('hentaisword.com') ||
+    host.includes('susanexpectcare.com')
+  ) {
     return 'https://voe.sx/';
   }
   if (host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
@@ -696,6 +713,7 @@ async function handleProxyRequest(req, res, parsedReqUrl) {
     const headers = {
       'User-Agent': BROWSER_UA,
       Accept: req.headers.accept || '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
       Referer: referer
     };
     if (req.headers.range) {
@@ -783,7 +801,7 @@ function getHostnameClean(rawUrl) {
 
 function isIpBoundStreamUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
-  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|eporner\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
+  return /(?:googlevideo\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|eporner\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com|[?&]ip=\d+\.\d+\.\d+\.\d+)/i.test(
     rawUrl
   );
 }

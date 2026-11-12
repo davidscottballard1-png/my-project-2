@@ -47,7 +47,18 @@ const {
   syncAgeGateUI,
   openAgeGateModal,
   closeAgeGateModal,
-  setAdultContentEnabled
+  setAdultContentEnabled,
+  resolveByseEmbedStreams,
+  extractEmbeddedPlayerMetaFromHtml,
+  getVideoDedupKeys,
+  deduplicateVideoItems,
+  isVideoAlreadySeen,
+  recordSeenVideoItem,
+  pullSmartInputToPlayer,
+  queueSearchResultsToPlayer,
+  isIpBoundEmbedOrCdnUrl,
+  isStrictProxyBoundHlsUrl,
+  getVideoRefererUrl
 } = require('../app.js');
 
 describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Tests', () => {
@@ -4072,7 +4083,722 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       }
     });
   });
+
+  describe('FullTaboo Reliability, Archive Pagination & Zero-Duplicate Feed Engine', () => {
+    it('canonicalizes mixed-case tnmr.org hostnames, collapses single-player LuluStream embeds, parses ISO-8601 itemprop duration, and recognizes lulust.com + susanexpectcare.com', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+
+      try {
+        settings.allowNsfw = true;
+
+        // 1. Mixed-case hostname canonicalization in extractVideoUrlsFromHtml
+        const htmlWithMixedCase = `
+          <script>
+            jwplayer("vplayer").setup({
+              sources: [
+                { file: "https://2rTd3chlML0g.tnmr.org/hls2/01/00942/lulust99xyz_h/master.m3u8?t=sig1" },
+                { file: "https://2rtd3chlml0g.tnmr.org/hls2/01/00942/lulust99xyz_h/master.m3u8?t=sig1" }
+              ]
+            });
+          </script>
+        `;
+        const extracted = extractVideoUrlsFromHtml(htmlWithMixedCase, 'https://lulust.com/e/lulust99xyz');
+        assert.strictEqual(
+          extracted.length,
+          1,
+          'Mixed-case CDN hostnames pointing to the identical stream must collapse to 1 canonical URL'
+        );
+        assert.strictEqual(
+          extracted[0],
+          'https://2rtd3chlml0g.tnmr.org/hls2/01/00942/lulust99xyz_h/master.m3u8?t=sig1'
+        );
+
+        // 2. ISO-8601 <meta itemprop="duration" content="P0DT0H7M45S"> (465s) parsing
+        const meta = extractEmbeddedPlayerMetaFromHtml(
+          '<html><head><meta itemprop="duration" content="P0DT0H7M45S" /><meta property="og:video:height" content="1080" /></head></html>'
+        );
+        assert.strictEqual(meta.duration, 465);
+        assert.strictEqual(meta.isHd, true);
+
+        // 3. lulust.com & susanexpectcare.com IP-bound + Referer helpers
+        assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://lulust.com/e/lulust99xyz'), true);
+        assert.strictEqual(isIpBoundEmbedOrCdnUrl('https://susanexpectcare.com/e/voe777xyz'), true);
+        assert.strictEqual(isStrictProxyBoundHlsUrl('https://lulust.com/hls/master.m3u8'), true);
+        assert.strictEqual(
+          getVideoRefererUrl({ videoUrl: 'https://lulust.com/hls/master.m3u8' }, 'https://lulust.com/hls/master.m3u8'),
+          'https://lulust.com/'
+        );
+        assert.strictEqual(
+          getVideoRefererUrl(
+            { videoUrl: 'https://susanexpectcare.com/hls/master.m3u8' },
+            'https://susanexpectcare.com/hls/master.m3u8'
+          ),
+          'https://susanexpectcare.com/'
+        );
+
+        // 4. Single FullTaboo post embedding lulust.com with 2 quality variants must emit 1 item (with convertedUrl backup) + 465s duration
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          if (u === 'https://fulltaboo.tv/exclusive-step-scene/') {
+            return new Response(
+              `<html>
+                <head>
+                  <title>Exclusive Step Scene - FullTaboo</title>
+                  <meta itemprop="duration" content="P0DT0H7M45S" />
+                  <meta itemprop="embedUrl" content="https://lulust.com/e/lulust99xyz" />
+                </head>
+                <body>
+                  <div class="sidebar">
+                    <a href="https://fulltaboo.tv/unrelated-sidebar-post/">Unrelated Sidebar Post</a>
+                  </div>
+                </body>
+              </html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (u === 'https://lulust.com/e/lulust99xyz') {
+            return new Response(
+              `<html><script>
+                sources: [
+                  { file: "https://2rTd3chlML0g.tnmr.org/hls2/01/00942/lulust99xyz_h/master.m3u8?t=tokA" },
+                  { file: "https://2rtd3chlml0g.tnmr.org/hls2/01/00942/lulust99xyz_n/index-v1-a1.m3u8?t=tokB" }
+                ]
+              </script></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          return new Response('Not Found', { status: 404 });
+        };
+
+        const items = await scanUrlForVideos('https://fulltaboo.tv/exclusive-step-scene/', 'FullTaboo');
+        assert.strictEqual(items.length, 1, 'LuluStream embed with master + index variants must emit 1 item, not duplicates');
+        assert.strictEqual(items[0].duration, 465);
+        assert.strictEqual(items[0].streamReferer, 'https://lulust.com/e/lulust99xyz');
+        assert.strictEqual(
+          items[0].convertedUrl,
+          'https://2rtd3chlml0g.tnmr.org/hls2/01/00942/lulust99xyz_n/index-v1-a1.m3u8?t=tokB'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+      }
+    });
+
+    it('prevents sidebar crawling on single watch pages, skips dead sbfull.com embeds, honors anti-CAPTCHA stop on gated klcams.com embeds, and decrypts un-gated Byse AES-GCM streams', async () => {
+      const origFetch = globalThis.fetch;
+      const origDoc = globalThis.document;
+      const origAllowNsfw = settings.allowNsfw;
+
+      const toastMessages = [];
+      const toastEl = {
+        textContent: '',
+        classList: {
+          add() {},
+          remove() {},
+          toggle() {},
+          contains: () => false
+        }
+      };
+
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: (id) => {
+          if (id === 'toast') {
+            return {
+              get textContent() {
+                return toastEl.textContent;
+              },
+              set textContent(v) {
+                toastEl.textContent = String(v);
+                toastMessages.push(String(v));
+              },
+              classList: toastEl.classList
+            };
+          }
+          return null;
+        },
+        querySelector: () => null,
+        querySelectorAll: () => []
+      };
+
+      // Encrypt a genuine AES-GCM Byse /embed/playback payload for the un-gated test case
+      const keyPart1 = new Uint8Array(16).fill(0x11);
+      const keyPart2 = new Uint8Array(16).fill(0x22);
+      const fullKey = new Uint8Array(32);
+      fullKey.set(keyPart1, 0);
+      fullKey.set(keyPart2, 16);
+      const iv = new Uint8Array(12).fill(0x33);
+      const cryptoKey = await globalThis.crypto.subtle.importKey(
+        'raw',
+        fullKey,
+        { name: 'AES-GCM' },
+        false,
+        ['encrypt']
+      );
+      const plainPayload = JSON.stringify({
+        sources: [{ url: 'https://edge-cdn.byse.example/hls/ungated_scene_1080p/master.m3u8', label: '1080p' }]
+      });
+      const encryptedBuf = await globalThis.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        cryptoKey,
+        new TextEncoder().encode(plainPayload)
+      );
+      const toB64Url = (u8) =>
+        Buffer.from(u8)
+          .toString('base64')
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/g, '');
+
+      const requestedUrls = [];
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        requestedUrls.push(u);
+
+        // Single watch page with dead sbfull.com + CAPTCHA-gated klcams.com + tempting sidebar links
+        if (u === 'https://fulltaboo.tv/gated-single-scene/') {
+          return new Response(
+            `<html>
+              <head><title>Gated Single Scene</title></head>
+              <body>
+                <iframe src="https://sbfull.com/e/deadlegacy123"></iframe>
+                <iframe src="https://klcams.com/e/gatedcode999"></iframe>
+                <div class="related-videos">
+                  <a href="https://fulltaboo.tv/sidebar-unrelated-video-one/">Sidebar 1</a>
+                  <a href="https://fulltaboo.tv/sidebar-unrelated-video-two/">Sidebar 2</a>
+                </div>
+              </body>
+            </html>`,
+            { status: 200, headers: { 'content-type': 'text/html' } }
+          );
+        }
+        if (u === 'https://klcams.com/api/videos/gatedcode999/embed/details') {
+          return new Response(
+            JSON.stringify({
+              code: 'gatedcode999',
+              title: 'Gated Single Scene',
+              embed_frame_url: 'https://n1mwq.org/e/gatedcode999'
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+        if (u === 'https://n1mwq.org/api/videos/gatedcode999/embed/settings') {
+          return new Response(
+            JSON.stringify({ captcha_required: true }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        // Un-gated Byse embed case (captcha_required: false)
+        if (u === 'https://klcams.com/api/videos/openbyse888/embed/details') {
+          return new Response(
+            JSON.stringify({
+              code: 'openbyse888',
+              title: 'Open Byse HD Scene',
+              embed_frame_url: 'https://n1mwq.org/e/openbyse888'
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+        if (u === 'https://n1mwq.org/api/videos/openbyse888/embed/settings') {
+          return new Response(
+            JSON.stringify({ captcha_required: false }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+        if (u === 'https://n1mwq.org/api/videos/openbyse888/embed/playback') {
+          return new Response(
+            JSON.stringify({
+              playback: {
+                iv: toB64Url(iv),
+                payload: toB64Url(new Uint8Array(encryptedBuf)),
+                key_parts: [toB64Url(keyPart1), toB64Url(keyPart2)]
+              }
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          );
+        }
+
+        return new Response('Not Found', { status: 404 });
+      };
+
+      try {
+        settings.allowNsfw = true;
+        setAppState({ videoQueue: [], currentIndex: -1 });
+
+        // 1. Gated single watch page: skips sbfull.com, never hits /captcha*, never crawls sidebar links, sets _captchaBlocked
+        const gatedScan = await scanUrlForVideos('https://fulltaboo.tv/gated-single-scene/', 'FullTaboo');
+        assert.strictEqual(gatedScan.length, 0);
+        assert.strictEqual(gatedScan._captchaBlocked, true);
+        assert.strictEqual(
+          requestedUrls.some((u) => u.includes('sbfull.com')),
+          false,
+          'Dead legacy StreamSB (sbfull.com) host must be skipped without wasting network timeouts'
+        );
+        assert.strictEqual(
+          requestedUrls.some((u) => u.includes('sidebar-unrelated-video')),
+          false,
+          'Single watch page with an embed must NEVER crawl unrelated sidebar videos'
+        );
+        assert.strictEqual(
+          requestedUrls.some((u) => /\/captcha/i.test(u)),
+          false,
+          'Must NEVER call /captcha* or attempt to solve/bypass CAPTCHA challenges'
+        );
+
+        // Direct user pull on CAPTCHA-gated watch URL surfaces clear, honest toast message
+        await pullSmartInputToPlayer('https://fulltaboo.tv/gated-single-scene/');
+        assert.ok(
+          toastMessages.some((m) => /interactive CAPTCHA/i.test(m)),
+          `Expected interactive CAPTCHA toast, got: ${JSON.stringify(toastMessages)}`
+        );
+
+        // 2. Un-gated Byse embed (captcha_required: false): decrypts AES-GCM playback JSON cleanly
+        const openByse = await resolveByseEmbedStreams(
+          'https://klcams.com/e/openbyse888',
+          'https://fulltaboo.tv/open-scene/'
+        );
+        assert.strictEqual(openByse.captchaRequired, false);
+        assert.strictEqual(openByse.title, 'Open Byse HD Scene');
+        assert.deepStrictEqual(openByse.urls, [
+          'https://edge-cdn.byse.example/hls/ungated_scene_1080p/master.m3u8'
+        ]);
+      } finally {
+        globalThis.fetch = origFetch;
+        globalThis.document = origDoc;
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({ videoQueue: [], currentIndex: -1 });
+      }
+    });
+
+    it('paginates deep into FullTaboo archive pages (/page/2..35/) once cached homepage clips have been seen', async () => {
+      const origFetch = globalThis.fetch;
+      const origAllowNsfw = settings.allowNsfw;
+      const origState = getAppState();
+
+      try {
+        settings.allowNsfw = true;
+        const ftSource = {
+          id: 'src-nsfw-fulltaboo',
+          type: 'url',
+          value: 'https://fulltaboo.tv/',
+          label: 'FullTaboo 18+',
+          enabled: true,
+          isNsfw: true
+        };
+        setAppState({ sources: [ftSource], videoQueue: [], currentIndex: -1 });
+
+        const hitListingUrls = [];
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          if (u === 'https://fulltaboo.tv/') {
+            hitListingUrls.push(u);
+            return new Response(
+              `<html><body>
+                <a href="https://fulltaboo.tv/home-post-alpha/">Home Alpha</a>
+                <a href="https://fulltaboo.tv/most-viewed/">Most Viewed Nav</a>
+                <a href="https://fulltaboo.tv/contact-us/">Contact Us Nav</a>
+              </body></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (/^https:\/\/fulltaboo\.tv\/page\/\d+\/$/.test(u)) {
+            hitListingUrls.push(u);
+            return new Response(
+              `<html><body>
+                <a href="https://fulltaboo.tv/archive-post-bravo/">Archive Bravo</a>
+              </body></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (u === 'https://fulltaboo.tv/home-post-alpha/') {
+            return new Response(
+              `<html><head><title>Home Alpha</title></head><body><iframe src="https://luluvid.com/e/homealpha11"></iframe></body></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (u === 'https://luluvid.com/e/homealpha11') {
+            return new Response(
+              `<html><script>sources: [{ file: "https://edge1.tnmr.org/hls2/01/001/homealpha11_h/master.m3u8?t=1" }]</script></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (u === 'https://fulltaboo.tv/archive-post-bravo/') {
+            return new Response(
+              `<html><head><title>Archive Bravo</title></head><body><iframe src="https://luluvid.com/e/archbravo22"></iframe></body></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          if (u === 'https://luluvid.com/e/archbravo22') {
+            return new Response(
+              `<html><script>sources: [{ file: "https://edge2.tnmr.org/hls2/01/002/archbravo22_h/master.m3u8?t=2" }]</script></html>`,
+              { status: 200, headers: { 'content-type': 'text/html' } }
+            );
+          }
+          throw new Error(`Unexpected URL in pagination test: ${u}`);
+        };
+
+        // Round 1: pulls homepage clip and caches homepage pool
+        const round1 = await pullFromSource(ftSource);
+        assert.strictEqual(round1.length, 1);
+        assert.strictEqual(round1[0].title, 'Home Alpha');
+        assert.strictEqual(hitListingUrls[0], 'https://fulltaboo.tv/');
+
+        // Mark homepage clip as seen -> Round 2 must bypass exhausted homepage cache and crawl /page/<2..35>/
+        recordSeenVideoItem(round1[0], { persist: false });
+        const round2 = await pullFromSource(ftSource);
+        assert.strictEqual(round2.length, 1);
+        assert.strictEqual(round2[0].title, 'Archive Bravo');
+        assert.ok(
+          hitListingUrls.some((u) => /^https:\/\/fulltaboo\.tv\/page\/([2-9]|[12]\d|3[0-5])\/$/.test(u)),
+          `Expected archive pagination URL /page/2..35/, got: ${JSON.stringify(hitListingUrls)}`
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        settings.allowNsfw = origAllowNsfw;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+
+    it('deduplicates rotating CDN tokens, crossposts, and FullTaboo re-uploads across all feed entry points while preserving multi-video HTML galleries and scrubbing 18+ seen history', async () => {
+      const origFetch = globalThis.fetch;
+      const origStorage = globalThis.localStorage;
+      const origDoc = globalThis.document;
+      const origAllowNsfw = settings.allowNsfw;
+      const origResume = settings.resumePlayback;
+      const origState = getAppState();
+
+      const store = new Map();
+      globalThis.localStorage = {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k)
+      };
+      globalThis.document = {
+        hidden: false,
+        body: { classList: { contains: () => false } },
+        getElementById: () => null,
+        querySelector: () => null,
+        querySelectorAll: () => []
+      };
+
+      try {
+        settings.allowNsfw = true;
+        settings.resumePlayback = true;
+
+        // 1. Canonical fingerprint matching across rotating CDN tokens, crossposts, Archive.org formats & FullTaboo re-uploads
+        const candidateBatch = [
+          // LuluVid clip on edge1 with token A
+          {
+            id: 'ft-1',
+            title: 'Taboo Family Dinner Night',
+            videoUrl: 'https://edge1.tnmr.org/hls2/01/00942/luluabc12345_h/master.m3u8?t=tokenOne&s=111',
+            streamReferer: 'https://luluvid.com/e/luluabc12345',
+            pageUrl: 'https://fulltaboo.tv/taboo-family-dinner-night/',
+            platform: 'fulltaboo',
+            isNsfw: true
+          },
+          // Same LuluVid clip on edge9 with rotated token B
+          {
+            id: 'ft-1-rotated',
+            title: 'Taboo Family Dinner Night',
+            videoUrl: 'https://edge9.tnmr.org/hls2/04/00942/luluabc12345_n/index-v1-a1.m3u8?t=tokenTwo&s=222',
+            streamReferer: 'https://lulust.com/e/luluabc12345',
+            pageUrl: 'https://fulltaboo.tv/taboo-family-dinner-night/?utm_source=feed',
+            platform: 'fulltaboo',
+            isNsfw: true
+          },
+          // FullTaboo re-upload of the exact same scene under a -2 slug with a different host
+          {
+            id: 'ft-1-reupload',
+            title: 'Taboo Family Dinner Night!',
+            videoUrl: 'https://cdn-a.cloudwindow-route.com/engine/hls2/01/099/voexyz98765/master.m3u8?t=voeTok1',
+            streamReferer: 'https://hentaisword.com/e/voexyz98765',
+            pageUrl: 'https://fulltaboo.tv/taboo-family-dinner-night-2/',
+            platform: 'fulltaboo',
+            isNsfw: true
+          },
+          // Reddit v.redd.it original post + crosspost in another subreddit
+          {
+            id: 'rd-orig',
+            title: 'Original Post',
+            videoUrl: 'https://v.redd.it/crosspost77/CMAF_720.mp4?source=fallback',
+            pageUrl: 'https://www.reddit.com/r/nsfw/comments/aaa111/original_post/',
+            platform: 'reddit',
+            isNsfw: true
+          },
+          {
+            id: 'rd-xpost',
+            title: 'Crossposted Clip',
+            videoUrl: 'https://v.redd.it/crosspost77/DASH_480.mp4',
+            pageUrl: 'https://www.reddit.com/r/AdultClips/comments/bbb222/crossposted_clip/',
+            platform: 'reddit',
+            isNsfw: true
+          },
+          // RedGIFs clip with two different expiring signatures
+          {
+            id: 'rg-velvetfox',
+            title: 'Velvet Fox',
+            videoUrl: 'https://media.redgifs.com/VelvetFox.mp4?expires=4102444800&signature=sigA',
+            pageUrl: 'https://www.redgifs.com/watch/velvetfox',
+            platform: 'redgifs',
+            isNsfw: true
+          },
+          {
+            id: 'web-rg-dup',
+            title: 'Velvet Fox Repost',
+            videoUrl: 'https://thumbs4.redgifs.com/VelvetFox-mobile.mp4?expires=4102999999&signature=sigB',
+            pageUrl: 'https://www.reddit.com/r/RealGirls/comments/ccc333/velvet_fox/',
+            platform: 'reddit',
+            isNsfw: true
+          },
+          // Multi-video HTML gallery page: TWO distinct videos sharing the same generic pageUrl MUST both survive!
+          {
+            id: 'gal-a',
+            title: 'Gallery Clip A',
+            videoUrl: 'https://cdn.indie-gallery.example/videos/clipA.mp4',
+            pageUrl: 'https://indie-gallery.example/showcase.html',
+            platform: 'web',
+            isNsfw: true
+          },
+          {
+            id: 'gal-b',
+            title: 'Gallery Clip B',
+            videoUrl: 'https://cdn.indie-gallery.example/videos/clipB.mp4',
+            pageUrl: 'https://indie-gallery.example/showcase.html',
+            platform: 'web',
+            isNsfw: true
+          }
+        ];
+
+        const deduped = deduplicateVideoItems(candidateBatch);
+        assert.deepStrictEqual(
+          deduped.map((v) => v.id),
+          ['ft-1', 'rd-orig', 'rg-velvetfox', 'gal-a', 'gal-b'],
+          'Must collapse rotated CDN tokens, crossposts, and FullTaboo re-uploads while keeping distinct gallery clips'
+        );
+
+        // Archive.org multi-derivative dedup check (ia-<identifier>-mp4 vs ia-<identifier>-ogv)
+        const iaDedup = deduplicateVideoItems([
+          {
+            id: 'ia-apollo11_launch-mp4',
+            title: 'Apollo 11 Launch',
+            videoUrl: 'https://archive.org/download/apollo11_launch/apollo11.ia.mp4',
+            pageUrl: 'https://archive.org/details/apollo11_launch',
+            platform: 'archive'
+          },
+          {
+            id: 'ia-apollo11_launch-ogv',
+            title: 'Apollo 11 Launch OGV',
+            videoUrl: 'https://archive.org/download/apollo11_launch/apollo11.ogv',
+            pageUrl: 'https://archive.org/details/apollo11_launch',
+            platform: 'archive'
+          }
+        ]);
+        assert.strictEqual(iaDedup.length, 1);
+
+        // 2. End-to-end queue deduplication across pullRandomVideos, queueSearchResultsToPlayer, and pullSmartInputToPlayer
+        const subA = {
+          id: 'src-sub-a',
+          type: 'subreddit',
+          value: 'SubAlpha',
+          label: 'r/SubAlpha',
+          enabled: true,
+          isNsfw: true
+        };
+        const subB = {
+          id: 'src-sub-b',
+          type: 'subreddit',
+          value: 'SubBeta',
+          label: 'r/SubBeta',
+          enabled: true,
+          isNsfw: true
+        };
+        setAppState({ sources: [subA, subB], videoQueue: [], currentIndex: -1 });
+
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          if (u.includes('/r/SubAlpha/')) {
+            return {
+              ok: true,
+              json: async () => ({
+                data: {
+                  children: [
+                    {
+                      data: {
+                        id: 'alpha1',
+                        title: 'Shared Crosspost',
+                        subreddit: 'SubAlpha',
+                        over_18: true,
+                        url_overridden_by_dest: 'https://v.redd.it/sharedvid99/DASH_720.mp4',
+                        permalink: '/r/SubAlpha/comments/alpha1/shared/'
+                      }
+                    },
+                    {
+                      data: {
+                        id: 'alpha2',
+                        title: 'Unique Alpha',
+                        subreddit: 'SubAlpha',
+                        over_18: true,
+                        url_overridden_by_dest: 'https://v.redd.it/uniquealpha22/DASH_720.mp4',
+                        permalink: '/r/SubAlpha/comments/alpha2/unique/'
+                      }
+                    }
+                  ]
+                }
+              })
+            };
+          }
+          if (u.includes('/r/SubBeta/')) {
+            return {
+              ok: true,
+              json: async () => ({
+                data: {
+                  children: [
+                    {
+                      data: {
+                        id: 'beta1',
+                        title: 'Shared Crosspost Reposted',
+                        subreddit: 'SubBeta',
+                        over_18: true,
+                        url_overridden_by_dest: 'https://v.redd.it/sharedvid99/CMAF_480.mp4',
+                        permalink: '/r/SubBeta/comments/beta1/shared_repost/'
+                      }
+                    },
+                    {
+                      data: {
+                        id: 'beta2',
+                        title: 'Unique Beta',
+                        subreddit: 'SubBeta',
+                        over_18: true,
+                        url_overridden_by_dest: 'https://v.redd.it/uniquebeta33/DASH_720.mp4',
+                        permalink: '/r/SubBeta/comments/beta2/unique/'
+                      }
+                    }
+                  ]
+                }
+              })
+            };
+          }
+          if (u === 'https://cdn.direct.example/shared-direct.mp4') {
+            return new Response('', { status: 200 });
+          }
+          return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+        };
+
+        await pullRandomVideos(5);
+        const qAfterPull = getAppState().videoQueue;
+        assert.strictEqual(
+          qAfterPull.length,
+          3,
+          'Crosspost v.redd.it/sharedvid99 across two enabled subreddits must appear only ONCE in videoQueue'
+        );
+
+        // Attempt to queue duplicate + 1 brand-new item via queueSearchResultsToPlayer
+        setAppState({
+          lastSearchResults: [
+            {
+              id: 'dup-shared',
+              title: 'Duplicate Shared',
+              videoUrl: 'https://v.redd.it/sharedvid99/DASH_1080.mp4',
+              platform: 'reddit',
+              isNsfw: true
+            },
+            {
+              id: 'brand-new-direct',
+              title: 'Brand New Direct',
+              videoUrl: 'https://cdn.direct.example/shared-direct.mp4',
+              format: 'mp4',
+              isNsfw: true
+            }
+          ]
+        });
+        const addedFromSearch = queueSearchResultsToPlayer({ startReels: false });
+        assert.strictEqual(addedFromSearch, 1);
+        assert.strictEqual(
+          getAppState().videoQueue.length,
+          4,
+          'queueSearchResultsToPlayer must skip already-queued videos and append only genuinely new items'
+        );
+
+        // Pulling an already-queued direct URL via pullSmartInputToPlayer jumps to existing index without duplicating
+        const lenBeforeSmartDup = getAppState().videoQueue.length;
+        await pullSmartInputToPlayer('https://cdn.direct.example/shared-direct.mp4');
+        assert.strictEqual(
+          getAppState().videoQueue.length,
+          lenBeforeSmartDup,
+          'pullSmartInputToPlayer must jump to existing queued video instead of inserting a duplicate'
+        );
+        assert.strictEqual(getAppState().currentIndex, lenBeforeSmartDup - 1);
+
+        // 3. Persistent 18+ seen history is saved to STORAGE_KEYS.SEEN_HISTORY and scrubbed when 18+ mode turns OFF
+        assert.ok(isVideoAlreadySeen(qAfterPull[0]), 'Queued video must be tracked in seen history');
+        const rawSeenBefore = JSON.parse(store.get(STORAGE_KEYS.SEEN_HISTORY) || '{}');
+        assert.ok(Array.isArray(rawSeenBefore.nsfw) && rawSeenBefore.nsfw.length > 0);
+
+        setAdultContentEnabled(false);
+        const rawSeenAfter = JSON.parse(store.get(STORAGE_KEYS.SEEN_HISTORY) || '{"nsfw":[]}');
+        assert.strictEqual(
+          (rawSeenAfter.nsfw || []).length,
+          0,
+          'Disabling 18+ Mode must scrub all 18+ fingerprints from persistent STORAGE_KEYS.SEEN_HISTORY'
+        );
+
+        // 4. restorePlaybackState deduplicates legacy saved queues on boot
+        settings.allowNsfw = true;
+        store.set(
+          STORAGE_KEYS.PLAYBACK_STATE,
+          JSON.stringify({
+            currentIndex: 0,
+            videoQueue: [
+              {
+                id: 'rest-1',
+                title: 'Restored Clip',
+                videoUrl: 'https://v.redd.it/sharedvid99/DASH_720.mp4',
+                originSourceId: 'src-sub-a',
+                platform: 'reddit',
+                isNsfw: true
+              },
+              {
+                id: 'rest-1-dup',
+                title: 'Restored Clip Duplicate',
+                videoUrl: 'https://v.redd.it/sharedvid99/CMAF_480.mp4',
+                originSourceId: 'src-sub-b',
+                platform: 'reddit',
+                isNsfw: true
+              }
+            ],
+            positions: {}
+          })
+        );
+        assert.strictEqual(restorePlaybackState(), true);
+        assert.strictEqual(
+          getAppState().videoQueue.length,
+          1,
+          'restorePlaybackState must collapse duplicate videos saved in legacy playback state'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+        globalThis.localStorage = origStorage;
+        globalThis.document = origDoc;
+        settings.allowNsfw = origAllowNsfw;
+        settings.resumePlayback = origResume;
+        setAppState({
+          sources: origState.sources,
+          videoQueue: origState.videoQueue,
+          currentIndex: origState.currentIndex
+        });
+      }
+    });
+  });
 });
+
 
 
 

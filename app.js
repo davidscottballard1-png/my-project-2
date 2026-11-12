@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v37';
+const APP_BUILD_VERSION = 'v38';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -8,6 +8,7 @@ const STORAGE_KEYS = {
   PLAYBACK_STATE: 'reelvault_playback_state_v1',
   CLOUD_CONFIG: 'reelvault_cloud_config_v1',
   AFFINITY_PROFILE: 'reelvault_affinity_v1',
+  SEEN_HISTORY: 'reelvault_seen_history_v1',
   APP_VERSION: 'reelvault_app_version_v1'
 };
 
@@ -377,7 +378,430 @@ let settings = {
 let videoQueue = [];
 let currentIndex = -1;
 let seenUrls = new Set();
+let seenVideoKeys = new Set();
+let seenHistoryByMode = { safe: [], nsfw: [] };
+const MAX_SEEN_HISTORY_KEYS_PER_MODE = 600;
+const visitedArchivePages = new Map();
 let deadUrls = new Set();
+
+const EPHEMERAL_STREAM_QUERY_PARAMS = new Set([
+  't',
+  's',
+  'e',
+  'f',
+  'i',
+  'sp',
+  'token',
+  'sig',
+  'signature',
+  'expires',
+  'exp',
+  'hash',
+  'hdnea',
+  'st',
+  'a',
+  'source',
+  'ip',
+  'ipbits',
+  'sparams',
+  'lsig',
+  'ratebypass',
+  'policy',
+  'key-pair-id',
+  'validfrom',
+  'validto'
+]);
+
+function normalizeStreamUrlForDedup(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const clean = unwrapProxyTargetUrl(rawUrl) || rawUrl.trim();
+  if (!clean) return '';
+  if (!/^https?:\/\//i.test(clean)) return clean;
+  try {
+    const u = new URL(clean);
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    const port = u.port ? `:${u.port}` : '';
+    const pathname = u.pathname.replace(/\/+$/, '') || '/';
+    const kept = [];
+    for (const [k, v] of u.searchParams.entries()) {
+      const lowerK = k.toLowerCase();
+      if (
+        EPHEMERAL_STREAM_QUERY_PARAMS.has(lowerK) ||
+        lowerK.startsWith('x-amz-') ||
+        lowerK.startsWith('utm_')
+      ) {
+        continue;
+      }
+      kept.push(`${encodeURIComponent(lowerK)}=${encodeURIComponent(v)}`);
+    }
+    kept.sort();
+    return `${host}${port}${pathname}${kept.length > 0 ? `?${kept.join('&')}` : ''}`;
+  } catch {
+    return clean;
+  }
+}
+
+function normalizeWatchPageUrlForDedup(rawPageUrl) {
+  if (!rawPageUrl || typeof rawPageUrl !== 'string') return '';
+  const clean = unwrapProxyTargetUrl(rawPageUrl) || rawPageUrl.trim();
+  if (!clean || !/^https?:\/\//i.test(clean)) return '';
+  try {
+    const u = new URL(clean);
+    if (DIRECT_VIDEO_URL_REGEX.test(u.pathname)) return '';
+    if (u.searchParams.has('s') || u.searchParams.has('q') || u.searchParams.has('search')) {
+      return '';
+    }
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    const pathname = u.pathname.replace(/\/+$/, '');
+    if (!pathname) return '';
+    if (
+      /^\/(?:page\/\d+|search|categories|category\/[^/]*|tags|tag\/[^/]*|r\/[^/]+(?:\/(?:hot|new|top|rising))?)$/i.test(
+        pathname
+      )
+    ) {
+      return '';
+    }
+    const kept = [];
+    for (const key of ['v', 'id', 'viewkey', 'title']) {
+      if (u.searchParams.has(key)) {
+        kept.push(`${key}=${encodeURIComponent(u.searchParams.get(key) || '')}`);
+      }
+    }
+    return `${host}${pathname}${kept.length > 0 ? `?${kept.join('&')}` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
+function getVideoDedupKeys(item) {
+  if (!item || typeof item !== 'object') return [];
+  const keys = new Set();
+
+  const rawPrimary =
+    typeof item.videoUrl === 'string'
+      ? unwrapProxyTargetUrl(item.videoUrl) || item.videoUrl.trim()
+      : '';
+  const rawConverted =
+    typeof item.convertedUrl === 'string'
+      ? unwrapProxyTargetUrl(item.convertedUrl) || item.convertedUrl.trim()
+      : '';
+  const rawPage = typeof item.pageUrl === 'string' ? item.pageUrl.trim() : '';
+  const rawOrig = typeof item.originalUrl === 'string' ? item.originalUrl.trim() : '';
+  const rawRef = typeof item.streamReferer === 'string' ? item.streamReferer.trim() : '';
+
+  const normPrimary = normalizeStreamUrlForDedup(rawPrimary);
+  if (normPrimary) {
+    keys.add(`stream:${normPrimary}`);
+  }
+  if (rawConverted && /^https?:\/\//i.test(rawConverted) && DIRECT_VIDEO_URL_REGEX.test(rawConverted)) {
+    const normConv = normalizeStreamUrlForDedup(rawConverted);
+    if (normConv) keys.add(`stream:${normConv}`);
+  }
+
+  const candidateUrls = [rawPrimary, rawConverted, rawRef, rawPage, rawOrig].filter(Boolean);
+  for (const u of candidateUrls) {
+    const luluHlsMatch = u.match(/\/hls2\/\d+\/\d+\/([a-z0-9]{6,})(?:_[a-z0-9]+)?\//i);
+    if (luluHlsMatch?.[1]) {
+      keys.add(`media:lulu:${luluHlsMatch[1].toLowerCase()}`);
+    }
+    const luluEmbedMatch = u.match(
+      /(?:luluvid|luluvdo|lulustream|lulust)\.com\/(?:e|d|v)\/([a-z0-9]{6,})/i
+    );
+    if (luluEmbedMatch?.[1]) {
+      keys.add(`media:lulu:${luluEmbedMatch[1].toLowerCase()}`);
+    }
+    const voeCdnMatch = u.match(
+      /\/engine\/(?:hls2[\w-]*|download)\/\d+\/\d+\/([a-z0-9]{6,})(?:_[a-z0-9,]+|\.)/i
+    );
+    if (voeCdnMatch?.[1]) {
+      keys.add(`media:voe:${voeCdnMatch[1].toLowerCase()}`);
+    }
+    const voeEmbedMatch = u.match(
+      /(?:voe\.sx|hentaisword\.com|susanexpectcare\.com)\/(?:e\/)?([a-z0-9]{8,})(?:[/?#]|$)/i
+    );
+    if (voeEmbedMatch?.[1]) {
+      keys.add(`media:voe-embed:${voeEmbedMatch[1].toLowerCase()}`);
+    }
+    const byseMatch = u.match(
+      /(?:klcams|filemoon|byse[\w-]*|n1mwq)\.[a-z]{2,}\/(?:e|d|[a-z0-9]{2,8})\/([a-z0-9]{8,})(?:[/?#]|$)/i
+    );
+    if (byseMatch?.[1]) {
+      keys.add(`media:byse:${byseMatch[1].toLowerCase()}`);
+    }
+    const vRedditMatch = u.match(/\/\/v\.redd\.it\/([a-z0-9]{6,})(?:[/?#]|$)/i);
+    if (vRedditMatch?.[1]) {
+      keys.add(`media:vreddit:${vRedditMatch[1].toLowerCase()}`);
+    }
+    const epMatch = u.match(/eporner\.com\/(?:video-|hd-porn\/|embed\/)([a-z0-9]{6,})/i);
+    if (epMatch?.[1]) {
+      keys.add(`media:eporner:${epMatch[1].toLowerCase()}`);
+    }
+  }
+
+  const rgSlug =
+    extractRedgifsId(rawPrimary) ||
+    extractRedgifsId(rawConverted) ||
+    extractRedgifsId(rawOrig) ||
+    extractRedgifsId(rawPage);
+  if (rgSlug) {
+    keys.add(`media:redgifs:${rgSlug.toLowerCase()}`);
+  }
+
+  const rawId = String(item.id || '').trim();
+  if (rawId) {
+    const iaMatch = rawId.match(/^ia-(.+)-[a-z0-9]{2,5}$/i);
+    if (iaMatch?.[1]) {
+      keys.add(`item-id:ia-${iaMatch[1].toLowerCase()}`);
+    } else if (
+      /^(?:rg|ep|rd|pt|wiki|nasa|dm|masto|lemmy|lemmynsfw|fb)-[a-z0-9_-]+$/i.test(rawId)
+    ) {
+      keys.add(`item-id:${rawId.toLowerCase()}`);
+    }
+  }
+
+  const platform = String(item.platform || inferVideoPlatform(item) || '').toLowerCase();
+  if (
+    rawPage &&
+    rawPage !== rawPrimary &&
+    (platform === 'fulltaboo' ||
+      platform === 'eporner' ||
+      platform === 'pornone' ||
+      platform === 'dailymotion' ||
+      platform === 'redgifs' ||
+      platform === 'wikimedia' ||
+      platform === 'peertube' ||
+      platform === 'nasa' ||
+      platform === 'archive' ||
+      platform === 'prelinger')
+  ) {
+    const normWatch = normalizeWatchPageUrlForDedup(rawPage);
+    if (normWatch) {
+      keys.add(`page:${normWatch}`);
+    }
+  }
+
+  if (platform === 'fulltaboo' && typeof item.title === 'string') {
+    const titleSlug = item.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '')
+      .trim();
+    if (
+      titleSlug.length >= 15 &&
+      !/^(?:video\d*|untitledvideo|extractedvideo|directvideo|episode\d+)$/.test(titleSlug)
+    ) {
+      keys.add(`ft-title:${titleSlug}`);
+    }
+  }
+
+  return [...keys];
+}
+
+function collectDedupKeySet(items) {
+  const out = new Set();
+  if (!Array.isArray(items)) return out;
+  for (const item of items) {
+    for (const k of getVideoDedupKeys(item)) {
+      out.add(k);
+    }
+  }
+  return out;
+}
+
+function hasAnyMatchingDedupKey(item, keySet) {
+  if (!item || !(keySet instanceof Set) || keySet.size === 0) return false;
+  const keys = getVideoDedupKeys(item);
+  for (const k of keys) {
+    if (keySet.has(k)) return true;
+  }
+  return false;
+}
+
+function deduplicateVideoItems(items, excludeKeySet = null) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const seenLocal =
+    excludeKeySet instanceof Set ? new Set(excludeKeySet) : new Set();
+  const unique = [];
+  for (const item of items) {
+    if (!item || !item.videoUrl) continue;
+    const itemKeys = getVideoDedupKeys(item);
+    if (itemKeys.some((k) => seenLocal.has(k))) {
+      continue;
+    }
+    for (const k of itemKeys) {
+      seenLocal.add(k);
+    }
+    unique.push(item);
+  }
+  return unique;
+}
+
+function findMatchingQueueIndex(item) {
+  if (!item || !Array.isArray(videoQueue) || videoQueue.length === 0) return -1;
+  const targetKeys = new Set(getVideoDedupKeys(item));
+  if (targetKeys.size === 0) {
+    return videoQueue.findIndex((q) => q && q.videoUrl === item.videoUrl);
+  }
+  return videoQueue.findIndex((q) => hasAnyMatchingDedupKey(q, targetKeys));
+}
+
+function isVideoAlreadySeen(item) {
+  if (!item) return false;
+  if (item.videoUrl && seenUrls.has(item.videoUrl)) return true;
+  return hasAnyMatchingDedupKey(item, seenVideoKeys);
+}
+
+function saveSeenHistoryState() {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const safeList = Array.isArray(seenHistoryByMode.safe)
+      ? seenHistoryByMode.safe.slice(-MAX_SEEN_HISTORY_KEYS_PER_MODE)
+      : [];
+    const nsfwList = Array.isArray(seenHistoryByMode.nsfw)
+      ? seenHistoryByMode.nsfw.slice(-MAX_SEEN_HISTORY_KEYS_PER_MODE)
+      : [];
+    if (safeList.length === 0 && nsfwList.length === 0) {
+      localStorage.removeItem(STORAGE_KEYS.SEEN_HISTORY);
+    } else {
+      localStorage.setItem(
+        STORAGE_KEYS.SEEN_HISTORY,
+        JSON.stringify({ safe: safeList, nsfw: nsfwList })
+      );
+    }
+  } catch {}
+}
+
+function rebuildActiveSeenSetFromMode() {
+  seenUrls.clear();
+  seenVideoKeys.clear();
+  const modeKey = settings.allowNsfw ? 'nsfw' : 'safe';
+  const modeList = Array.isArray(seenHistoryByMode[modeKey]) ? seenHistoryByMode[modeKey] : [];
+  for (const k of modeList) {
+    if (typeof k === 'string' && k) {
+      seenVideoKeys.add(k);
+    }
+  }
+  for (const qItem of videoQueue) {
+    if (qItem?.videoUrl) seenUrls.add(qItem.videoUrl);
+    for (const k of getVideoDedupKeys(qItem)) {
+      seenVideoKeys.add(k);
+    }
+  }
+}
+
+function loadSeenHistoryState() {
+  seenHistoryByMode = { safe: [], nsfw: [] };
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEYS.SEEN_HISTORY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed?.safe)) {
+          seenHistoryByMode.safe = parsed.safe
+            .filter((k) => typeof k === 'string' && k)
+            .slice(-MAX_SEEN_HISTORY_KEYS_PER_MODE);
+        }
+        if (Array.isArray(parsed?.nsfw)) {
+          seenHistoryByMode.nsfw = parsed.nsfw
+            .filter((k) => typeof k === 'string' && k)
+            .slice(-MAX_SEEN_HISTORY_KEYS_PER_MODE);
+        }
+      }
+    }
+  } catch {}
+  rebuildActiveSeenSetFromMode();
+}
+
+function recordSeenVideoItem(item, opts = {}) {
+  if (!item) return;
+  if (item.videoUrl) {
+    seenUrls.add(item.videoUrl);
+  }
+  const keys = getVideoDedupKeys(item);
+  for (const k of keys) {
+    seenVideoKeys.add(k);
+  }
+  if (opts?.persist === false || keys.length === 0) return;
+
+  const isNsfwItem = Boolean(item.isNsfw || item.over_18 || settings.allowNsfw);
+  const bucketKey = isNsfwItem ? 'nsfw' : 'safe';
+  const list = seenHistoryByMode[bucketKey];
+  const existingSet = new Set(list);
+  let changed = false;
+  for (const k of keys) {
+    if (!existingSet.has(k)) {
+      existingSet.add(k);
+      list.push(k);
+      changed = true;
+    }
+  }
+  if (list.length > MAX_SEEN_HISTORY_KEYS_PER_MODE) {
+    seenHistoryByMode[bucketKey] = list.slice(-MAX_SEEN_HISTORY_KEYS_PER_MODE);
+    changed = true;
+  }
+  if (changed) {
+    saveSeenHistoryState();
+  }
+}
+
+function removeSeenVideoItems(items) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const activeQueueKeys = collectDedupKeySet(videoQueue);
+  const activeQueueUrls = new Set(videoQueue.map((q) => q?.videoUrl).filter(Boolean));
+  const keysToRemove = new Set();
+
+  for (const item of items) {
+    if (item?.videoUrl && !activeQueueUrls.has(item.videoUrl)) {
+      seenUrls.delete(item.videoUrl);
+    }
+    for (const k of getVideoDedupKeys(item)) {
+      if (!activeQueueKeys.has(k)) {
+        seenVideoKeys.delete(k);
+        keysToRemove.add(k);
+      }
+    }
+  }
+
+  if (keysToRemove.size > 0) {
+    seenHistoryByMode.safe = seenHistoryByMode.safe.filter((k) => !keysToRemove.has(k));
+    seenHistoryByMode.nsfw = seenHistoryByMode.nsfw.filter((k) => !keysToRemove.has(k));
+    saveSeenHistoryState();
+  }
+}
+
+function recycleSeenHistoryKeepQueue() {
+  const modeKey = settings.allowNsfw ? 'nsfw' : 'safe';
+  seenHistoryByMode[modeKey] = [];
+  seenUrls.clear();
+  seenVideoKeys.clear();
+  for (const qItem of videoQueue) {
+    recordSeenVideoItem(qItem, { persist: false });
+  }
+  saveSeenHistoryState();
+}
+
+function clearSeenHistoryState(scope = 'all') {
+  if (scope === 'nsfw') {
+    seenHistoryByMode.nsfw = [];
+    saveSeenHistoryState();
+    rebuildActiveSeenSetFromMode();
+    return;
+  }
+  if (scope === 'safe') {
+    seenHistoryByMode.safe = [];
+    saveSeenHistoryState();
+    rebuildActiveSeenSetFromMode();
+    return;
+  }
+  seenHistoryByMode = { safe: [], nsfw: [] };
+  seenUrls.clear();
+  seenVideoKeys.clear();
+  visitedArchivePages.clear();
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEYS.SEEN_HISTORY);
+    }
+  } catch {}
+}
 let lastSearchResults = [];
 let playbackPositions = {};
 let isReelsFullscreen = false;
@@ -557,15 +981,21 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
     /(?:^|\.)[\w-]*tnmr\.org$/i.test(host) ||
     host.includes('luluvid.com') ||
     host.includes('luluvdo.com') ||
-    host.includes('lulustream.com')
+    host.includes('lulustream.com') ||
+    host.includes('lulust.com')
   ) {
-    return host.includes('luluvdo.com') ? 'https://luluvdo.com/' : 'https://luluvid.com/';
+    if (host.includes('luluvdo.com')) return 'https://luluvdo.com/';
+    if (host.includes('lulust.com')) return 'https://lulust.com/';
+    return 'https://luluvid.com/';
   }
   if (
     host.endsWith('cloudwindow-route.com') ||
     host.includes('voe.sx') ||
-    host.includes('hentaisword.com')
+    host.includes('hentaisword.com') ||
+    host.includes('susanexpectcare.com')
   ) {
+    if (host.includes('susanexpectcare.com')) return 'https://susanexpectcare.com/';
+    if (host.includes('hentaisword.com')) return 'https://hentaisword.com/';
     return 'https://voe.sx/';
   }
   if (platform === 'fulltaboo' || host.includes('fulltaboo.tv')) return 'https://fulltaboo.tv/';
@@ -614,7 +1044,7 @@ function isIpBoundEmbedOrCdnUrl(rawUrl) {
   if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
   const host = getHostnameSafe(cleanUrl);
   if (!host) return false;
-  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com|cloudwindow-route\.com)$/i.test(
+  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com|cloudwindow-route\.com)$/i.test(
     host
   );
 }
@@ -624,7 +1054,7 @@ function isStrictProxyBoundHlsUrl(rawUrl) {
   if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
   const host = getHostnameSafe(cleanUrl);
   if (!host) return false;
-  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|cloudwindow-route\.com)$/i.test(
+  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|cloudwindow-route\.com)$/i.test(
     host
   );
 }
@@ -1902,7 +2332,7 @@ async function shuffleVaultToPlayer(options = {}) {
     return [];
   }
 
-  const shuffled = matching
+  const shuffled = deduplicateVideoItems(matching)
     .map((item) => ({ ...item, fromVault: true }))
     .sort(() => Math.random() - 0.5);
   const nextUrls = new Set(shuffled.map((item) => item?.convertedBlobUrl || item?.offlineObjectUrl).filter(Boolean));
@@ -1915,7 +2345,7 @@ async function shuffleVaultToPlayer(options = {}) {
   videoQueue = shuffled;
   currentIndex = 0;
   for (const item of shuffled) {
-    if (item?.videoUrl) seenUrls.add(item.videoUrl);
+    recordSeenVideoItem(item, { persist: false });
   }
 
   if (typeof document !== 'undefined') {
@@ -2055,6 +2485,7 @@ function loadState() {
   }
 
   loadAffinityState();
+  loadSeenHistoryState();
 }
 
 function saveSources() {
@@ -2863,6 +3294,7 @@ function syncQueueAfterSourceChange() {
   sourceSelectionGeneration++;
   continuousSourceCursor = 0;
   sourcePoolCache.clear();
+  visitedArchivePages.clear();
   const ptEnabled = isPeerTubeExplicitlyEnabled();
   const active = getEffectiveActiveSources();
   const activeIds = new Set(active.map((s) => s?.id).filter(Boolean));
@@ -2872,9 +3304,7 @@ function syncQueueAfterSourceChange() {
     const wasPlayingPt = isPeerTubeVideoItem(currentItem);
     const removedPt = videoQueue.filter((item) => isPeerTubeVideoItem(item));
     videoQueue = videoQueue.filter((item) => !isPeerTubeVideoItem(item));
-    for (const item of removedPt) {
-      if (item?.videoUrl) seenUrls.delete(item.videoUrl);
-    }
+    removeSeenVideoItems(removedPt);
     revokeVideoItemBlobUrls(removedPt);
     if (videoQueue.length === 0) {
       currentIndex = -1;
@@ -2920,9 +3350,7 @@ function syncQueueAfterSourceChange() {
 
     if (removedUpcoming.length > 0) {
       videoQueue = [...preservedHead, ...keptUpcoming];
-      for (const item of removedUpcoming) {
-        if (item?.videoUrl) seenUrls.delete(item.videoUrl);
-      }
+      removeSeenVideoItems(removedUpcoming);
       revokeVideoItemBlobUrls(removedUpcoming);
 
       const nextRemaining = videoQueue[currentIndex + 1];
@@ -3132,6 +3560,7 @@ function scrubNsfwFromActiveSession() {
   const removedNsfw = videoQueue.filter((item) => isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => !isItemNsfw(item));
   revokeVideoItemBlobUrls(removedNsfw);
+  clearSeenHistoryState('nsfw');
   if (videoQueue.length === 0) {
     currentIndex = -1;
   } else if (currentIndex >= videoQueue.length) {
@@ -3199,6 +3628,7 @@ function scrubSafeFromActiveSession() {
   const removedSafe = videoQueue.filter((item) => !isItemNsfw(item));
   videoQueue = videoQueue.filter((item) => isItemNsfw(item));
   revokeVideoItemBlobUrls(removedSafe);
+  rebuildActiveSeenSetFromMode();
   if (videoQueue.length === 0) {
     currentIndex = -1;
   } else if (currentIndex >= videoQueue.length) {
@@ -3268,6 +3698,7 @@ function triggerPanicSafeMode() {
   const prevQueue = videoQueue;
   videoQueue = [safeClip];
   currentIndex = 0;
+  recordSeenVideoItem(safeClip, { persist: false });
   revokeVideoItemBlobUrls(prevQueue);
 
   if (typeof document !== 'undefined') {
@@ -3556,9 +3987,10 @@ function clearLoadedVideoQueue(opts = {}) {
   videoQueue = [];
   currentIndex = -1;
   playbackPositions = {};
-  seenUrls.clear();
+  clearSeenHistoryState('all');
   deadUrls.clear();
   sourcePoolCache.clear();
+  visitedArchivePages.clear();
   try {
     if (typeof localStorage !== 'undefined') {
       localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
@@ -3604,8 +4036,8 @@ function restorePlaybackState() {
     }
     const hadModeMatchingItems = restoredQueue.length > 0;
     const activeSources = getEffectiveActiveSources();
-    restoredQueue = restoredQueue.filter(
-      (item) => !isStaleOrDisallowedRestoredItem(item, activeSources)
+    restoredQueue = deduplicateVideoItems(
+      restoredQueue.filter((item) => !isStaleOrDisallowedRestoredItem(item, activeSources))
     );
     if (restoredQueue.length === 0) {
       if (hadModeMatchingItems && activeSources.length > 0) {
@@ -3617,6 +4049,12 @@ function restorePlaybackState() {
 
     const targetKey = getPlaybackItemKey(parsed.currentVideo);
     let restoredIndex = restoredQueue.findIndex((item) => getPlaybackItemKey(item) === targetKey);
+    if (restoredIndex < 0 && parsed.currentVideo) {
+      const targetDedupSet = collectDedupKeySet([parsed.currentVideo]);
+      restoredIndex = restoredQueue.findIndex((item) =>
+        hasAnyMatchingDedupKey(item, targetDedupSet)
+      );
+    }
     if (restoredIndex < 0) {
       restoredIndex =
         typeof parsed.currentIndex === 'number' &&
@@ -3654,7 +4092,7 @@ function restorePlaybackState() {
     videoQueue = restoredQueue;
     currentIndex = restoredIndex;
     for (const item of videoQueue) {
-      if (item?.videoUrl) seenUrls.add(item.videoUrl);
+      recordSeenVideoItem(item, { persist: false });
     }
 
     if (typeof document !== 'undefined' && document.getElementById('mainVideo')) {
@@ -4055,7 +4493,10 @@ function isInvalidCorsProxyPayload(payload, asText = false, targetUrl = '') {
       'query' in payload ||
       'response' in payload ||
       'media_attachments' in payload ||
-      'streamingPlaylists' in payload;
+      'streamingPlaylists' in payload ||
+      'embed_frame_url' in payload ||
+      'captcha_required' in payload ||
+      'payload' in payload;
     if (
       !hasDataKey &&
       ('error' in payload ||
@@ -5720,10 +6161,38 @@ function extractEmbeddedPlayerMetaFromHtml(rawText) {
       if (Number.isFinite(parsedDur) && parsedDur > 0 && parsedDur <= 43200) {
         duration = parsedDur;
       }
+    } else {
+      const isoDurMatch = rawText.match(
+        /<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](P(?:\d+D)?T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)["']/i
+      );
+      if (isoDurMatch?.[1]) {
+        const isoParts = isoDurMatch[1].match(
+          /^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i
+        );
+        if (isoParts) {
+          const totalSec = Math.round(
+            (Number(isoParts[1]) || 0) * 86400 +
+              (Number(isoParts[2]) || 0) * 3600 +
+              (Number(isoParts[3]) || 0) * 60 +
+              (Number(isoParts[4]) || 0)
+          );
+          if (totalSec > 0 && totalSec <= 43200) {
+            duration = totalSec;
+          }
+        }
+      }
     }
   }
   if (!isHd && /(?:_h\/master\.m3u8|\b(?:720|1080|1440|2160)p\b|for free in HD\b)/i.test(combined)) {
     isHd = true;
+  }
+  if (!isHd) {
+    const heightMeta = rawText.match(
+      /<meta[^>]+(?:property=["']og:video:height["']|itemprop=["']height["'])[^>]+content=["'](\d{3,4})["']/i
+    );
+    if (heightMeta?.[1] && Number(heightMeta[1]) >= 720) {
+      isHd = true;
+    }
   }
 
   return { duration, isHd, title };
@@ -5745,10 +6214,24 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     .replace(/&amp;/g, '&');
 
   const foundUrls = new Set();
+  const addCanonicalCandidate = (rawCandidate, allowRelative = false) => {
+    if (!rawCandidate || typeof rawCandidate !== 'string') return;
+    const trimmedCandidate = rawCandidate.trim();
+    if (!trimmedCandidate) return;
+    let canonical = trimmedCandidate;
+    try {
+      canonical = baseUrl ? new URL(trimmedCandidate, baseUrl).href : new URL(trimmedCandidate).href;
+    } catch {
+      if (allowRelative) return;
+    }
+    if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(canonical)) {
+      foundUrls.add(canonical);
+    }
+  };
 
   // 0. VOE JSON/base64 obfuscated stream payloads
   for (const voeUrl of decodeVoeEmbeddedStreams(rawText)) {
-    foundUrls.add(voeUrl);
+    addCanonicalCandidate(voeUrl);
   }
 
   // 1. Absolute video URLs across all 19 extensions (including inside inline <script> player configs)
@@ -5758,9 +6241,7 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
   );
   let m;
   while ((m = absRegex.exec(decodedText)) !== null) {
-    if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(m[0])) {
-      foundUrls.add(m[0]);
-    }
+    addCanonicalCandidate(m[0]);
   }
 
   // 2. Relative video src/href/data-src/file attributes & JSON tube player keys (KVS, SpankBang, PornOne, Streamable)
@@ -5770,14 +6251,7 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     'gi'
   );
   while ((m = relRegex.exec(decodedText)) !== null) {
-    try {
-      const resolved = new URL(m[1], baseUrl).href;
-      if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(resolved)) {
-        foundUrls.add(resolved);
-      }
-    } catch {
-      // ignore invalid relative URL
-    }
+    addCanonicalCandidate(m[1], true);
   }
 
   // 2B. Explicit video <meta> tags (itemprop="contentUrl", property="og:video", twitter:player:stream) in any attribute order
@@ -5793,20 +6267,13 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
     if (!metaVideoAttrRegex.test(tag)) continue;
     const cm = tag.match(metaVideoContentRegex);
     if (!cm || !cm[1]) continue;
-    try {
-      const resolved = new URL(cm[1], baseUrl).href;
-      if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(resolved)) {
-        foundUrls.add(resolved);
-      }
-    } catch {}
+    addCanonicalCandidate(cm[1], true);
   }
 
   // 3. Explicit HTML5 tube player setter calls (e.g. setVideoUrlHigh, setVideoUrlLow, setVideoHLS)
   const setterRegex = /setVideo(?:UrlHigh|UrlLow|HLS)\(\s*["'](https?:\/\/[^"']+)["']\s*\)/gi;
   while ((m = setterRegex.exec(decodedText)) !== null) {
-    if (!DECOY_OR_AD_VIDEO_URL_REGEX.test(m[1])) {
-      foundUrls.add(m[1]);
-    }
+    addCanonicalCandidate(m[1]);
   }
 
   // 4. OpenGraph & Twitter Player stream meta tags (<meta property="og:video" content="...">)
@@ -5817,7 +6284,7 @@ function extractVideoUrlsFromHtml(rawText, baseUrl) {
       !DECOY_OR_AD_VIDEO_URL_REGEX.test(m[1]) &&
       (DIRECT_VIDEO_URL_REGEX.test(m[1]) || /\.(?:mp4|m3u8|webm|mov)(\b|$)/i.test(m[1]))
     ) {
-      foundUrls.add(m[1]);
+      addCanonicalCandidate(m[1]);
     }
   }
 
@@ -6081,6 +6548,201 @@ async function searchCloudVideos(keyword, limit = 6) {
   return filtered.length > 0 ? filtered : results.slice(0, safeLimit);
 }
 
+function decodeBase64UrlToUint8Array(b64Url) {
+  const normalized = String(b64Url || '')
+    .trim()
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  if (!normalized) return new Uint8Array(0);
+  const padLen = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + '='.repeat(padLen);
+  if (typeof Buffer !== 'undefined') {
+    return new Uint8Array(Buffer.from(padded, 'base64'));
+  }
+  if (typeof atob === 'function') {
+    const bin = atob(padded);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return new Uint8Array(0);
+}
+
+const BYSE_EMBED_URL_REGEX =
+  /^https?:\/\/(?:www\.)?(?:klcams|filemoon|byse[\w-]*|n1mwq)\.[a-z]{2,}\/(?:e|d|[a-z0-9]{2,8})\/([a-z0-9]{8,})/i;
+const DEAD_LEGACY_EMBED_HOST_REGEX =
+  /(?:^|\.)(?:sbfull|streamsb|sbembed|sbplay\d*|watchsb|lvturbo)\.[a-z]{2,}$/i;
+
+// Resolve Byse Frontend SPA embeds ONLY when un-gated (captcha_required === false).
+// Never calls /captcha* endpoints or computes CAPTCHA / proof-of-work challenges.
+async function resolveByseEmbedStreams(embedUrl, parentReferer = '') {
+  if (!embedUrl || typeof embedUrl !== 'string') {
+    return { urls: [], captchaRequired: false, title: '' };
+  }
+  let parsedEmbed;
+  try {
+    parsedEmbed = new URL(embedUrl.trim());
+  } catch {
+    return { urls: [], captchaRequired: false, title: '' };
+  }
+  const codeMatch = parsedEmbed.pathname.match(
+    /\/(?:e|d|[a-z0-9]{2,8})\/([a-z0-9]{8,})(?:[/?#]|$)/i
+  );
+  const code = codeMatch?.[1] || '';
+  if (!code) {
+    return { urls: [], captchaRequired: false, title: '' };
+  }
+
+  let parentOriginHost = '';
+  let parentRefRoot = '';
+  if (parentReferer && /^https?:\/\//i.test(parentReferer)) {
+    try {
+      const pUrl = new URL(parentReferer.trim());
+      parentOriginHost = pUrl.hostname;
+      parentRefRoot = `${pUrl.origin}/`;
+    } catch {}
+  }
+
+  const embedHeaders = {
+    Accept: 'application/json',
+    ...(parentOriginHost ? { 'X-Embed-Origin': parentOriginHost } : {}),
+    ...(parentRefRoot ? { 'X-Embed-Referer': parentRefRoot } : {}),
+    'X-Embed-Parent': parsedEmbed.href
+  };
+
+  const fetchByseJson = async (apiUrl, timeoutMs = 4500) => {
+    if (!isCloudBackendConfigured()) {
+      try {
+        const res = await fetchWithTimeout(apiUrl, timeoutMs, { headers: embedHeaders });
+        if (res && res.ok) {
+          return await res.json();
+        }
+        if (res && res.status >= 400) {
+          return null;
+        }
+      } catch {
+        // Browser CORS preflight blocked custom X-Embed-* headers -> fall back to fetchWithCorsFallback
+      }
+    }
+    try {
+      return await fetchWithCorsFallback(apiUrl, false, parentReferer || parsedEmbed.href);
+    } catch {
+      return null;
+    }
+  };
+
+  try {
+    const details = await fetchByseJson(
+      `${parsedEmbed.origin}/api/videos/${encodeURIComponent(code)}/embed/details`,
+      4500
+    );
+    if (!details || typeof details !== 'object') {
+      return { urls: [], captchaRequired: false, title: '' };
+    }
+    const embedTitle = cleanScannedPageTitle(details?.title || '');
+    let frameOrigin = parsedEmbed.origin;
+    if (
+      typeof details?.embed_frame_url === 'string' &&
+      /^https?:\/\//i.test(details.embed_frame_url)
+    ) {
+      try {
+        frameOrigin = new URL(details.embed_frame_url).origin;
+      } catch {}
+    }
+
+    const settingsData = await fetchByseJson(
+      `${frameOrigin}/api/videos/${encodeURIComponent(code)}/embed/settings`,
+      4500
+    );
+    if (!settingsData || typeof settingsData !== 'object') {
+      return { urls: [], captchaRequired: false, title: embedTitle };
+    }
+    if (
+      settingsData?.captcha_required ||
+      settingsData?.recaptcha_required ||
+      settingsData?.pow_required ||
+      settingsData?.turnstile_required
+    ) {
+      return { urls: [], captchaRequired: true, title: embedTitle };
+    }
+
+    const playbackData = await fetchByseJson(
+      `${frameOrigin}/api/videos/${encodeURIComponent(code)}/embed/playback`,
+      5000
+    );
+    if (!playbackData || typeof playbackData !== 'object') {
+      return { urls: [], captchaRequired: false, title: embedTitle };
+    }
+
+    let sources = Array.isArray(playbackData?.sources) ? playbackData.sources : null;
+    const enc = playbackData?.playback || playbackData?.payload || playbackData;
+    if (
+      !sources &&
+      enc &&
+      typeof enc.iv === 'string' &&
+      typeof enc.payload === 'string' &&
+      Array.isArray(enc.key_parts) &&
+      enc.key_parts.length > 0 &&
+      globalThis.crypto?.subtle
+    ) {
+      const ivBytes = decodeBase64UrlToUint8Array(enc.iv);
+      const cipherBytes = decodeBase64UrlToUint8Array(enc.payload);
+      const partArrays = enc.key_parts.map(decodeBase64UrlToUint8Array);
+      const totalKeyLen = partArrays.reduce((sum, arr) => sum + arr.byteLength, 0);
+      const keyBytes = new Uint8Array(totalKeyLen);
+      let offset = 0;
+      for (const arr of partArrays) {
+        keyBytes.set(arr, offset);
+        offset += arr.byteLength;
+      }
+      if (
+        (totalKeyLen === 16 || totalKeyLen === 24 || totalKeyLen === 32) &&
+        ivBytes.byteLength > 0
+      ) {
+        const cryptoKey = await globalThis.crypto.subtle.importKey(
+          'raw',
+          keyBytes,
+          { name: 'AES-GCM' },
+          false,
+          ['decrypt']
+        );
+        const plainBuf = await globalThis.crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: ivBytes },
+          cryptoKey,
+          cipherBytes
+        );
+        const plainJson = JSON.parse(new TextDecoder().decode(plainBuf));
+        if (Array.isArray(plainJson?.sources)) {
+          sources = plainJson.sources;
+        }
+      }
+    }
+
+    const urls = [];
+    if (Array.isArray(sources)) {
+      for (const s of sources) {
+        const u = typeof s === 'string' ? s.trim() : String(s?.url || s?.file || '').trim();
+        if (
+          u &&
+          /^https?:\/\//i.test(u) &&
+          !DECOY_OR_AD_VIDEO_URL_REGEX.test(u) &&
+          !urls.includes(u)
+        ) {
+          urls.push(u);
+        }
+      }
+    }
+    return { urls, captchaRequired: false, title: embedTitle };
+  } catch {
+    return { urls: [], captchaRequired: false, title: '' };
+  }
+}
+
+function isWatchPageUrlAlreadySeen(rawPageUrl) {
+  const norm = normalizeWatchPageUrlForDedup(rawPageUrl);
+  return Boolean(norm && seenVideoKeys.has(`page:${norm}`));
+}
+
 // 8. Custom URL / Webpage & Free Tube Site Multi-Format Video Scanner
 async function scanUrlForVideos(
   targetUrl,
@@ -6090,6 +6752,12 @@ async function scanUrlForVideos(
 ) {
   const trimmed = targetUrl.trim();
   const markScannedNsfw = Boolean(settings.allowNsfw) || isKnownNsfwUrl(trimmed);
+
+  // Skip dead legacy StreamSB domains immediately without timing out
+  const trimmedHost = getHostnameSafe(trimmed);
+  if (trimmedHost && DEAD_LEGACY_EMBED_HOST_REGEX.test(trimmedHost)) {
+    return [];
+  }
 
   // Direct RedGIFs watch/embed link resolver
   if (/redgifs\.com\/(?:watch|ifr|detail)\//i.test(trimmed)) {
@@ -6155,6 +6823,40 @@ async function scanUrlForVideos(
   }
 
   let effectiveUrl = trimmed;
+  let blockedByEmbedCaptcha = false;
+  let byseResolvedTitle = '';
+
+  // Fast-path Byse Frontend SPA embeds (klcams.com / filemoon.sx): check /embed/settings first
+  if (BYSE_EMBED_URL_REGEX.test(trimmed)) {
+    const byseDirect = await resolveByseEmbedStreams(trimmed, refererOverride);
+    if (byseDirect.captchaRequired) {
+      const gatedOut = [];
+      gatedOut._captchaBlocked = true;
+      return gatedOut;
+    }
+    if (byseDirect.urls.length > 0) {
+      byseResolvedTitle = byseDirect.title || '';
+      const out = [];
+      const norm = normalizeAndAutoRewriteVideoUrl(byseDirect.urls[0]);
+      if (norm && isFormatAllowedBySettings(norm.format)) {
+        const built = normalizeVideoItem({
+          id: `scan-${Date.now()}-0`,
+          title: byseResolvedTitle || 'Embedded Video',
+          videoUrl: norm.videoUrl,
+          originalUrl: norm.originalUrl,
+          convertedUrl: norm.convertedUrl || byseDirect.urls[1] || null,
+          format: norm.format,
+          isAutoConverted: norm.isAutoConverted,
+          isNsfw: Boolean(markScannedNsfw || isKnownNsfwUrl(byseDirect.urls[0])),
+          sourceName: customLabel,
+          pageUrl: trimmed
+        });
+        if (built) out.push(built);
+      }
+      return out;
+    }
+  }
+
   let rawText = '';
   try {
     rawText = await fetchWithCorsFallback(trimmed, true, refererOverride);
@@ -6191,19 +6893,38 @@ async function scanUrlForVideos(
     }
   }
 
+  // Handle custom-domain Byse Frontend SPA shells discovered after fetching HTML
+  if (
+    extractedUrls.length === 0 &&
+    typeof rawText === 'string' &&
+    /<title[^>]*>\s*Byse Frontend\s*<\/title>/i.test(rawText)
+  ) {
+    const byseRes = await resolveByseEmbedStreams(effectiveUrl, refererOverride || trimmed);
+    if (byseRes.captchaRequired) {
+      blockedByEmbedCaptcha = true;
+    } else if (byseRes.urls.length > 0) {
+      extractedUrls = byseRes.urls;
+      byseResolvedTitle = byseRes.title || '';
+    }
+  }
+
   const titleMatch = String(rawText || '').match(/<title[^>]*>([^<]+)<\/title>/i);
-  const pageTitle = cleanScannedPageTitle(titleMatch?.[1] || '');
+  const rawPageTitle = cleanScannedPageTitle(titleMatch?.[1] || '');
+  const pageTitle = /^Byse Frontend$/i.test(rawPageTitle) ? '' : rawPageTitle;
   const embedMeta = extractEmbeddedPlayerMetaFromHtml(rawText);
-  const resolvedPageTitle = pageTitle || embedMeta.title || null;
+  const resolvedPageTitle = pageTitle || byseResolvedTitle || embedMeta.title || null;
 
   if (extractedUrls.length === 0 && rawText && /eporner\.com\//i.test(effectiveUrl)) {
     extractedUrls = await resolveEpornerStreamsFromEmbedHtml(rawText, null, effectiveUrl);
   }
 
   const voeStreams = decodeVoeEmbeddedStreams(rawText);
-  const collapseSingleEmbedStreams = voeStreams.length >= 1;
-  const urlsToMaterialize = collapseSingleEmbedStreams ? [voeStreams[0]] : extractedUrls;
-  const secondaryEmbedUrl = collapseSingleEmbedStreams ? voeStreams[1] || null : null;
+  const isSingleEmbedHost = /(?:luluvid|luluvdo|lulustream|lulust)\.com\//i.test(effectiveUrl);
+  const collapseSingleEmbedStreams =
+    voeStreams.length >= 1 || (isSingleEmbedHost && extractedUrls.length >= 1);
+  const primaryStreamPool = voeStreams.length >= 1 ? voeStreams : extractedUrls;
+  const urlsToMaterialize = collapseSingleEmbedStreams ? [primaryStreamPool[0]] : extractedUrls;
+  const secondaryEmbedUrl = collapseSingleEmbedStreams ? primaryStreamPool[1] || null : null;
 
   const results = [];
   let idx = 0;
@@ -6231,6 +6952,9 @@ async function scanUrlForVideos(
     idx++;
   }
 
+  // Track whether this page is a single-video watch page with an embedded player (so we never crawl random sidebar videos)
+  let hasSinglePlayerEmbed = false;
+
   // If this watch page embeds its player inside an <iframe> or <meta itemprop="embedUrl">, scan the embed src
   if (results.length === 0 && typeof rawText === 'string' && rawText.length > 0) {
     const iframeLinks = [];
@@ -6244,10 +6968,16 @@ async function scanUrlForVideos(
           frameUrl !== effectiveUrl &&
           !/(?:doubleclick|googlesyndication|exoclick|juicyads|trafficjunky|adserver|facebook|twitter|recaptcha|cloudflare)/i.test(
             frameUrl
-          ) &&
-          !iframeLinks.includes(frameUrl)
+          )
         ) {
-          iframeLinks.push(frameUrl);
+          hasSinglePlayerEmbed = true;
+          const frameHost = getHostnameSafe(frameUrl);
+          if (frameHost && DEAD_LEGACY_EMBED_HOST_REGEX.test(frameHost)) {
+            return;
+          }
+          if (!iframeLinks.includes(frameUrl)) {
+            iframeLinks.push(frameUrl);
+          }
         }
       } catch {
         // ignore invalid iframe URL
@@ -6273,6 +7003,9 @@ async function scanUrlForVideos(
         const s = frameSettled[i];
         const fallbackFrameUrl = iframeLinks[i];
         if (s.status === 'fulfilled' && Array.isArray(s.value)) {
+          if (s.value._captchaBlocked) {
+            blockedByEmbedCaptcha = true;
+          }
           for (const item of s.value.slice(0, 2)) {
             if (!item.streamReferer) {
               item.streamReferer =
@@ -6300,7 +7033,13 @@ async function scanUrlForVideos(
         }
       }
 
-      if (results.length === 0 && !triedCloudExtract && allowSubpageCrawl && isCloudBackendConfigured()) {
+      if (
+        results.length === 0 &&
+        !blockedByEmbedCaptcha &&
+        !triedCloudExtract &&
+        allowSubpageCrawl &&
+        isCloudBackendConfigured()
+      ) {
         triedCloudExtract = true;
         const cloudFrameItems = await fetchCloudExtractedItems(
           iframeLinks[0],
@@ -6319,9 +7058,10 @@ async function scanUrlForVideos(
     }
   }
 
-  // When scanning a single watch page with Cloud connected, run yt-dlp /extract BEFORE crawling random sidebar subpages
+  // When scanning a single watch page with Cloud connected, run yt-dlp /extract BEFORE crawling subpages
   if (
     !triedCloudExtract &&
+    !blockedByEmbedCaptcha &&
     results.length === 0 &&
     allowSubpageCrawl &&
     isCloudBackendConfigured() &&
@@ -6332,18 +7072,18 @@ async function scanUrlForVideos(
     results.push(...cloudWatchItems);
   }
 
-  // Two-Hop Tube Listing Crawler: if this was a tube homepage/search/category page, crawl up to 6 randomized watch pages
+  // Two-Hop Tube Listing Crawler: ONLY run on listing/category/search pages (never on single watch pages)
   if (
     allowSubpageCrawl &&
-    results.length < 2 &&
-    !(triedCloudExtract && results.length > 0) &&
+    results.length === 0 &&
+    !hasSinglePlayerEmbed &&
     typeof rawText === 'string' &&
     rawText.length > 0
   ) {
     const candidateLinks = [];
     const linkRegex = /href=["']([^"']*(?:\/video[^"']*|\bviewkey=[^"']+|\/watch\/[^"']+|\/videos\/[^"']+|\/v\/[^"']+))["']/gi;
     let lm;
-    while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 24) {
+    while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 30) {
       try {
         const fullLink = new URL(lm[1].replace(/&amp;/g, '&'), trimmed).href;
         if (fullLink !== trimmed && !candidateLinks.includes(fullLink)) {
@@ -6355,22 +7095,22 @@ async function scanUrlForVideos(
     }
 
     // Also support WordPress / Tube post-slug watch pages on the same host (e.g. https://fulltaboo.tv/post-title-slug/)
-    if (candidateLinks.length < 24) {
+    if (candidateLinks.length < 30) {
       let baseHost = '';
       try {
         baseHost = new URL(trimmed).host;
       } catch {}
       const slugRegex = /href=["']([^"'#?]+)["']/gi;
       let sm;
-      while ((sm = slugRegex.exec(rawText)) !== null && candidateLinks.length < 24) {
+      while ((sm = slugRegex.exec(rawText)) !== null && candidateLinks.length < 30) {
         try {
           const parsed = new URL(sm[1].replace(/&amp;/g, '&'), trimmed);
           if (baseHost && parsed.host !== baseHost) continue;
           const pathClean = parsed.pathname.replace(/^\/+|\/+$/g, '');
-          // Match single-segment hyphenated post slugs while excluding navigation/taxonomy paths
+          // Match single-segment hyphenated post slugs while excluding navigation/taxonomy/archive paths
           if (
             /^[a-z0-9]+-[a-z0-9-]{4,}$/i.test(pathClean) &&
-            !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|pornstar|pornstars|partner|partners|page|wp-[a-z0-9-]+|feed|about|contact|privacy|terms|dmca|login|register)/i.test(
+            !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|pornstar|pornstars|partner|partners|page|wp-[a-z0-9-]+|feed|about|contact(?:-us)?|privacy(?:-policy)?|terms(?:-of-(?:use|service))?|dmca(?:-\d+)?|2257|sitemap|login|register|most-viewed|top-rated|longest-videos|latest-videos|random-videos|popular-videos|trending-videos|all-videos|submit-video)$/i.test(
               pathClean
             ) &&
             parsed.href !== trimmed &&
@@ -6384,8 +7124,14 @@ async function scanUrlForVideos(
       }
     }
 
-    const shuffledCandidates = shuffleArray(candidateLinks);
-    const firstBatch = shuffledCandidates.slice(0, 6);
+    const unseenLinks = shuffleArray(
+      candidateLinks.filter((u) => !isWatchPageUrlAlreadySeen(u))
+    );
+    const seenLinks = shuffleArray(
+      candidateLinks.filter((u) => isWatchPageUrlAlreadySeen(u))
+    );
+    const prioritizedCandidates = [...unseenLinks, ...seenLinks];
+    const firstBatch = prioritizedCandidates.slice(0, 8);
     if (firstBatch.length > 0) {
       const subSettled = await Promise.allSettled(
         firstBatch.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
@@ -6395,8 +7141,8 @@ async function scanUrlForVideos(
           results.push(...s.value.slice(0, 2));
         }
       }
-      if (results.length < 3 && shuffledCandidates.length > 6) {
-        const secondBatch = shuffledCandidates.slice(6, 12);
+      if (results.length < 3 && prioritizedCandidates.length > 8) {
+        const secondBatch = prioritizedCandidates.slice(8, 14);
         const secondSettled = await Promise.allSettled(
           secondBatch.map((wUrl) => scanUrlForVideos(wUrl, customLabel, false))
         );
@@ -6412,6 +7158,7 @@ async function scanUrlForVideos(
   // Cloud yt-dlp Extractor Fallback: unlock 1,800+ websites when connected to Private Cloud Server
   if (
     !triedCloudExtract &&
+    !blockedByEmbedCaptcha &&
     results.length === 0 &&
     allowSubpageCrawl &&
     isCloudBackendConfigured() &&
@@ -6421,15 +7168,19 @@ async function scanUrlForVideos(
     results.push(...cloudFallbackItems);
   }
 
+  const dedupedOut = deduplicateVideoItems(results);
   if (markScannedNsfw) {
-    for (const item of results) {
+    for (const item of dedupedOut) {
       if (item && typeof item === 'object') {
         item.isNsfw = true;
       }
     }
   }
+  if (dedupedOut.length === 0 && blockedByEmbedCaptcha) {
+    dedupedOut._captchaBlocked = true;
+  }
 
-  return results;
+  return dedupedOut;
 }
 
 // Helper: Extract candidate external video/tube pages from search engine HTML (e.g. DuckDuckGo HTML/Lite)
@@ -6520,10 +7271,12 @@ async function searchOpenWebVideos(keyword, limit = 6) {
   if (!cleanKw) return [];
 
   const results = [];
-  const seenUrlsInWeb = new Set();
+  const seenKeysInWeb = new Set();
   const addResult = (item) => {
-    if (item?.videoUrl && !seenUrlsInWeb.has(item.videoUrl)) {
-      seenUrlsInWeb.add(item.videoUrl);
+    if (item?.videoUrl && !hasAnyMatchingDedupKey(item, seenKeysInWeb)) {
+      for (const k of getVideoDedupKeys(item)) {
+        seenKeysInWeb.add(k);
+      }
       results.push(item);
     }
   };
@@ -6786,8 +7539,11 @@ async function searchFreeTubeSites(keyword, limit = 6) {
   }
 
   await Promise.allSettled(tasks);
-  const filtered = filterAndSortTubeResults(results);
-  return filtered.length > 0 ? filtered : filterAndSortTubeResults(results, 'all', settings.tubeQualityFilter);
+  const dedupedResults = deduplicateVideoItems(results);
+  const filtered = filterAndSortTubeResults(dedupedResults);
+  return filtered.length > 0
+    ? filtered
+    : filterAndSortTubeResults(dedupedResults, 'all', settings.tubeQualityFilter);
 }
 
 // In-memory source pool cache (3-minute TTL) for instant 0ms subsequent pulls
@@ -6919,9 +7675,55 @@ function getSourceCacheKey(source) {
   return `${source.id || ''}:${source.type}:${String(source.value || '').toLowerCase()}:${settings.formatMode}:${settings.allowNsfw}:${ptFlag}:${cloudFlag}:${durFilter}:${qualFilter}`;
 }
 
+function canPaginateTubeListingUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  try {
+    const u = new URL(rawUrl.trim());
+    if (!/^https?:$/i.test(u.protocol)) return false;
+    if (u.search || DIRECT_VIDEO_URL_REGEX.test(u.pathname)) return false;
+    if (/reddit\.com|redd\.it|redgifs\.com|archive\.org|wikimedia\.org|nasa\.gov/i.test(u.hostname)) {
+      return false;
+    }
+    const cleanPath = u.pathname.replace(/^\/+|\/+$/g, '');
+    if (!cleanPath) return true;
+    if (/^page\/\d+$/i.test(cleanPath)) return false;
+    if (/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels)\/[^/]+$/i.test(cleanPath)) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function pickNextTubeArchivePageUrl(rawUrl, sourceKey, maxPage = 35) {
+  try {
+    const u = new URL(rawUrl.trim());
+    let usedSet = visitedArchivePages.get(sourceKey);
+    if (!usedSet) {
+      usedSet = new Set();
+      visitedArchivePages.set(sourceKey, usedSet);
+    }
+    const available = [];
+    for (let p = 2; p <= maxPage; p++) {
+      if (!usedSet.has(p)) available.push(p);
+    }
+    if (available.length === 0) {
+      usedSet.clear();
+      for (let p = 2; p <= maxPage; p++) available.push(p);
+    }
+    const chosenPage = available[Math.floor(Math.random() * available.length)];
+    usedSet.add(chosenPage);
+    const basePath = u.pathname.replace(/\/+$/, '');
+    return `${u.origin}${basePath}/page/${chosenPage}/`;
+  } catch {
+    return '';
+  }
+}
+
 function interleaveVideoBuckets(buckets) {
   const combined = [];
-  const seenInPool = new Set();
+  const seenKeysInPool = new Set();
   const validBuckets = (Array.isArray(buckets) ? buckets : []).filter(
     (b) => Array.isArray(b) && b.length > 0
   );
@@ -6929,8 +7731,10 @@ function interleaveVideoBuckets(buckets) {
   for (let i = 0; i < maxLen; i++) {
     for (const bucket of validBuckets) {
       const item = bucket[i];
-      if (item?.videoUrl && !seenInPool.has(item.videoUrl)) {
-        seenInPool.add(item.videoUrl);
+      if (item?.videoUrl && !hasAnyMatchingDedupKey(item, seenKeysInPool)) {
+        for (const k of getVideoDedupKeys(item)) {
+          seenKeysInPool.add(k);
+        }
         combined.push(item);
       }
     }
@@ -6941,7 +7745,7 @@ function interleaveVideoBuckets(buckets) {
 // Pull videos from a single source object, randomize within the source pool, and tag originSourceId
 async function pullFromSource(source) {
   const stampAndShuffle = (list) =>
-    shuffleArray(list)
+    deduplicateVideoItems(shuffleArray(list))
       .filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl))
       .map((item) => (source?.id ? { ...item, originSourceId: source.id } : { ...item }));
 
@@ -6950,7 +7754,7 @@ async function pullFromSource(source) {
   if (cached && Date.now() - cached.timestamp < SOURCE_CACHE_TTL_MS) {
     const unseen = filterAndSortTubeResults(
       cached.items.filter(
-        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !isVideoAlreadySeen(item)
       )
     );
     if (unseen.length >= 2) {
@@ -6959,21 +7763,40 @@ async function pullFromSource(source) {
   }
 
   if (source.type === 'subreddit') {
-    const items = await fetchSubredditVideos(source.value);
+    const items = deduplicateVideoItems(await fetchSubredditVideos(source.value));
     if (items.length > 0) {
       sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
     }
     return stampAndShuffle(items);
   }
   if (source.type === 'url' || /^https?:\/\//i.test(String(source.value || '').trim())) {
-    const items = await scanUrlForVideos(source.value, source.label || 'Custom URL');
+    const label = source.label || 'Custom URL';
+    let items = [];
+    // When homepage/listing cache ran low on unseen videos, sample a deeper archive page (/page/2..35/) first
+    if (cached && canPaginateTubeListingUrl(source.value)) {
+      const archivePageUrl = pickNextTubeArchivePageUrl(source.value, cacheKey);
+      if (archivePageUrl) {
+        try {
+          items = await scanUrlForVideos(archivePageUrl, label);
+        } catch {
+          items = [];
+        }
+      }
+    }
+    if (items.length === 0) {
+      items = await scanUrlForVideos(source.value, label);
+    }
+    items = deduplicateVideoItems(items);
     if (source.isNsfw || settings.allowNsfw) {
       items.forEach((item) => {
         item.isNsfw = true;
       });
     }
     if (items.length > 0) {
-      sourcePoolCache.set(cacheKey, { items, timestamp: Date.now() });
+      const mergedCacheItems = cached?.items
+        ? deduplicateVideoItems([...items, ...cached.items]).slice(0, 60)
+        : items;
+      sourcePoolCache.set(cacheKey, { items: mergedCacheItems, timestamp: Date.now() });
     }
     return stampAndShuffle(items);
   }
@@ -7138,22 +7961,27 @@ async function runContinuousPullCycle() {
         }
       }
 
+      const queueKeySet = collectDedupKeySet(videoQueue);
       const interleaved = interleaveVideoBuckets(buckets).filter(
         (item) => item?.videoUrl && !deadUrls.has(item.videoUrl)
       );
-      let fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
+      let fresh = deduplicateVideoItems(
+        interleaved.filter((item) => item?.videoUrl && !isVideoAlreadySeen(item)),
+        queueKeySet
+      );
       if (fresh.length === 0 && interleaved.length > 1 && effectiveSources.length === 1) {
-        const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
-        for (const item of interleaved) {
-          if (item?.videoUrl && item.videoUrl !== currentPlayingUrl) {
-            seenUrls.delete(item.videoUrl);
-          }
+        const recyclable = deduplicateVideoItems(interleaved, queueKeySet);
+        if (recyclable.length > 0) {
+          recycleSeenHistoryKeepQueue();
+          fresh = recyclable;
         }
-        fresh = interleaved.filter((item) => item?.videoUrl && !seenUrls.has(item.videoUrl));
       }
-      const picks = rankVideosByAffinity(fresh, { isNsfw: pullAllowNsfw }).slice(0, 4);
+      const picks = deduplicateVideoItems(
+        rankVideosByAffinity(fresh, { isNsfw: pullAllowNsfw }),
+        queueKeySet
+      ).slice(0, 4);
       for (const p of picks) {
-        seenUrls.add(p.videoUrl);
+        recordSeenVideoItem(p);
         videoQueue.push(p);
         addedCount++;
       }
@@ -9650,7 +10478,7 @@ async function handleVideoPlaybackError(opts = {}) {
       !current._triedDirectBypass &&
       opts?.reason !== 'decoy-bumper' &&
       /^https:\/\//i.test(current.videoUrl || '') &&
-      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|luluvid\.com|luluvdo\.com|lulustream\.com|voe\.sx|hentaisword\.com)/i.test(
+      !/(?:googlevideo\.com|eporner\.com|tiktokcdn|byteoversea\.com|bilivideo\.com|[\w-]*tnmr\.org|cloudwindow-route\.com|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com)/i.test(
         current.videoUrl || ''
       )
     ) {
@@ -9833,9 +10661,14 @@ async function pullRandomVideos(count = 1, customKeyword = null, opts = {}) {
           }
         }
 
+        const waveQueueKeys = collectDedupKeySet(videoQueue);
         const candidatePool = interleaveVideoBuckets(sourceBuckets);
         const unseenInWave = candidatePool.filter(
-          (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+          (item) =>
+            item?.videoUrl &&
+            !deadUrls.has(item.videoUrl) &&
+            !isVideoAlreadySeen(item) &&
+            !hasAnyMatchingDedupKey(item, waveQueueKeys)
         );
         if (unseenInWave.length >= Math.max(1, count)) {
           break;
@@ -9877,20 +10710,35 @@ async function pullRandomVideos(count = 1, customKeyword = null, opts = {}) {
       return;
     }
 
-    let fresh = pool.filter(
-      (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
+    const queueKeySet = collectDedupKeySet(videoQueue);
+    let fresh = deduplicateVideoItems(
+      pool.filter(
+        (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !isVideoAlreadySeen(item)
+      ),
+      queueKeySet
     );
     if (fresh.length === 0 && pool.length > 0) {
-      const currentPlayingUrl = videoQueue[currentIndex]?.videoUrl;
-      seenUrls.clear();
-      if (currentPlayingUrl && pool.length > 1) {
-        seenUrls.add(currentPlayingUrl);
-        fresh = pool.filter(
-          (item) => item?.videoUrl && !deadUrls.has(item.videoUrl) && !seenUrls.has(item.videoUrl)
-        );
-      }
-      if (fresh.length === 0) {
-        fresh = pool.filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl));
+      // Recycle historically seen clips ONLY if they are not currently sitting in videoQueue
+      const recyclable = deduplicateVideoItems(
+        pool.filter((item) => item?.videoUrl && !deadUrls.has(item.videoUrl)),
+        queueKeySet
+      );
+      if (recyclable.length > 0) {
+        recycleSeenHistoryKeepQueue();
+        fresh = recyclable;
+      } else if (videoQueue.length > 0) {
+        // Every clip from the source is already in videoQueue — focus an existing item instead of duplicating
+        const altIndices = [];
+        for (let i = 0; i < videoQueue.length; i++) {
+          if (i !== currentIndex) altIndices.push(i);
+        }
+        const nextIdx =
+          altIndices.length > 0
+            ? altIndices[Math.floor(Math.random() * altIndices.length)]
+            : Math.max(0, currentIndex);
+        currentIndex = nextIdx;
+        updatePlayerUI();
+        return [videoQueue[currentIndex]];
       }
     }
 
@@ -9904,15 +10752,24 @@ async function pullRandomVideos(count = 1, customKeyword = null, opts = {}) {
         setPlayerLoading(false);
         return [];
       }
-      fresh = [...FALLBACK_VIDEOS];
+      fresh = deduplicateVideoItems([...FALLBACK_VIDEOS], queueKeySet);
+      if (fresh.length === 0 && videoQueue.length > 0) {
+        currentIndex = (currentIndex + 1) % videoQueue.length;
+        updatePlayerUI();
+        return [videoQueue[currentIndex]];
+      }
     }
 
     const orderedFresh = customKeyword
       ? shuffleArray(fresh)
       : rankVideosByAffinity(fresh, { isNsfw: pullAllowNsfw });
-    const selected = orderedFresh.slice(0, count);
+    const selected = deduplicateVideoItems(orderedFresh, queueKeySet).slice(0, count);
+    if (selected.length === 0) {
+      updatePlayerUI();
+      return [];
+    }
     for (const item of selected) {
-      seenUrls.add(item.videoUrl);
+      recordSeenVideoItem(item);
       videoQueue.push(item);
     }
 
@@ -9936,7 +10793,24 @@ async function pullRandomVideos(count = 1, customKeyword = null, opts = {}) {
       return [];
     }
     if (!settings.allowNsfw) {
+      const queueKeySet = collectDedupKeySet(videoQueue);
+      const unqueuedFallbacks = deduplicateVideoItems(FALLBACK_VIDEOS, queueKeySet);
+      if (unqueuedFallbacks.length > 0) {
+        const fallbackItem =
+          unqueuedFallbacks[Math.floor(Math.random() * unqueuedFallbacks.length)];
+        recordSeenVideoItem(fallbackItem);
+        videoQueue.push(fallbackItem);
+        currentIndex = videoQueue.length - 1;
+        updatePlayerUI();
+        return [fallbackItem];
+      }
+      if (videoQueue.length > 0) {
+        currentIndex = (currentIndex + 1) % videoQueue.length;
+        updatePlayerUI();
+        return [videoQueue[currentIndex]];
+      }
       const fallbackItem = FALLBACK_VIDEOS[Math.floor(Math.random() * FALLBACK_VIDEOS.length)];
+      recordSeenVideoItem(fallbackItem);
       videoQueue.push(fallbackItem);
       currentIndex = videoQueue.length - 1;
       updatePlayerUI();
@@ -10115,7 +10989,7 @@ function renderSourcesList() {
 }
 
 const BARE_URL_PULL_REGEX =
-  /^(?:www\.|(?:[\w-]+\.)?(?:reddit\.com|redd\.it|redgifs\.com|vimeo\.com|dailymotion\.com|dai\.ly|streamable\.com|x\.com|twitter\.com|youtube\.com|youtu\.be|tiktok\.com|instagram\.com|eporner\.com|spankbang\.com|xhamster\.com|xvideos\.com|pornhub\.com|archive\.org)\/)\S+/i;
+  /^(?:www\.|(?:[\w-]+\.)?(?:reddit\.com|redd\.it|redgifs\.com|vimeo\.com|dailymotion\.com|dai\.ly|streamable\.com|x\.com|twitter\.com|youtube\.com|youtu\.be|tiktok\.com|instagram\.com|eporner\.com|fulltaboo\.tv|pornone\.com|spankbang\.com|xhamster\.com|xvideos\.com|pornhub\.com|archive\.org)\/)\S+/i;
 
 async function pullSmartInputToPlayer(rawInput) {
   const trimmed = String(rawInput || '').trim();
@@ -10136,10 +11010,18 @@ async function pullSmartInputToPlayer(rawInput) {
     try {
       const found = await scanUrlForVideos(targetUrl, 'Direct Pull');
       if (pullGen !== modeGeneration) return [];
-      const allowed = (Array.isArray(found) ? found : []).filter(
-        (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+      const allowed = deduplicateVideoItems(
+        (Array.isArray(found) ? found : []).filter(
+          (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+        )
       );
       if (allowed.length === 0) {
+        if (found?._captchaBlocked) {
+          showToast(
+            'This video’s embed host requires an interactive CAPTCHA — try another FullTaboo video!'
+          );
+          return [];
+        }
         showToast(
           isCloudBackendConfigured()
             ? 'No playable video stream found on that link.'
@@ -10147,12 +11029,21 @@ async function pullSmartInputToPlayer(rawInput) {
         );
         return [];
       }
-      const startIdx = videoQueue.length;
-      for (const item of allowed) {
-        videoQueue.push(item);
-        seenUrls.add(item.videoUrl);
+      const queueKeys = collectDedupKeySet(videoQueue);
+      const newItems = allowed.filter((item) => !hasAnyMatchingDedupKey(item, queueKeys));
+      if (newItems.length > 0) {
+        const startIdx = videoQueue.length;
+        for (const item of newItems) {
+          recordSeenVideoItem(item);
+          videoQueue.push(item);
+        }
+        currentIndex = startIdx;
+      } else {
+        const existingIdx = findMatchingQueueIndex(allowed[0]);
+        if (existingIdx >= 0) {
+          currentIndex = existingIdx;
+        }
       }
-      currentIndex = startIdx;
       updatePlayerUI();
       showToast(
         allowed.length === 1
@@ -10178,19 +11069,36 @@ async function pullSmartInputToPlayer(rawInput) {
     try {
       const subVideos = await fetchSubredditVideos(subName);
       if (pullGen !== modeGeneration) return [];
-      const fresh = shuffleArray(
+      const queueKeys = collectDedupKeySet(videoQueue);
+      const allAllowed = deduplicateVideoItems(
         (Array.isArray(subVideos) ? subVideos : []).filter(
-          (item) => item && item.videoUrl && !seenUrls.has(item.videoUrl) && (settings.allowNsfw || !item.isNsfw)
+          (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
         )
-      ).slice(0, 10);
-      const batch = fresh.length > 0 ? fresh : (subVideos || []).slice(0, 5);
+      );
+      const notQueued = allAllowed.filter((item) => !hasAnyMatchingDedupKey(item, queueKeys));
+      const fresh = shuffleArray(notQueued.filter((item) => !isVideoAlreadySeen(item))).slice(
+        0,
+        10
+      );
+      const batch =
+        fresh.length > 0
+          ? fresh
+          : notQueued.length > 0
+          ? shuffleArray(notQueued).slice(0, 5)
+          : allAllowed.slice(0, 5);
       if (batch.length > 0) {
-        const startIdx = videoQueue.length;
-        for (const item of batch) {
-          videoQueue.push(item);
-          seenUrls.add(item.videoUrl);
+        const toAppend = batch.filter((item) => !hasAnyMatchingDedupKey(item, queueKeys));
+        if (toAppend.length > 0) {
+          const startIdx = videoQueue.length;
+          for (const item of toAppend) {
+            recordSeenVideoItem(item);
+            videoQueue.push(item);
+          }
+          currentIndex = startIdx;
+        } else {
+          const existingIdx = findMatchingQueueIndex(batch[0]);
+          if (existingIdx >= 0) currentIndex = existingIdx;
         }
-        currentIndex = startIdx;
         updatePlayerUI();
         showToast(`📡 Pulled ${batch.length} clip${batch.length === 1 ? '' : 's'} from r/${subName}`);
         return batch;
@@ -10213,30 +11121,42 @@ function queueSearchResultsToPlayer(opts = {}) {
     showToast('Search or scan a URL first to load results');
     return 0;
   }
-  const allowed = lastSearchResults.filter(
-    (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+  const allowed = deduplicateVideoItems(
+    lastSearchResults.filter(
+      (item) => item && item.videoUrl && (settings.allowNsfw || !item.isNsfw)
+    )
   );
   if (allowed.length === 0) {
     showToast('No playable videos in current search results');
     return 0;
   }
-  const startIdx = videoQueue.length;
-  for (const item of allowed) {
-    videoQueue.push(item);
-    seenUrls.add(item.videoUrl);
+  const queueKeys = collectDedupKeySet(videoQueue);
+  const newItems = allowed.filter((item) => !hasAnyMatchingDedupKey(item, queueKeys));
+  if (newItems.length > 0) {
+    const startIdx = videoQueue.length;
+    for (const item of newItems) {
+      recordSeenVideoItem(item);
+      videoQueue.push(item);
+    }
+    currentIndex = startIdx;
+  } else {
+    const existingIdx = findMatchingQueueIndex(allowed[0]);
+    if (existingIdx >= 0) {
+      currentIndex = existingIdx;
+    }
   }
-  currentIndex = startIdx;
   switchTab('view-discover');
   updatePlayerUI();
   if (startReels && !isReelsFullscreen) {
     toggleReelsFullscreen(true);
   }
+  const countShown = newItems.length > 0 ? newItems.length : allowed.length;
   showToast(
     startReels
-      ? `📱 Swiping ${allowed.length} search clip${allowed.length === 1 ? '' : 's'} in Reels`
-      : `▶ Queued ${allowed.length} search clip${allowed.length === 1 ? '' : 's'} in Player`
+      ? `📱 Swiping ${countShown} search clip${countShown === 1 ? '' : 's'} in Reels`
+      : `▶ Queued ${countShown} search clip${countShown === 1 ? '' : 's'} in Player`
   );
-  return allowed.length;
+  return newItems.length;
 }
 
 function renderSearchResults(items) {
@@ -10493,16 +11413,22 @@ function initBookmarkletAndUrlParams() {
         if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
           return;
         }
-        const safeOrAdultFound = (Array.isArray(found) ? found : []).filter((item) => {
-          if (!item?.videoUrl) return false;
-          if (scanAllowNsfw) {
-            item.isNsfw = true;
-            return true;
-          }
-          return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
-        });
+        const safeOrAdultFound = deduplicateVideoItems(
+          (Array.isArray(found) ? found : []).filter((item) => {
+            if (!item?.videoUrl) return false;
+            if (scanAllowNsfw) {
+              item.isNsfw = true;
+              return true;
+            }
+            return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
+          })
+        );
         renderSearchResults(safeOrAdultFound);
-        showToast(`Found ${safeOrAdultFound.length} video(s) from Safari page!`);
+        if (safeOrAdultFound.length === 0 && found?._captchaBlocked) {
+          showToast('This video’s embed host requires an interactive CAPTCHA — try another video!');
+        } else {
+          showToast(`Found ${safeOrAdultFound.length} video(s) from Safari page!`);
+        }
       })
       .catch(() => {
         if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
@@ -11432,11 +12358,11 @@ if (typeof document !== 'undefined') {
     }
 
     const combined = [];
-    const seenUrlsInSearch = new Set();
+    const seenKeysInSearch = new Set();
     for (const r of settled) {
       if (r.status === 'fulfilled' && Array.isArray(r.value)) {
         for (const item of r.value) {
-          if (item?.videoUrl && !seenUrlsInSearch.has(item.videoUrl)) {
+          if (item?.videoUrl && !hasAnyMatchingDedupKey(item, seenKeysInSearch)) {
             if (searchAllowNsfw) {
               if (
                 !isDirectUrlQuery &&
@@ -11452,7 +12378,9 @@ if (typeof document !== 'undefined') {
             ) {
               continue;
             }
-            seenUrlsInSearch.add(item.videoUrl);
+            for (const k of getVideoDedupKeys(item)) {
+              seenKeysInSearch.add(k);
+            }
             combined.push(item);
           }
         }
@@ -11491,17 +12419,21 @@ if (typeof document !== 'undefined') {
       if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
         return;
       }
-      const safeOrAdultFound = (Array.isArray(found) ? found : []).filter((item) => {
-        if (!item?.videoUrl) return false;
-        if (scanAllowNsfw) {
-          item.isNsfw = true;
-          return true;
-        }
-        return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
-      });
+      const safeOrAdultFound = deduplicateVideoItems(
+        (Array.isArray(found) ? found : []).filter((item) => {
+          if (!item?.videoUrl) return false;
+          if (scanAllowNsfw) {
+            item.isNsfw = true;
+            return true;
+          }
+          return !item.isNsfw && !isKnownNsfwUrl(item.pageUrl) && !isKnownNsfwUrl(item.videoUrl);
+        })
+      );
       renderSearchResults(safeOrAdultFound);
       if (safeOrAdultFound.length > 0) {
         showToast(`Found ${safeOrAdultFound.length} video(s) on page!`);
+      } else if (found?._captchaBlocked) {
+        showToast('This video’s embed host requires an interactive CAPTCHA — try another video!');
       }
     } catch {
       if (scanGen !== modeGeneration || Boolean(settings.allowNsfw) !== scanAllowNsfw) {
@@ -11538,8 +12470,14 @@ if (typeof document !== 'undefined') {
     }
 
     if (btn.dataset.action === 'play-search-item') {
-      videoQueue.push(item);
-      currentIndex = videoQueue.length - 1;
+      const existingIdx = findMatchingQueueIndex(item);
+      if (existingIdx >= 0) {
+        currentIndex = existingIdx;
+      } else {
+        recordSeenVideoItem(item);
+        videoQueue.push(item);
+        currentIndex = videoQueue.length - 1;
+      }
       switchTab('view-discover');
       updatePlayerUI();
     } else if (btn.dataset.action === 'download-search-item') {
@@ -11688,10 +12626,23 @@ if (typeof document !== 'undefined') {
         try {
           const items = await fetchSubredditVideos(entry.value);
           if (isStaleAdultPull()) return;
-          if (items.length > 0) {
-            const pick = items[Math.floor(Math.random() * items.length)];
-            videoQueue.push(pick);
-            currentIndex = videoQueue.length - 1;
+          const usable = deduplicateVideoItems(
+            (Array.isArray(items) ? items : []).filter((i) => i?.videoUrl && !deadUrls.has(i.videoUrl))
+          );
+          if (usable.length > 0) {
+            const queueKeys = collectDedupKeySet(videoQueue);
+            const notQueued = usable.filter((i) => !hasAnyMatchingDedupKey(i, queueKeys));
+            const unseen = notQueued.filter((i) => !isVideoAlreadySeen(i));
+            const pool = unseen.length > 0 ? unseen : notQueued.length > 0 ? notQueued : usable;
+            const pick = pool[Math.floor(Math.random() * pool.length)];
+            const existingIdx = findMatchingQueueIndex(pick);
+            if (existingIdx >= 0) {
+              currentIndex = existingIdx;
+            } else {
+              recordSeenVideoItem(pick);
+              videoQueue.push(pick);
+              currentIndex = videoQueue.length - 1;
+            }
             updatePlayerUI();
             showToast(`🔞 Loaded clip from r/${entry.value}!`);
           } else {
@@ -11708,19 +12659,36 @@ if (typeof document !== 'undefined') {
       } else if (entry.type === 'url') {
         setPlayerLoading(true, `Scanning ${entry.label}...`);
         try {
-          const items = await scanUrlForVideos(entry.value, entry.label || 'FullTaboo.tv');
+          const pulled = await pullFromSource({
+            id: entry.id,
+            type: 'url',
+            value: entry.value,
+            label: entry.label || 'FullTaboo.tv',
+            enabled: true,
+            isNsfw: true
+          });
           if (isStaleAdultPull()) return;
-          const usable = items.filter((i) => i?.videoUrl && !deadUrls.has(i.videoUrl));
+          const usable = deduplicateVideoItems(
+            pulled.filter((i) => i?.videoUrl && !deadUrls.has(i.videoUrl))
+          );
           if (usable.length > 0) {
             usable.forEach((i) => {
               i.isNsfw = true;
             });
-            const unseen = usable.filter((i) => !seenUrls.has(i.videoUrl));
-            const candidates = unseen.length > 0 ? unseen : usable;
+            const queueKeys = collectDedupKeySet(videoQueue);
+            const notQueued = usable.filter((i) => !hasAnyMatchingDedupKey(i, queueKeys));
+            const unseen = notQueued.filter((i) => !isVideoAlreadySeen(i));
+            const candidates =
+              unseen.length > 0 ? unseen : notQueued.length > 0 ? notQueued : usable;
             const pick = candidates[Math.floor(Math.random() * candidates.length)];
-            seenUrls.add(pick.videoUrl);
-            videoQueue.push(pick);
-            currentIndex = videoQueue.length - 1;
+            const existingIdx = findMatchingQueueIndex(pick);
+            if (existingIdx >= 0) {
+              currentIndex = existingIdx;
+            } else {
+              recordSeenVideoItem(pick);
+              videoQueue.push(pick);
+              currentIndex = videoQueue.length - 1;
+            }
             updatePlayerUI();
             showToast(`🔞 Loaded clip from ${entry.label}!`);
           } else {
@@ -12087,8 +13055,9 @@ if (typeof document !== 'undefined') {
     currentIndex = -1;
     playbackPositions = {};
     lastSearchResults = [];
-    seenUrls.clear();
+    clearSeenHistoryState('all');
     sourcePoolCache.clear();
+    visitedArchivePages.clear();
     try {
       localStorage.removeItem(STORAGE_KEYS.PLAYBACK_STATE);
     } catch {}
@@ -12191,8 +13160,16 @@ if (typeof document !== 'undefined') {
     if (!item) return;
 
     if (btn.dataset.action === 'play-vault-item') {
-      videoQueue.push({ ...item, fromVault: true });
-      currentIndex = videoQueue.length - 1;
+      const vaultPlayItem = { ...item, fromVault: true };
+      const existingIdx = findMatchingQueueIndex(vaultPlayItem);
+      if (existingIdx >= 0) {
+        videoQueue[existingIdx] = { ...videoQueue[existingIdx], ...vaultPlayItem };
+        currentIndex = existingIdx;
+      } else {
+        recordSeenVideoItem(vaultPlayItem, { persist: false });
+        videoQueue.push(vaultPlayItem);
+        currentIndex = videoQueue.length - 1;
+      }
       switchTab('view-discover');
       updatePlayerUI();
     } else if (btn.dataset.action === 'download-vault-item') {
@@ -12397,7 +13374,12 @@ if (typeof module !== 'undefined' && module.exports) {
     resolveEpornerStreamsFromEmbedHtml,
     unpackDeanEdwardsPacker,
     decodeVoeEmbeddedStreams,
+    resolveByseEmbedStreams,
     extractEmbeddedPlayerMetaFromHtml,
+    getVideoDedupKeys,
+    deduplicateVideoItems,
+    isVideoAlreadySeen,
+    recordSeenVideoItem,
     unwrapProxyTargetUrl,
     buildHttpsMediaProxyCandidates,
     hasManagedHlsEngineSupport,
@@ -12501,6 +13483,7 @@ if (typeof module !== 'undefined' && module.exports) {
         sourceSelectionGeneration++;
         continuousSourceCursor = 0;
         sourcePoolCache.clear();
+        visitedArchivePages.clear();
         if (!Array.isArray(patch.deletedSourceIds)) {
           settings.deletedSourceIds = [];
         }
@@ -12518,12 +13501,18 @@ if (typeof module !== 'undefined' && module.exports) {
         consecutiveErrorSkips = 0;
         isHandlingPlaybackError = false;
         if (patch.videoQueue.length === 0) {
-          seenUrls.clear();
+          clearSeenHistoryState('all');
           deadUrls.clear();
           httpOnlyHosts.clear();
           resetActiveAffinityWatch(null);
           if (!patch.playbackPositions) {
             playbackPositions = {};
+          }
+        } else {
+          seenUrls.clear();
+          seenVideoKeys.clear();
+          for (const qItem of videoQueue) {
+            recordSeenVideoItem(qItem, { persist: false });
           }
         }
       }

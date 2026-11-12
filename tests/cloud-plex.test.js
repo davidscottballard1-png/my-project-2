@@ -783,6 +783,129 @@ describe('Private Cloud Bridge Server (server/bridge.js)', () => {
     assert.strictEqual(cachedHit.length, 3);
     assert.strictEqual(searchCalls, 2, 'limit=3 after limit=4 must be served from cache');
   });
+
+  it('enforces ipv4first DNS order, preserves Accept-Language parity across Path 1 (.m3u8/embed) and Path 2 (.key/.ts) for LuluVid tnmr.org HMAC tokens, and classifies lulust.com + susanexpectcare.com as IP-bound', async () => {
+    const dns = require('node:dns');
+    if (typeof dns.getDefaultResultOrder === 'function') {
+      assert.strictEqual(
+        dns.getDefaultResultOrder(),
+        'ipv4first',
+        'Bridge must prefer IPv4 so minted LuluVid/VOE tokens match IPv4-only CDN edge nodes'
+      );
+    }
+
+    assert.strictEqual(bridge.isIpBoundStreamUrl('https://lulust.com/e/abc123xyz'), true);
+    assert.strictEqual(bridge.isIpBoundStreamUrl('https://susanexpectcare.com/e/voe987xyz'), true);
+    assert.strictEqual(bridge.isIpBoundStreamUrl('https://2rtd3chlml0g.tnmr.org/hls2/01/seg-1.ts'), true);
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://lulust.com/e/abc123xyz')),
+      'https://lulust.com/'
+    );
+    assert.strictEqual(
+      bridge.buildUpstreamReferer(new URL('https://susanexpectcare.com/e/voe987xyz')),
+      'https://voe.sx/'
+    );
+
+    const origLookup = dns.promises.lookup;
+    const origFetch = globalThis.fetch;
+    const recordedUpstreamHeaders = new Map();
+
+    dns.promises.lookup = async (host, opts) => {
+      if (host === 'luluvid.com' || host === '2rtd3chlml0g.tnmr.org') {
+        return opts && opts.all
+          ? [{ address: '93.184.216.34', family: 4 }]
+          : { address: '93.184.216.34', family: 4 };
+      }
+      return origLookup.call(dns.promises, host, opts);
+    };
+
+    globalThis.fetch = async (input, init = {}) => {
+      const target = String(input);
+      if (target.startsWith('https://luluvid.com/') || target.startsWith('https://2rtd3chlml0g.tnmr.org/')) {
+        const hdrs = {};
+        for (const [k, v] of Object.entries(init.headers || {})) {
+          hdrs[k.toLowerCase()] = v;
+        }
+        recordedUpstreamHeaders.set(new URL(target).pathname, hdrs);
+
+        // Simulate LuluVid's strict HMAC signature check over (User-Agent, Accept-Language, IPv4)
+        if (hdrs['accept-language'] !== 'en-US,en;q=0.9') {
+          return new Response('403 Forbidden - HMAC signature mismatch', { status: 403 });
+        }
+        if (target.endsWith('.m3u8')) {
+          return new Response(
+            '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="enc.key"\n#EXTINF:4.0,\nseg-1-v1-a1.ts\n#EXT-X-ENDLIST\n',
+            { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' } }
+          );
+        }
+        if (target.endsWith('.key')) {
+          return new Response(new Uint8Array(16).fill(0x42), {
+            status: 200,
+            headers: { 'content-type': 'application/octet-stream' }
+          });
+        }
+        if (target.endsWith('.ts')) {
+          return new Response(new Uint8Array([0x47, 0x40, 0x00, 0x10]), {
+            status: 200,
+            headers: { 'content-type': 'video/mp2t' }
+          });
+        }
+        return new Response('<html>embed ok</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' }
+        });
+      }
+      return origFetch(input, init);
+    };
+
+    const srv = bridge.createBridgeServer();
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const port = srv.address().port;
+    const base = `http://127.0.0.1:${port}`;
+    const apiKey = 'rv_unit_test_secret_key_123456';
+    const embedReferer = 'https://luluvid.com/e/ft_scene_1';
+
+    try {
+      // Path 1: Embed HTML & HLS manifest rewrite
+      const m3u8Res = await origFetch(
+        `${base}/proxy?key=${apiKey}&hls=1&referer=${encodeURIComponent(embedReferer)}&url=${encodeURIComponent(
+          'https://2rtd3chlml0g.tnmr.org/hls2/01/00942/ft_scene_1/index-v1-a1.m3u8'
+        )}`
+      );
+      assert.strictEqual(m3u8Res.status, 200);
+      const rewrittenM3u8 = await m3u8Res.text();
+      assert.ok(rewrittenM3u8.includes('/proxy?key='));
+
+      // Path 2: Binary AES-128 .key and .ts segment requests MUST send identical Accept-Language + Referer + User-Agent
+      const keyRes = await origFetch(
+        `${base}/proxy?key=${apiKey}&referer=${encodeURIComponent(embedReferer)}&url=${encodeURIComponent(
+          'https://2rtd3chlml0g.tnmr.org/hls2/01/00942/ft_scene_1/enc.key'
+        )}`
+      );
+      assert.strictEqual(keyRes.status, 200, 'AES-128 .key request must succeed without 403 HMAC mismatch');
+      assert.strictEqual((await keyRes.arrayBuffer()).byteLength, 16);
+
+      const tsRes = await origFetch(
+        `${base}/proxy?key=${apiKey}&referer=${encodeURIComponent(embedReferer)}&url=${encodeURIComponent(
+          'https://2rtd3chlml0g.tnmr.org/hls2/01/00942/ft_scene_1/seg-1-v1-a1.ts'
+        )}`
+      );
+      assert.strictEqual(tsRes.status, 200, '.ts segment request must succeed without 403 HMAC mismatch');
+
+      const m3u8Hdrs = recordedUpstreamHeaders.get('/hls2/01/00942/ft_scene_1/index-v1-a1.m3u8');
+      const keyHdrs = recordedUpstreamHeaders.get('/hls2/01/00942/ft_scene_1/enc.key');
+      const tsHdrs = recordedUpstreamHeaders.get('/hls2/01/00942/ft_scene_1/seg-1-v1-a1.ts');
+
+      assert.strictEqual(keyHdrs['accept-language'], m3u8Hdrs['accept-language']);
+      assert.strictEqual(tsHdrs['accept-language'], m3u8Hdrs['accept-language']);
+      assert.strictEqual(keyHdrs['user-agent'], m3u8Hdrs['user-agent']);
+      assert.strictEqual(tsHdrs['referer'], embedReferer);
+    } finally {
+      dns.promises.lookup = origLookup;
+      globalThis.fetch = origFetch;
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  });
 });
 
 describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
