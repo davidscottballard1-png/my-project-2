@@ -1927,7 +1927,7 @@ describe('ReelVault Unit Tests', () => {
       const listeners = {};
       const cacheEntries = new Map();
       const cachedResponse = { ok: true, tag: 'cached-app-js', clone() { return this; } };
-      cacheEntries.set('https://reelvault.local/app.js', cachedResponse);
+      cacheEntries.set(`https://reelvault.local/app.js?v=${APP_BUILD_VERSION.replace(/^v/, '')}`, cachedResponse);
 
       let resolveNetworkFetch;
       const networkPromise = new Promise((r) => {
@@ -1989,11 +1989,12 @@ describe('ReelVault Unit Tests', () => {
       });
       assert.strictEqual(crossOriginResponded, false, 'Service Worker must never intercept cross-origin API JSON');
 
-      // 2. Same-origin App Shell asset resolves immediately from cache BEFORE network settles
+      // 2. Same-origin versioned App Shell asset resolves immediately from cache BEFORE network settles
+      const currentVerUrl = `https://reelvault.local/app.js?v=${APP_BUILD_VERSION.replace(/^v/, '')}`;
       let swResponsePromise = null;
       const waitUntilPromises = [];
       listeners.fetch({
-        request: { method: 'GET', url: 'https://reelvault.local/app.js?v=31' },
+        request: { method: 'GET', url: currentVerUrl },
         respondWith: (p) => {
           swResponsePromise = p;
         },
@@ -2008,10 +2009,10 @@ describe('ReelVault Unit Tests', () => {
       assert.strictEqual(fetchedUrls.length, 1);
 
       // Now finish background network fetch and verify cache updates cleanly
-      const updatedResponse = { ok: true, tag: 'fresh-app-js-v31', clone() { return this; } };
+      const updatedResponse = { ok: true, tag: 'fresh-app-js-current', clone() { return this; } };
       resolveNetworkFetch(updatedResponse);
       await Promise.all(waitUntilPromises);
-      assert.strictEqual(cacheEntries.get('https://reelvault.local/app.js?v=31').tag, 'fresh-app-js-v31');
+      assert.strictEqual(cacheEntries.get(currentVerUrl).tag, 'fresh-app-js-current');
     });
 
     it('flags expired overnight sessions during restorePlaybackState and auto-pulls fresh feed on unlockAppGate', async () => {
@@ -2097,19 +2098,28 @@ describe('ReelVault Unit Tests', () => {
       }
     });
 
-    it('uses Network-First for HTML navigation, auto-navigates open tabs on SW cache upgrade, purges stale queues on build bump, and supports 1-tap Clear Queue', async () => {
+    it('uses Network-First for HTML navigation, notifies open tabs after SW activation without navigate deadlock, enforces exact ?v= asset matching, purges stale queues on build bump, and supports 1-tap Clear Queue', async () => {
       const swSource = fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8');
       const listeners = {};
       const cacheEntries = new Map();
       cacheEntries.set('https://reelvault.local/', { ok: true, tag: 'stale-cached-html', clone() { return this; } });
+      cacheEntries.set('https://reelvault.local/app.js?v=37', { ok: true, tag: 'cached-v37-js', clone() { return this; } });
 
       const deletedKeys = [];
-      const navigatedUrls = [];
+      const postedMessages = [];
+      let navigateCalledInsideActivate = false;
 
       const mockCache = {
-        match: async (req) => {
+        match: async (req, opts = {}) => {
           const url = typeof req === 'string' ? req : req.url;
-          return cacheEntries.get(url) || null;
+          if (cacheEntries.has(url)) return cacheEntries.get(url);
+          if (opts.ignoreSearch) {
+            const base = url.split('?')[0];
+            for (const [k, v] of cacheEntries.entries()) {
+              if (k.split('?')[0] === base) return v;
+            }
+          }
+          return null;
         },
         put: async (req, res) => {
           const url = typeof req === 'string' ? req : req.url;
@@ -2123,19 +2133,22 @@ describe('ReelVault Unit Tests', () => {
         Response: { error: () => ({ ok: false }) },
         caches: {
           open: async () => mockCache,
-          keys: async () => ['reelvault-v32', 'reelvault-v33'],
+          keys: async () => ['reelvault-v35', 'reelvault-v36'],
           delete: async (k) => {
             deletedKeys.push(k);
             return true;
           }
         },
-        fetch: async () => ({
-          ok: true,
-          tag: 'fresh-network-html',
-          clone() {
-            return this;
-          }
-        }),
+        fetch: async (req) => {
+          const url = typeof req === 'string' ? req : req.url;
+          return {
+            ok: true,
+            tag: url.includes('app.js?v=38') ? 'fresh-v38-js' : 'fresh-network-html',
+            clone() {
+              return this;
+            }
+          };
+        },
         self: {
           location: { origin: 'https://reelvault.local' },
           skipWaiting: () => {},
@@ -2144,8 +2157,13 @@ describe('ReelVault Unit Tests', () => {
             matchAll: async () => [
               {
                 url: 'https://reelvault.local/',
-                navigate: async (u) => {
-                  navigatedUrls.push(u);
+                navigate: async () => {
+                  navigateCalledInsideActivate = true;
+                  // Would deadlock if awaited inside activate waitUntil!
+                  return new Promise(() => {});
+                },
+                postMessage: (msg) => {
+                  postedMessages.push(msg);
                 }
               }
             ]
@@ -2158,7 +2176,7 @@ describe('ReelVault Unit Tests', () => {
 
       vm.runInNewContext(swSource, sandbox);
 
-      // 1. SW activate must delete old caches and auto-navigate controlled window clients into the new build
+      // 1. SW activate must delete old caches, settle waitUntil immediately without client.navigate deadlock, and post REELVAULT_SW_ACTIVATED
       let activatePromise = null;
       listeners.activate({
         waitUntil: (p) => {
@@ -2166,12 +2184,16 @@ describe('ReelVault Unit Tests', () => {
         }
       });
       await activatePromise;
-      assert.deepStrictEqual(deletedKeys, ['reelvault-v32', 'reelvault-v33']);
-      assert.deepStrictEqual(
-        navigatedUrls,
-        ['https://reelvault.local/'],
-        'Upgrading Service Worker must auto-refresh open window clients'
+      await new Promise((r) => setTimeout(r, 10));
+      assert.deepStrictEqual(deletedKeys, ['reelvault-v35', 'reelvault-v36']);
+      assert.strictEqual(
+        navigateCalledInsideActivate,
+        false,
+        'activate must never call client.navigate() inside waitUntil (causes iOS Safari loading bar freeze)'
       );
+      assert.strictEqual(postedMessages.length, 1);
+      assert.strictEqual(postedMessages[0].type, 'REELVAULT_SW_ACTIVATED');
+      assert.strictEqual(postedMessages[0].version, APP_BUILD_VERSION);
 
       // 2. HTML navigation (mode: "navigate") must use Network-First instead of returning stale cached HTML
       let navPromise = null;
@@ -2184,6 +2206,22 @@ describe('ReelVault Unit Tests', () => {
       });
       const navResult = await navPromise;
       assert.strictEqual(navResult.tag, 'fresh-network-html');
+
+      // 3. Versioned subresource requests (?v=38) must NEVER match stale cached ?v=37 via ignoreSearch
+      let subPromise = null;
+      listeners.fetch({
+        request: { method: 'GET', mode: 'cors', url: 'https://reelvault.local/app.js?v=38' },
+        respondWith: (p) => {
+          subPromise = p;
+        },
+        waitUntil: () => {}
+      });
+      const subResult = await subPromise;
+      assert.strictEqual(
+        subResult.tag,
+        'fresh-v38-js',
+        'Newer ?v=38 script request must fetch from network instead of serving stale cached ?v=37'
+      );
 
       // 3. syncAppBuildVersion must clear stale non-Vault remote queue items on version upgrade while preserving Vault items
       const { elements } = createMockDom();

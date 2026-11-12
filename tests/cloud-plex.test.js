@@ -2102,7 +2102,203 @@ describe('ReelVault Frontend Cloud & Plex Integration (app.js)', () => {
       'Full-length playback must never be flagged as a decoy'
     );
   });
+
+  it('prioritizes 1080p HD videoUrl over SD convertedUrl in sendVideoToPlex, preserves fallbackUrl, and stages Plex transcodes in tmpDir so failed ffmpeg runs leave zero corrupt files', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+
+    app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+    let sentBody = null;
+    globalThis.fetch = async (_url, opts = {}) => {
+      sentBody = JSON.parse(opts.body);
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({ ok: true, jobId: 'hd_job_1', library: 'ReelVault 18+ Vault', status: 'queued' })
+      };
+    };
+
+    await app.sendVideoToPlex({
+      id: 'ep-hd-1',
+      title: 'Studio Full Episode 1080p',
+      videoUrl: 'https://gvideo.eporner.com/1080p-hd-primary.mp4',
+      convertedUrl: 'https://gvideo.eporner.com/240p-sd-backup.mp4',
+      originalUrl: 'https://www.eporner.com/video-1/episode/',
+      pageUrl: 'https://www.eporner.com/video-1/episode/',
+      isNsfw: true
+    });
+
+    assert.strictEqual(
+      sentBody.url,
+      'https://gvideo.eporner.com/1080p-hd-primary.mp4',
+      'sendVideoToPlex must send 1080p HD videoUrl as primary url'
+    );
+    assert.strictEqual(
+      sentBody.fallbackUrl,
+      'https://gvideo.eporner.com/240p-sd-backup.mp4',
+      'sendVideoToPlex must include convertedUrl as fallbackUrl so backup stream is never dropped'
+    );
+
+    // End-to-end processPlexSaveJob staging + fallbackUrl verification
+    globalThis.fetch = origFetch;
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-plex-atomic-'));
+    const binDir = path.join(testRoot, 'bin');
+    const safeDir = path.join(testRoot, 'safe');
+    const nsfwDir = path.join(testRoot, 'nsfw');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(safeDir, { recursive: true });
+    fs.mkdirSync(nsfwDir, { recursive: true });
+
+    // yt-dlp fails on primary URL (93.184.216.34/dead.webm) and succeeds on fallbackUrl (93.184.216.34/backup.webm)
+    fs.writeFileSync(
+      path.join(binDir, 'yt-dlp'),
+      `#!/usr/bin/env bash
+last="\${@: -1}"
+if [[ "$last" == *"dead.webm"* ]]; then
+  exit 1
+fi
+for ((i=1; i<=$#; i++)); do
+  if [ "\${!i}" = "-o" ]; then
+    next=$((i+1))
+    tpl="\${!next}"
+    printf 'WEBM_INPUT' > "\${tpl//%(ext)s/webm}"
+    exit 0
+  fi
+done
+exit 1
+`,
+      { mode: 0o755 }
+    );
+    fs.writeFileSync(path.join(binDir, 'ffprobe'), '#!/usr/bin/env bash\necho "vp9"\n', { mode: 0o755 });
+
+    const modeFlagFile = path.join(testRoot, 'ffmpeg_mode');
+    fs.writeFileSync(modeFlagFile, 'fail');
+    fs.writeFileSync(
+      path.join(binDir, 'ffmpeg'),
+      `#!/usr/bin/env bash
+dest="\${@: -1}"
+mode=$(cat "${modeFlagFile}")
+if [ "$mode" = "fail" ]; then
+  printf 'TRUNCATED_CORRUPT_MP4' > "$dest"
+  exit 1
+fi
+printf 'VALID_FASTSTART_MP4_BYTES' > "$dest"
+exit 0
+`,
+      { mode: 0o755 }
+    );
+
+    const prevPath = process.env.PATH;
+    const prevKey = process.env.REELVAULT_API_KEY;
+    const prevSafe = process.env.MEDIA_SAFE_DIR;
+    const prevNsfw = process.env.MEDIA_NSFW_DIR;
+    const prevPlexUrl = process.env.PLEX_URL;
+    const prevPlexTok = process.env.PLEX_TOKEN;
+
+    process.env.PATH = `${binDir}:${prevPath}`;
+    process.env.REELVAULT_API_KEY = 'rv_unit_test_secret_key_123456';
+    process.env.MEDIA_SAFE_DIR = safeDir;
+    process.env.MEDIA_NSFW_DIR = nsfwDir;
+    process.env.PLEX_URL = '';
+    process.env.PLEX_TOKEN = '';
+
+    const bridgePath = require.resolve('../server/bridge.js');
+    delete require.cache[bridgePath];
+    const isolatedBridge = require(bridgePath);
+    const srv = isolatedBridge.createBridgeServer();
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const port = srv.address().port;
+
+    try {
+      // 1. Failed ffmpeg transcode must leave ZERO files inside live MEDIA_NSFW_DIR
+      const failSave = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/dead.webm',
+          fallbackUrl: 'http://93.184.216.34/backup.webm',
+          title: 'Failed Transcode Episode',
+          isNsfw: true
+        })
+      });
+      const failJson = await failSave.json();
+      let failJob = null;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
+          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+        });
+        const jd = await jr.json();
+        const found = jd.jobs.find((j) => j.id === failJson.jobId);
+        if (found && (found.status === 'error' || found.status === 'ready')) {
+          failJob = found;
+          break;
+        }
+      }
+      assert.strictEqual(failJob?.status, 'error');
+      assert.deepStrictEqual(
+        fs.readdirSync(nsfwDir),
+        [],
+        'Failed ffmpeg transcode must never leave partial/corrupt .mp4 files inside live Plex library'
+      );
+
+      // 2. Successful transcode using fallbackUrl publishes complete MP4 atomically into MEDIA_NSFW_DIR
+      fs.writeFileSync(modeFlagFile, 'ok');
+      const okSave = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/dead.webm',
+          fallbackUrl: 'http://93.184.216.34/backup.webm',
+          title: 'Recovered Full Episode',
+          isNsfw: true
+        })
+      });
+      const okJson = await okSave.json();
+      let okJob = null;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 40));
+        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
+          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+        });
+        const jd = await jr.json();
+        const found = jd.jobs.find((j) => j.id === okJson.jobId);
+        if (found && (found.status === 'error' || found.status === 'ready')) {
+          okJob = found;
+          break;
+        }
+      }
+      assert.strictEqual(okJob?.status, 'ready');
+      const publishedFiles = fs.readdirSync(nsfwDir);
+      assert.strictEqual(publishedFiles.length, 1);
+      assert.strictEqual(
+        fs.readFileSync(path.join(nsfwDir, publishedFiles[0]), 'utf8'),
+        'VALID_FASTSTART_MP4_BYTES'
+      );
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+      process.env.PATH = prevPath;
+      process.env.REELVAULT_API_KEY = prevKey;
+      if (prevSafe === undefined) delete process.env.MEDIA_SAFE_DIR;
+      else process.env.MEDIA_SAFE_DIR = prevSafe;
+      if (prevNsfw === undefined) delete process.env.MEDIA_NSFW_DIR;
+      else process.env.MEDIA_NSFW_DIR = prevNsfw;
+      if (prevPlexUrl === undefined) delete process.env.PLEX_URL;
+      else process.env.PLEX_URL = prevPlexUrl;
+      if (prevPlexTok === undefined) delete process.env.PLEX_TOKEN;
+      else process.env.PLEX_TOKEN = prevPlexTok;
+      fs.rmSync(testRoot, { recursive: true, force: true });
+    }
+  });
 });
+
 
 
 

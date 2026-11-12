@@ -1,4 +1,6 @@
-const CACHE_NAME = 'reelvault-v36';
+const CACHE_NAME = 'reelvault-v37';
+const APP_BUILD = CACHE_NAME.replace(/^reelvault-/, '');
+const VERSIONED_QUERY = `?v=${APP_BUILD.replace(/^v/, '')}`;
 const APP_SHELL = [
   './',
   './index.html',
@@ -13,10 +15,13 @@ const APP_SHELL = [
 ];
 
 self.addEventListener('install', (event) => {
+  const precacheUrls = APP_SHELL.map((url) =>
+    url === './styles.css' || url === './app.js' ? `${url}${VERSIONED_QUERY}` : url
+  );
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) =>
       Promise.all(
-        APP_SHELL.map((url) =>
+        precacheUrls.map((url) =>
           fetch(url, { cache: 'no-cache' }).then((res) => {
             if (res && res.ok) {
               return cache.put(url, res);
@@ -30,33 +35,39 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    (async () => {
-      const keys = await caches.keys();
-      let deletedOldCache = false;
-      await Promise.all(
-        keys.map((key) => {
-          if (key !== CACHE_NAME) {
-            deletedOldCache = true;
-            return caches.delete(key);
-          }
-        })
-      );
-      await self.clients.claim();
-      // When upgrading from an older Service Worker cache, immediately refresh open app windows into the new build
-      if (deletedOldCache && typeof self.clients?.matchAll === 'function') {
-        const windowClients = await self.clients.matchAll({ type: 'window' });
-        await Promise.all(
-          windowClients.map((client) => {
-            if (client && typeof client.navigate === 'function' && client.url) {
-              return Promise.resolve(client.navigate(client.url)).catch(() => null);
-            }
-            return null;
-          })
-        );
+  const activationDone = (async () => {
+    const keys = await caches.keys();
+    let deletedOldCache = false;
+    await Promise.all(
+      keys.map((key) => {
+        if (key !== CACHE_NAME) {
+          deletedOldCache = true;
+          return caches.delete(key);
+        }
+      })
+    );
+    await self.clients.claim();
+    return deletedOldCache;
+  })();
+
+  event.waitUntil(activationDone);
+
+  // Notify open windows AFTER activate's waitUntil settles so navigation never deadlocks on 'activating'
+  activationDone
+    .then(async (deletedOldCache) => {
+      if (!deletedOldCache || typeof self.clients?.matchAll !== 'function') return;
+      const windowClients = await self.clients.matchAll({ type: 'window' });
+      for (const client of windowClients) {
+        try {
+          client?.postMessage?.({
+            type: 'REELVAULT_SW_ACTIVATED',
+            version: APP_BUILD,
+            cacheName: CACHE_NAME
+          });
+        } catch {}
       }
-    })()
-  );
+    })
+    .catch(() => {});
 });
 
 self.addEventListener('fetch', (event) => {
@@ -87,12 +98,10 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Stale-While-Revalidate: serve cached App Shell subresources in 0ms while refreshing in background
+  // Stale-While-Revalidate with exact URL matching so ?v=<N> cache-busters never serve stale builds
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
-      const cached =
-        (await cache.match(event.request)) ||
-        (await cache.match(event.request, { ignoreSearch: true }));
+      const cached = await cache.match(event.request);
 
       const networkUpdate = fetch(event.request, { cache: 'no-cache' })
         .then((response) => {
@@ -113,4 +122,3 @@ self.addEventListener('fetch', (event) => {
     })
   );
 });
-

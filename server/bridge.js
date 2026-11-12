@@ -2058,11 +2058,39 @@ async function processPlexSaveJob(job) {
     const largestFile = files[0];
 
     job.status = 'optimizing';
+    const stagedMp4 = path.join(tmpDir, 'optimized.mp4');
+    await ensureDirectPlayMp4(largestFile, stagedMp4);
+    const stagedStats = fs.statSync(stagedMp4);
+    if (!stagedStats.size) {
+      throw new Error('Transcoder produced an empty output file');
+    }
+
     const safeTitle = sanitizeFilenameTitle(job.title);
     const finalFileName = `${safeTitle} [${job.id}].mp4`;
     const finalPath = path.join(destDir, finalFileName);
+    const hiddenPublishTmp = path.join(destDir, `.rv-staging-${job.id}.tmp`);
 
-    await ensureDirectPlayMp4(largestFile, finalPath);
+    try {
+      try {
+        fs.renameSync(stagedMp4, finalPath);
+      } catch (moveErr) {
+        if (moveErr && moveErr.code === 'EXDEV') {
+          fs.copyFileSync(stagedMp4, hiddenPublishTmp);
+          fs.renameSync(hiddenPublishTmp, finalPath);
+        } else {
+          throw moveErr;
+        }
+      }
+    } catch (pubErr) {
+      try {
+        fs.rmSync(hiddenPublishTmp, { force: true });
+      } catch {}
+      try {
+        fs.rmSync(finalPath, { force: true });
+      } catch {}
+      throw pubErr;
+    }
+
     const stats = fs.statSync(finalPath);
     job.sizeBytes = stats.size;
     job.fileName = finalFileName;
@@ -2152,6 +2180,7 @@ async function handlePlexSaveRequest(req, res) {
   }
 
   const rawUrl = toSafePrimitiveString(body.url).trim();
+  const rawFallbackUrl = toSafePrimitiveString(body.fallbackUrl).trim();
   const rawPageUrl = toSafePrimitiveString(body.pageUrl).trim();
   const rawStreamReferer = toSafePrimitiveString(body.streamReferer).trim();
   const rawOriginalUrl = toSafePrimitiveString(body.originalUrl).trim();
@@ -2170,6 +2199,7 @@ async function handlePlexSaveRequest(req, res) {
     candidateSet.add(rawPageUrl);
   }
   if (rawUrl) candidateSet.add(rawUrl);
+  if (rawFallbackUrl && /^https?:\/\//i.test(rawFallbackUrl)) candidateSet.add(rawFallbackUrl);
   if (rawOriginalUrl && /^https?:\/\//i.test(rawOriginalUrl)) candidateSet.add(rawOriginalUrl);
   if (isSpecificWatchPageUrl(rawPageUrl)) candidateSet.add(rawPageUrl);
 

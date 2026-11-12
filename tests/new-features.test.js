@@ -3888,7 +3888,191 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         globalThis.fetch = origFetch;
       }
     });
+
+    it('preserves foreground #mainVideo HLS engine when clearing #standbyVideo and never saves backup #EXTM3U playlists as .mp4', async () => {
+      const {
+        startProxiedHlsPlayback,
+        scheduleBackgroundQueuePrebuffer,
+        stopContinuousBackgroundPuller,
+        detachActiveHlsPlayer,
+        obtainIphoneReadyVideoBlob,
+        setCloudBackendConfig,
+        clearCloudBackendConfig,
+        setAppState
+      } = require('../app.js');
+
+      const origHls = globalThis.Hls;
+      const origMediaSource = globalThis.MediaSource;
+      const origDoc = globalThis.document;
+      const origFetch = globalThis.fetch;
+
+      let hlsDestroyCount = 0;
+      class MockHlsEngine {
+        static isSupported() {
+          return true;
+        }
+        static Events = { MANIFEST_PARSED: 'hlsManifestParsed', ERROR: 'hlsError' };
+        static ErrorTypes = { NETWORK_ERROR: 'networkError', MEDIA_ERROR: 'mediaError' };
+        constructor() {
+          this.handlers = {};
+        }
+        on(evt, cb) {
+          this.handlers[evt] = cb;
+        }
+        loadSource(src) {
+          this.src = src;
+        }
+        attachMedia(el) {
+          this.el = el;
+          this.handlers.hlsManifestParsed?.();
+        }
+        destroy() {
+          hlsDestroyCount++;
+        }
+      }
+
+      const makeVideoEl = (id) => ({
+        id,
+        src: '',
+        muted: false,
+        volume: 1,
+        controls: true,
+        playsInline: true,
+        preload: 'metadata',
+        dataset: {},
+        style: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+        pause() {},
+        load() {},
+        play: () => Promise.resolve(),
+        canPlayType: () => '',
+        getAttribute: () => null,
+        setAttribute() {},
+        removeAttribute(k) {
+          if (k === 'src') this.src = '';
+        },
+        addEventListener() {},
+        removeEventListener() {}
+      });
+
+      const fgEl = makeVideoEl('mainVideo');
+      const sbEl = makeVideoEl('standbyVideo');
+
+      try {
+        globalThis.Hls = MockHlsEngine;
+        globalThis.MediaSource = function MockMse() {};
+        globalThis.document = {
+          hidden: false,
+          head: {
+            appendChild(el) {
+              queueMicrotask(() => el?.onerror?.(new Error('offline unit test')));
+            }
+          },
+          body: { classList: { contains: () => false, add() {}, remove() {}, toggle() {} }, appendChild() {} },
+          getElementById: (id) => (id === 'mainVideo' ? fgEl : id === 'standbyVideo' ? sbEl : null),
+          querySelector: () => null,
+          querySelectorAll: () => [],
+          createElement: (tag) => makeVideoEl(tag),
+          addEventListener() {}
+        };
+
+        setCloudBackendConfig('https://cloud.reelvault.example', 'rv-secret-key', true);
+        const hlsEp1 = {
+          id: 'hls-fg-1',
+          title: 'Episode 1',
+          videoUrl: 'https://cdn.luluvdo.com/hls/ep1/master.m3u8',
+          pageUrl: 'https://fulltaboo.tv/ep1/',
+          streamReferer: 'https://luluvdo.com/e/ep1',
+          format: 'm3u8',
+          isNsfw: true,
+          _forceProxiedHls: true
+        };
+        const hlsEp2 = {
+          id: 'hls-fg-2',
+          title: 'Episode 2',
+          videoUrl: 'https://cdn.luluvdo.com/hls/ep2/master.m3u8',
+          pageUrl: 'https://fulltaboo.tv/ep2/',
+          streamReferer: 'https://luluvdo.com/e/ep2',
+          format: 'm3u8',
+          isNsfw: true,
+          _forceProxiedHls: true
+        };
+
+        setAppState({
+          videoQueue: [hlsEp1, hlsEp2, { ...hlsEp2, id: 'hls-fg-3' }],
+          currentIndex: 0
+        });
+
+        const started = await startProxiedHlsPlayback(fgEl, hlsEp1, hlsEp1.videoUrl);
+        assert.strictEqual(started, true);
+        assert.strictEqual(hlsDestroyCount, 0);
+
+        // Prebuffer cycle clears #standbyVideo when nextItem also requires managed HLS — must NOT kill #mainVideo HLS!
+        await scheduleBackgroundQueuePrebuffer();
+        assert.strictEqual(
+          hlsDestroyCount,
+          0,
+          'Clearing #standbyVideo must never destroy active Hls engine on #mainVideo'
+        );
+
+        // Explicit detach targeting #mainVideo DOES destroy the active Hls engine
+        detachActiveHlsPlayer(fgEl);
+        assert.strictEqual(hlsDestroyCount, 1);
+
+        // Saving a VOE/Cloud .m3u8 item whose convertedUrl is a secondary .m3u8 mirror must assemble real binary segments, never save #EXTM3U text
+        clearCloudBackendConfig();
+        const segPayload = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);
+        globalThis.fetch = async (url) => {
+          const u = String(url);
+          if (u.includes('backup-mirror.m3u8')) {
+            return new Response('#EXTM3U\n#EXTINF:4.0,\nseg0.m4s\n#EXT-X-ENDLIST\n', {
+              status: 200,
+              headers: { 'content-type': 'application/vnd.apple.mpegurl' }
+            });
+          }
+          if (u.includes('primary.m3u8')) {
+            return new Response('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4.0,\nseg0.m4s\n#EXT-X-ENDLIST\n', {
+              status: 200,
+              headers: { 'content-type': 'application/vnd.apple.mpegurl' }
+            });
+          }
+          return new Response(segPayload, {
+            status: 200,
+            headers: { 'content-type': 'video/mp4' }
+          });
+        };
+
+        const exported = await obtainIphoneReadyVideoBlob(
+          {
+            id: 'voe-export-1',
+            title: 'VOE HLS Scene',
+            videoUrl: 'https://cdn1.voe.example/hls/primary.m3u8',
+            convertedUrl: 'https://cdn2.voe.example/hls/backup-mirror.m3u8',
+            format: 'm3u8',
+            isNsfw: true
+          },
+          false
+        );
+        const exportedBytes = new Uint8Array(await exported.blob.arrayBuffer());
+        assert.strictEqual(exported.ext, 'mp4');
+        assert.strictEqual(
+          exportedBytes.byteLength,
+          segPayload.byteLength * 2,
+          'obtainIphoneReadyVideoBlob must stitch init.mp4 + seg0.m4s instead of saving #EXTM3U playlist text'
+        );
+      } finally {
+        stopContinuousBackgroundPuller();
+        detachActiveHlsPlayer();
+        clearCloudBackendConfig();
+        setAppState({ videoQueue: [], currentIndex: -1 });
+        globalThis.Hls = origHls;
+        globalThis.MediaSource = origMediaSource;
+        globalThis.document = origDoc;
+        globalThis.fetch = origFetch;
+      }
+    });
   });
 });
+
 
 

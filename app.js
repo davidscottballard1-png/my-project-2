@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v36';
+const APP_BUILD_VERSION = 'v37';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -1202,7 +1202,12 @@ async function fetchVideoBlobWithProgress(
       if (timer) clearTimeout(timer);
       if (res && res.ok) {
         const ct = String(res.headers?.get?.('content-type') || '').toLowerCase();
-        if (ct.includes('text/html') || ct.includes('application/json') || ct.includes('text/plain')) {
+        if (
+          ct.includes('text/html') ||
+          ct.includes('application/json') ||
+          ct.includes('text/plain') ||
+          ct.includes('mpegurl')
+        ) {
           if (isHttpsUpgradeProbe) {
             const h = getHostnameSafe(cleanTarget);
             if (h) httpOnlyHosts.add(h);
@@ -1235,6 +1240,7 @@ async function fetchVideoBlobWithProgress(
   const contentLength = Number(response.headers.get('content-length')) || 0;
   const reader = response.body?.getReader();
 
+  let outBlob;
   if (reader) {
     const chunks = [];
     let received = 0;
@@ -1251,11 +1257,26 @@ async function fetchVideoBlobWithProgress(
         onProgress?.(progressLabel, 65, `${mb} MB`);
       }
     }
-    return new Blob(chunks, { type: mimeType || 'video/mp4' });
+    outBlob = new Blob(chunks, { type: mimeType || 'video/mp4' });
+  } else {
+    const blob = await response.blob();
+    outBlob = new Blob([blob], { type: mimeType || blob.type || 'video/mp4' });
   }
 
-  const blob = await response.blob();
-  return new Blob([blob], { type: mimeType || blob.type || 'video/mp4' });
+  if (outBlob.size > 0 && outBlob.size < 524288 && typeof outBlob.slice === 'function') {
+    try {
+      const headText = await outBlob.slice(0, 16).text();
+      if (/^\s*#EXTM3U\b/i.test(headText)) {
+        throw new Error('Received HLS manifest text instead of binary video stream');
+      }
+    } catch (err) {
+      if (err && /HLS manifest text/i.test(err.message || '')) {
+        throw err;
+      }
+    }
+  }
+
+  return outBlob;
 }
 
 // Parse an HLS .m3u8 manifest (Master Playlist or Media Segment Playlist)
@@ -1434,7 +1455,16 @@ async function obtainIphoneReadyVideoBlob(videoItem, forceMp4Conversion = false,
   }
 
   // 2. If a server-transcoded .mp4 derivative URL is available (Archive.org / Wikimedia / NASA / PeerTube / Reddit / .gifv)
-  if (shouldConvert && videoItem.convertedUrl) {
+  const cleanConvertedTarget =
+    typeof videoItem.convertedUrl === 'string'
+      ? unwrapProxyTargetUrl(videoItem.convertedUrl) || videoItem.convertedUrl
+      : '';
+  const hasServerMp4Derivative =
+    Boolean(cleanConvertedTarget) &&
+    fmtInfo.ext !== 'mp4' &&
+    /\.(?:mp4|m4v)(?:[?#]|$)/i.test(cleanConvertedTarget);
+
+  if (shouldConvert && hasServerMp4Derivative) {
     try {
       const mp4Blob = await fetchVideoBlobWithProgress(
         videoItem.convertedUrl,
@@ -2329,16 +2359,22 @@ async function sendVideoToPlex(videoItem) {
     return { ok: false, error: 'No video selected' };
   }
 
-  const candidateMedia = [
-    videoItem.convertedUrl,
-    videoItem.videoUrl,
-    videoItem.originalUrl
-  ].find((u) => typeof u === 'string' && /^https?:\/\//i.test(unwrapProxyTargetUrl(u) || u));
-
-  const cleanMediaUrl = candidateMedia ? unwrapProxyTargetUrl(candidateMedia) || candidateMedia : '';
+  const cleanPrimaryVideoUrl =
+    typeof videoItem.videoUrl === 'string'
+      ? unwrapProxyTargetUrl(videoItem.videoUrl) || videoItem.videoUrl
+      : '';
+  const cleanConvertedUrl =
+    typeof videoItem.convertedUrl === 'string'
+      ? unwrapProxyTargetUrl(videoItem.convertedUrl) || videoItem.convertedUrl
+      : '';
   const cleanOrigUrl = videoItem.originalUrl
     ? unwrapProxyTargetUrl(videoItem.originalUrl) || videoItem.originalUrl
     : '';
+  const httpCandidates = [cleanPrimaryVideoUrl, cleanConvertedUrl, cleanOrigUrl].filter(
+    (u) => typeof u === 'string' && /^https?:\/\//i.test(u)
+  );
+  const cleanMediaUrl = httpCandidates[0] || '';
+  const cleanFallbackUrl = httpCandidates.find((u) => u !== cleanMediaUrl) || '';
   const cleanPageUrl =
     typeof videoItem.pageUrl === 'string' && /^https?:\/\//i.test(videoItem.pageUrl)
       ? videoItem.pageUrl
@@ -2365,6 +2401,7 @@ async function sendVideoToPlex(videoItem) {
       },
       body: JSON.stringify({
         url: cleanMediaUrl,
+        ...(cleanFallbackUrl ? { fallbackUrl: cleanFallbackUrl } : {}),
         originalUrl: /^https?:\/\//i.test(cleanOrigUrl) ? cleanOrigUrl : '',
         pageUrl: cleanPageUrl,
         ...(cleanStreamReferer ? { streamReferer: cleanStreamReferer } : {}),
@@ -7947,13 +7984,26 @@ let hlsEngineLoadingPromise = null;
 let activeHlsState = null;
 
 function detachActiveHlsPlayer(targetVideoEl = null) {
-  if (!activeHlsState) return;
+  if (!activeHlsState) {
+    if (targetVideoEl && typeof targetVideoEl._prevDisableRemotePlayback === 'boolean') {
+      targetVideoEl.disableRemotePlayback = targetVideoEl._prevDisableRemotePlayback;
+      delete targetVideoEl._prevDisableRemotePlayback;
+    }
+    return;
+  }
+  if (targetVideoEl && activeHlsState.videoEl && activeHlsState.videoEl !== targetVideoEl) {
+    if (typeof targetVideoEl._prevDisableRemotePlayback === 'boolean') {
+      targetVideoEl.disableRemotePlayback = targetVideoEl._prevDisableRemotePlayback;
+      delete targetVideoEl._prevDisableRemotePlayback;
+    }
+    return;
+  }
   const state = activeHlsState;
   activeHlsState = null;
   try {
     state.hls?.destroy?.();
   } catch {}
-  const el = targetVideoEl || state.videoEl;
+  const el = state.videoEl || targetVideoEl;
   if (el && typeof el._prevDisableRemotePlayback === 'boolean') {
     el.disableRemotePlayback = el._prevDisableRemotePlayback;
     delete el._prevDisableRemotePlayback;
@@ -10607,12 +10657,13 @@ if (typeof document !== 'undefined') {
     clearLoadedVideoQueue();
   });
 
-  // Register Service Worker for PWA & auto-reload once when a newer build takes control
+  // Register Service Worker for PWA & reload once after activation only if this tab is on an older build
   if ('serviceWorker' in navigator) {
-    const hadController = Boolean(navigator.serviceWorker.controller);
     let refreshingForSwUpdate = false;
-    navigator.serviceWorker.addEventListener?.('controllerchange', () => {
-      if (!hadController || refreshingForSwUpdate) return;
+    navigator.serviceWorker.addEventListener?.('message', (event) => {
+      const data = event?.data;
+      if (!data || data.type !== 'REELVAULT_SW_ACTIVATED' || refreshingForSwUpdate) return;
+      if (data.version && data.version === APP_BUILD_VERSION) return;
       refreshingForSwUpdate = true;
       window.location?.reload?.();
     });
