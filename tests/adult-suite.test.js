@@ -50,6 +50,7 @@ const {
   deleteVaultVideoDB,
   clearVaultDB,
   scanUrlForVideos,
+  getVideoRefererUrl,
   getSourceCacheKey,
   updateHeaderSummary,
   revokeVideoItemBlobUrls,
@@ -1533,7 +1534,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
             })
           };
         }
-        if (u.includes('search_text=asmr') && u.includes('order=best')) {
+        if (u.includes('tags=asmr') && u.includes('search_text=asmr') && u.includes('order=top')) {
           return {
             ok: true,
             json: async () => ({
@@ -1558,18 +1559,20 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
         assert.strictEqual(items.length, 1);
         assert.strictEqual(items[0].id, 'rg-voicedasmr1');
         assert.ok(!items.some((i) => i.id === 'rg-silentloop1'));
-        assert.ok(hitUrls.some((u) => u.includes('search_text=asmr&order=best')));
+        assert.ok(hitUrls.some((u) => u.includes('tags=asmr%2Ctease') && u.includes('order=trending')));
+        assert.ok(hitUrls.some((u) => u.includes('tags=asmr&search_text=asmr&order=top')));
+        assert.ok(!hitUrls.some((u) => u.includes('order=best') || u.includes('order=new')));
       } finally {
         setAppState({ resetRedgifsToken: true });
         globalThis.fetch = origFetch;
       }
     });
 
-    it('prefers muxed HLSPlaylist.m3u8 audio streams on Reddit ASMR feeds, skips silent GIFs, and falls back to subreddit video search when top slice is non-video', async () => {
+    it('prefers muxed HLSPlaylist.m3u8 audio streams on Reddit ASMR feeds, skips silent previews on RedGIFs links, and falls back cleanly', async () => {
       setupTestEnv();
       settings.allowNsfw = true;
 
-      // 1. Direct listing extraction on r/nsfwasmr prefers HLSPlaylist.m3u8 over silent DASH MP4 and skips is_gif/has_audio:false
+      // 1. Direct listing extraction on r/nsfwasmr prefers HLSPlaylist.m3u8 over silent DASH MP4, skips silent GIFs, and ignores silent reddit_video_preview on voiced RedGIFs posts
       const sampleListing = {
         data: {
           children: [
@@ -1610,17 +1613,39 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
                   }
                 }
               }
+            },
+            {
+              data: {
+                id: 'rg_voiced_post_1',
+                title: 'Soft Moan ASMR Roleplay',
+                subreddit: 'nsfwasmr',
+                over_18: true,
+                url: 'https://www.redgifs.com/watch/rewardingblissfulthrip',
+                url_overridden_by_dest: 'https://www.redgifs.com/watch/rewardingblissfulthrip',
+                permalink: '/r/nsfwasmr/comments/rg_voiced_post_1/',
+                preview: {
+                  reddit_video_preview: {
+                    fallback_url: 'https://v.redd.it/silentprev1/CMAF_1080.mp4',
+                    hls_url: 'https://v.redd.it/silentprev1/HLSPlaylist.m3u8',
+                    is_gif: true,
+                    has_audio: false,
+                    duration: 38
+                  }
+                }
+              }
             }
           ]
         }
       };
 
       const extracted = extractRedditVideosFromListing(sampleListing, 'r/nsfwasmr');
-      assert.strictEqual(extracted.length, 1);
+      assert.strictEqual(extracted.length, 2);
       assert.strictEqual(extracted[0].id, 'rd-voiced_roleplay_1');
       assert.strictEqual(extracted[0].format, 'm3u8');
       assert.strictEqual(extracted[0].videoUrl, 'https://v.redd.it/voiced1/HLSPlaylist.m3u8');
       assert.strictEqual(extracted[0].convertedUrl, 'https://v.redd.it/voiced1/DASH_720.mp4?source=fallback');
+      assert.strictEqual(extracted[1].id, 'rd-rg_voiced_post_1');
+      assert.strictEqual(extracted[1].videoUrl, 'https://media.redgifs.com/rewardingblissfulthrip.mp4');
 
       // 2. fetchSubredditVideos('nsfwasmr') falls back to restrict_sr=on video search when hot/top/new only had external links
       const origFetch = globalThis.fetch;
@@ -1647,7 +1672,10 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
           };
         }
         if (u.includes('reddit.com/r/nsfwasmr/search.json') && u.includes('restrict_sr=on')) {
-          return { ok: true, json: async () => sampleListing };
+          return {
+            ok: true,
+            json: async () => ({ data: { children: sampleListing.data.children.slice(0, 2) } })
+          };
         }
         return { ok: false, status: 404, json: async () => ({}) };
       };
@@ -1657,6 +1685,171 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
         assert.strictEqual(subVideos.length, 1);
         assert.strictEqual(subVideos[0].id, 'rd-voiced_roleplay_1');
         assert.strictEqual(subVideos[0].videoUrl, 'https://v.redd.it/voiced1/HLSPlaylist.m3u8');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('excludes silent PornOne gallery.vcmdiawe.com/lpp/ hover previews and crawls full-length HD watch pages', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('pornone.com/search?q=asmr')) {
+          return {
+            ok: true,
+            text: async () => `
+              <html><title>Search Asmr</title><body>
+                <video src="https://gallery.vcmdiawe.com/lpp/5/dd0e92f9/dd0e92f9.20.mp4"></video>
+                <a href="https://pornone.com/female/asmr-peaches-sexy-roleplay/277874321/">Watch</a>
+              </body></html>`
+          };
+        }
+        if (u.includes('pornone.com/female/asmr-peaches-sexy-roleplay/277874321/')) {
+          return {
+            ok: true,
+            text: async () => `
+              <html>
+                <head>
+                  <title>Asmr Peaches Sexy Roleplay &mdash; PornOne ex vPorn</title>
+                  <script type="application/ld+json">{"@type":"VideoObject","duration":"P0DT0H5M29S"}</script>
+                </head>
+                <body>
+                  <video>
+                    <source src="https://s1003.pornone.com/vid2/tok/277874321_720x406_500k.mp4?lang=en" type="video/mp4" label="480p" />
+                    <source src="https://s3110.pornone.com/vid2/tok/277874321_1920x1080_4000k.mp4?lang=en" type="video/mp4" label="720p" />
+                  </video>
+                  <video src="https://gallery.vcmdiawe.com/lpp/7/fadd1212/fadd1212.20.mp4"></video>
+                </body>
+              </html>`
+          };
+        }
+        return { ok: false, status: 404, text: async () => '' };
+      };
+
+      try {
+        const items = await scanUrlForVideos('https://pornone.com/search?q=asmr', 'PornOne Tube (asmr)', true);
+        assert.strictEqual(items.length, 1);
+        assert.strictEqual(items[0].title, 'Asmr Peaches Sexy Roleplay');
+        assert.strictEqual(items[0].duration, 329);
+        assert.strictEqual(items[0].isHd, true);
+        assert.strictEqual(items[0].videoUrl, 'https://s3110.pornone.com/vid2/tok/277874321_1920x1080_4000k.mp4?lang=en');
+        assert.strictEqual(items[0].convertedUrl, 'https://s1003.pornone.com/vid2/tok/277874321_720x406_500k.mp4?lang=en');
+        assert.ok(!items.some((i) => i.videoUrl.includes('vcmdiawe.com')));
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('excludes silent Pornhub 180P hover WebMs and falls back to Arctic Shift when r/nsfwasmr search.json is blocked', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (u.includes('pornhub.com/video/search?search=asmr+tease')) {
+          return {
+            ok: true,
+            text: async () => `
+              <html><title>Strip Tease Asmr Porn Videos | Pornhub.com</title><body>
+                <a href="/video?o=ht">Hottest</a>
+                <a href="/video/search?search=other">Search</a>
+                <video data-mediabook="https://ew.phncdn.com/c6541/videos/202610/11/65381995/180P_225K_65381995.webm"></video>
+                <video src="https://pix-fl.phncdn.com/c6531/videos/202610/11/65447405/original_65447405.mp4"></video>
+                <video src="https://video-b.flirtify.com/tok/media=hls4/index.m3u8"></video>
+                <a href="/view_video.php?viewkey=65381995">ASMR Tease Watch</a>
+              </body></html>`
+          };
+        }
+        if (u.includes('pornhub.com/view_video.php?viewkey=65381995')) {
+          return {
+            ok: true,
+            text: async () => `
+              <html><head><title>POV Virtual ASMR Roleplay - Pornhub.com</title></head><body>
+                <script>var flashvars_65381995 = {"video_duration":"421","mediaDefinitions":[{"videoUrl":"https:\\/\\/ev.phncdn.com\\/videos\\/202610\\/11\\/65381995\\/720P_4000K_65381995.mp4"}]};</script>
+              </body></html>`
+          };
+        }
+        if (/reddit\.com\/r\/nsfwasmr\/(hot|top|new)\.json/i.test(u)) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: 'sg_only_1',
+                      title: '[F4M] Audio Only Post',
+                      subreddit: 'nsfwasmr',
+                      over_18: true,
+                      url: 'https://soundgasm.net/u/demo/audio-only'
+                    }
+                  }
+                ]
+              }
+            })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=nsfwasmr')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                {
+                  id: 'arch_rg_1',
+                  title: '[F4M] Sensual ASMR Roleplay Clip',
+                  subreddit: 'nsfwasmr',
+                  over_18: true,
+                  url: 'https://www.redgifs.com/watch/gainsborobrightasiantrumpetfish',
+                  permalink: '/r/nsfwasmr/comments/arch_rg_1/sensual_asmr/'
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/gainsborobrightasiantrumpetfish')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gif: {
+                id: 'gainsborobrightasiantrumpetfish',
+                duration: 44.8,
+                hasAudio: true,
+                urls: { hd: 'https://media.redgifs.com/GainsboroBrightAsiantrumpetfish.mp4' }
+              }
+            })
+          };
+        }
+        return { ok: false, status: 403, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        const phItems = await scanUrlForVideos(
+          'https://www.pornhub.com/video/search?search=asmr+tease',
+          'ASMR Tease',
+          true
+        );
+        assert.strictEqual(phItems.length, 1);
+        assert.strictEqual(
+          phItems[0].videoUrl,
+          'https://ev.phncdn.com/videos/202610/11/65381995/720P_4000K_65381995.mp4'
+        );
+        assert.ok(
+          !phItems.some((i) => /ew\.phncdn\.com|pix-fl\.phncdn\.com|flirtify\.com|180P_/i.test(i.videoUrl))
+        );
+
+        const subFallback = await fetchSubredditVideos('nsfwasmr');
+        assert.strictEqual(subFallback.length, 1);
+        assert.strictEqual(subFallback[0].id, 'rd-arch_rg_1');
+        assert.strictEqual(
+          subFallback[0].videoUrl,
+          'https://media.redgifs.com/GainsboroBrightAsiantrumpetfish.mp4'
+        );
+        assert.strictEqual(getVideoRefererUrl(subFallback[0]), 'https://www.redgifs.com/');
       } finally {
         globalThis.fetch = origFetch;
       }

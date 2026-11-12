@@ -996,14 +996,14 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
           };
         }
 
-        // 2. RedGIFs trending search returns empty, but order=best returns a clip
+        // 2. RedGIFs trending search returns empty, but order=top returns a clip
         if (u.includes('api.redgifs.com/v2/auth/temporary')) {
           return { ok: true, json: async () => ({ token: 'tok' }) };
         }
         if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=trending')) {
           return { ok: true, json: async () => ({ gifs: [] }) };
         }
-        if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=best')) {
+        if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=top')) {
           return {
             ok: true,
             json: async () => ({
@@ -1062,7 +1062,7 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         assert.strictEqual(
           rgHits.length,
           1,
-          'Should fall back from order=trending to order=best and not be wiped out by tubeDurationFilter="long"'
+          'Should fall back from order=trending to order=top and not be wiped out by tubeDurationFilter="long"'
         );
         assert.strictEqual(rgHits[0].videoUrl, 'https://thumbs4.redgifs.com/NicheClip1.mp4');
 
@@ -1241,11 +1241,11 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
           if (u.includes('api.redgifs.com/v2/auth/temporary')) {
             return { ok: true, json: async () => ({ token: 'tok' }) };
           }
-          // Simulate trending returning empty so 'redgifs' preset exercises the fallback to order=best / Reddit
+          // Simulate trending returning empty so 'redgifs' preset exercises the fallback to order=top / Reddit
           if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=trending')) {
             return { ok: true, json: async () => ({ gifs: [] }) };
           }
-          if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=best')) {
+          if (u.includes('api.redgifs.com/v2/gifs/search') && u.includes('order=top')) {
             return {
               ok: true,
               json: async () => ({
@@ -1296,7 +1296,7 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         );
         assert.ok(
           rgResults.some((item) => item.videoUrl === 'https://thumbs4.redgifs.com/RgBest1.mp4'),
-          'RedGIFs preset should return RedGIFs HD stream (including order=best fallback for trending)'
+          'RedGIFs preset should return RedGIFs HD stream (including order=top fallback for trending)'
         );
         assert.ok(
           !rgResults.some((item) => item.videoUrl === 'https://i.redd.it/reddit_clip.mp4'),

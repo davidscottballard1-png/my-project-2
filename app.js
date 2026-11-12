@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v41';
+const APP_BUILD_VERSION = 'v42';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -971,6 +971,13 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
     return rawStreamRef;
   }
 
+  const host = getHostnameSafe(cleanTarget);
+  if (host.includes('redgifs.com')) {
+    const rawPageHost = getHostnameSafe(videoItem?.pageUrl || '');
+    if (rawPageHost.includes('redgifs.com')) return String(videoItem.pageUrl).trim();
+    return 'https://www.redgifs.com/';
+  }
+
   const rawPage = String(videoItem?.pageUrl || '').trim();
   if (rawPage && /^https?:\/\//i.test(rawPage) && !/\/proxy\?(?:.*&)?key=/i.test(rawPage)) {
     return rawPage;
@@ -987,7 +994,6 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
   }
 
   const platform = String(videoItem?.platform || '').toLowerCase();
-  const host = getHostnameSafe(cleanTarget);
   if (platform === 'eporner' || host.includes('eporner.com')) return 'https://www.eporner.com/';
   if (platform === 'redgifs' || host.includes('redgifs.com')) return 'https://www.redgifs.com/';
   if (platform === 'reddit' || host.includes('redd.it') || host.includes('reddit.com')) {
@@ -1073,10 +1079,10 @@ function getVideoRefererUrl(videoItem, fallbackTargetUrl = '') {
 function isIpBoundEmbedOrCdnUrl(rawUrl) {
   const cleanUrl = unwrapProxyTargetUrl(rawUrl) || String(rawUrl || '').trim();
   if (!cleanUrl || !/^https?:\/\//i.test(cleanUrl)) return false;
-  const host = getHostnameSafe(cleanUrl);
+  const host = getHostnameSafe(rawUrl) || getHostnameSafe(cleanUrl);
   if (!host) return false;
-  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com|cloudwindow-route\.com)$/i.test(
-    host
+  return /(?:^|\.)(?:[\w-]*tnmr\.org|luluvid\.com|luluvdo\.com|lulustream\.com|lulust\.com|voe\.sx|hentaisword\.com|susanexpectcare\.com|cloudwindow-route\.com|phncdn\.com)$/i.test(
+    getHostnameSafe(cleanUrl)
   );
 }
 
@@ -4576,7 +4582,7 @@ async function fetchWithCorsFallback(url, asText = false, refererOverride = '', 
   const cleanUrl = unwrapProxyTargetUrl(url) || url;
   const host = getHostnameSafe(cleanUrl);
   const isNativeOpenCorsHost =
-    /(?:^|\.)(?:archive\.org|wikimedia\.org|nasa\.gov|sepiasearch\.org)$/i.test(host);
+    /(?:^|\.)(?:archive\.org|wikimedia\.org|nasa\.gov|sepiasearch\.org|photon-reddit\.com)$/i.test(host);
   const mustStayOnCloudProxy =
     isCloudBackendConfigured() &&
     /^https?:\/\//i.test(cleanUrl) &&
@@ -5351,6 +5357,12 @@ async function searchRedgifsVideos(keyword, limit = 6) {
   const seenIds = new Set();
   const cleanKw = String(keyword || '').replace(/\b(redgifs|nsfw|18\+)\b/gi, '').trim() || 'trending';
   const requireAudio = isAudioEssentialQuery(keyword);
+  const tagWords = cleanKw
+    .replace(/\b(?:hd|4k|loop|loops|clip|clips|video|videos)\b/gi, ' ')
+    .split(/\s+/)
+    .map((w) => w.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase())
+    .filter((w) => w.length >= 2 && w !== 'trending');
+  const tagsQueryPrefix = tagWords.length > 0 ? `tags=${encodeURIComponent(tagWords.join(','))}&` : '';
 
   const appendGifsFromList = (gifs) => {
     if (!Array.isArray(gifs)) return;
@@ -5386,8 +5398,8 @@ async function searchRedgifsVideos(keyword, limit = 6) {
   try {
     const token = await getRedgifsTempToken();
 
-    // 1. Primary search on RedGIFs API v2
-    const searchUrl = `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(
+    // 1. Primary search on RedGIFs API v2 (pass tags= alongside search_text= since v2 filters by tags=)
+    const searchUrl = `https://api.redgifs.com/v2/gifs/search?${tagsQueryPrefix}search_text=${encodeURIComponent(
       cleanKw
     )}&order=trending&count=${limit}`;
     const data = await fetchRedgifsApiJson(searchUrl, token);
@@ -5395,20 +5407,28 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       appendGifsFromList(data?.gifs);
     }
 
-    // 2. Niche/creator keywords (or when trending returns 0 voiced clips) fall back to 'best', core ASMR tag, and creator feeds
+    // 2. Niche/creator keywords (or when trending returns 0 voiced clips) fall back to 'top', core single tag, and creator feeds
     if (results.length === 0) {
       const activeToken = cachedRedgifsToken || token;
       const fallbackUrls = [
-        `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(cleanKw)}&order=best&count=${limit}`
+        `https://api.redgifs.com/v2/gifs/search?${tagsQueryPrefix}search_text=${encodeURIComponent(cleanKw)}&order=top&count=${limit}`
       ];
-      if (requireAudio && cleanKw.includes(' ') && cleanKw.toLowerCase() !== 'asmr') {
+      if (tagWords.length > 1) {
+        const primarySingleTag =
+          requireAudio && tagWords.includes('asmr') ? 'asmr' : tagWords[0];
         fallbackUrls.push(
-          `https://api.redgifs.com/v2/gifs/search?search_text=asmr&order=best&count=${limit}`
+          `https://api.redgifs.com/v2/gifs/search?tags=${encodeURIComponent(
+            primarySingleTag
+          )}&search_text=${encodeURIComponent(primarySingleTag)}&order=top&count=${limit}`
+        );
+      } else if (requireAudio && tagWords[0] !== 'asmr') {
+        fallbackUrls.push(
+          `https://api.redgifs.com/v2/gifs/search?tags=asmr&search_text=asmr&order=top&count=${limit}`
         );
       }
       if (cleanKw.toLowerCase() !== 'trending' && /^[a-zA-Z0-9_.-]{3,30}$/.test(cleanKw)) {
         fallbackUrls.push(
-          `https://api.redgifs.com/v2/users/${encodeURIComponent(cleanKw.toLowerCase())}/search?order=new&count=${limit}`
+          `https://api.redgifs.com/v2/users/${encodeURIComponent(cleanKw.toLowerCase())}/search?order=latest&count=${limit}`
         );
       }
       const settled = await Promise.allSettled(
@@ -5471,14 +5491,21 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
       continue;
     }
 
+    const previewVid =
+      mediaPost?.preview?.reddit_video_preview ||
+      mediaPost?.preview?.video_preview ||
+      null;
+    const allowPreviewVid =
+      !preferAudioStream ||
+      (previewVid && previewVid.is_gif !== true && previewVid.has_audio !== false);
+
     const fallbackMp4Url =
       redditVid?.fallback_url ||
-      mediaPost?.preview?.reddit_video_preview?.fallback_url ||
-      mediaPost?.preview?.video_preview?.fallback_url ||
-      mediaPost?.preview?.images?.[0]?.variants?.mp4?.source?.url ||
+      (allowPreviewVid ? previewVid?.fallback_url : null) ||
+      (!preferAudioStream ? mediaPost?.preview?.images?.[0]?.variants?.mp4?.source?.url : null) ||
       null;
 
-    const hlsUrl = redditVid?.hls_url || null;
+    const hlsUrl = redditVid?.hls_url || (allowPreviewVid ? previewVid?.hls_url : null) || null;
     let rawVideoUrl = null;
     let redditMp4FallbackUrl = null;
 
@@ -5486,8 +5513,9 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
     if (
       preferAudioStream &&
       hlsUrl &&
-      redditVid?.is_gif !== true &&
-      redditVid?.has_audio !== false &&
+      redditVid &&
+      redditVid.is_gif !== true &&
+      redditVid.has_audio !== false &&
       isFormatAllowedBySettings('m3u8')
     ) {
       rawVideoUrl = hlsUrl;
@@ -5642,15 +5670,24 @@ async function fetchSubredditVideos(subreddit) {
   const sorts = ['hot', 'top', 'new'];
   const randomSort = sorts[Math.floor(Math.random() * sorts.length)];
   const endpoints = [
-    `https://www.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`,
-    `https://old.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`
+    `https://www.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`
   ];
+  if (!settings.allowNsfw) {
+    endpoints.push(
+      `https://old.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`
+    );
+  }
 
   let sawNonVideoPostsInListing = false;
+  let reachedRedditListing = false;
   for (const url of endpoints) {
     try {
       const json = await fetchWithCorsFallback(url, false);
-      if (Array.isArray(json?.data?.children) && json.data.children.length > 0) {
+      const children = Array.isArray(json?.data?.children) ? json.data.children : null;
+      if (children && (children.length > 0 || !settings.allowNsfw)) {
+        reachedRedditListing = true;
+      }
+      if (children && children.length > 0) {
         sawNonVideoPostsInListing = true;
       }
       const extracted = await upgradeUnsignedRedgifsItems(
@@ -5661,6 +5698,7 @@ async function fetchSubredditVideos(subreddit) {
         extractRedditVideosFromListing(json, `r/${cleanSub}`, true)
       );
       if (sfwOrAll.length > 0) return sfwOrAll;
+      if (reachedRedditListing) break;
     } catch {
       // Try alternate Reddit mirror
     }
@@ -5680,6 +5718,42 @@ async function fetchSubredditVideos(subreddit) {
       if (videoExtracted.length > 0) return videoExtracted;
     } catch {
       // ignore subreddit video search fallback error
+    }
+  }
+
+  // Native-CORS Reddit archive mirror fallback strictly for this subreddit when Reddit blocks direct/proxy IPs (HTTP 403/429)
+  // or when the top slice only had text/audio posts and Reddit search.json was blocked
+  if ((!reachedRedditListing || sawNonVideoPostsInListing) && cleanSub) {
+    const subParts = cleanSub
+      .split('+')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const targetSub = subParts[Math.floor(Math.random() * subParts.length)] || cleanSub;
+    for (const archiveLimit of [25, 18]) {
+      try {
+        const archiveUrl = `https://arctic-shift.photon-reddit.com/api/posts/search?subreddit=${encodeURIComponent(
+          targetSub
+        )}&limit=${archiveLimit}`;
+        const archiveRes = await fetchWithTimeout(archiveUrl, 8500);
+        if (archiveRes && archiveRes.ok) {
+          const archiveJson = await archiveRes.json();
+          const rows = Array.isArray(archiveJson?.data) ? archiveJson.data : [];
+          if (rows.length > 0) {
+            const listingShape = { data: { children: rows.map((row) => ({ data: row })) } };
+            const mirrorExtracted = await upgradeUnsignedRedgifsItems(
+              extractRedditVideosFromListing(listingShape, `r/${cleanSub}`)
+            );
+            if (mirrorExtracted.length > 0) return mirrorExtracted;
+            const mirrorAll = await upgradeUnsignedRedgifsItems(
+              extractRedditVideosFromListing(listingShape, `r/${cleanSub}`, true)
+            );
+            if (mirrorAll.length > 0) return mirrorAll;
+          }
+          break;
+        }
+      } catch {
+        // retry with smaller limit if first archive query timed out
+      }
     }
   }
 
@@ -6085,7 +6159,7 @@ async function searchNasaVideos(keyword, limit = 4) {
 }
 
 const DECOY_OR_AD_VIDEO_URL_REGEX =
-  /(?:test-videos\.co\.uk|Big_Buck_Bunny_\d+_\d+s|(?:^|[/.])(?:exoclick|trafficjunky|juicyads|pemsrv|magsrv|tsyndicate|realsrv|adsco\.re|popads|adserver)\b|\/preroll[/_.-])/i;
+  /(?:test-videos\.co\.uk|Big_Buck_Bunny_\d+_\d+s|gallery\.vcmdiawe\.com\/lpp\/|(?:ew|ei|em|pix[\w-]*)\.phncdn\.com\/|phncdn\.com\/c\d+\/videos\/|\b180P_\d+K_\d+\.webm\b|\bprev_\d+\.mp4\b|(?:^|[/.])(?:exoclick|trafficjunky|juicyads|pemsrv|magsrv|tsyndicate|realsrv|adsco\.re|popads|adserver|flirtify)\b|\/preroll[/_.-])/i;
 
 function encodePackerBaseToken(num, radix) {
   if (radix <= 36) return num.toString(radix);
@@ -6249,7 +6323,10 @@ function decodeBasicHtmlEntities(rawStr) {
 function cleanScannedPageTitle(rawTitle) {
   if (!rawTitle || typeof rawTitle !== 'string') return null;
   const decoded = decodeBasicHtmlEntities(rawTitle)
-    .replace(/\s*(?:[-|–—]\s*)?(?:Free Taboo porn videos|FullTaboo(?:\.tv)?|Watch video online)\s*$/i, '')
+    .replace(
+      /\s*(?:[-|–—]\s*)?(?:Free Taboo porn videos|FullTaboo(?:\.tv)?|PornOne(?:\s+ex\s+vPorn)?|Watch video online)\s*$/i,
+      ''
+    )
     .trim();
   return decoded || null;
 }
@@ -6274,37 +6351,55 @@ function extractEmbeddedPlayerMetaFromHtml(rawText) {
   const unpacked = unpackDeanEdwardsPacker(rawText);
   const combined = unpacked ? `${unpacked}\n${rawText}` : rawText;
   if (!duration) {
-    const durMatch =
-      combined.match(/\bduration\s*[:=]\s*["']?(\d{1,6}(?:\.\d+)?)["']?/i) ||
-      rawText.match(/<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](\d+(?:\.\d+)?)["']/i);
-    if (durMatch?.[1]) {
-      const parsedDur = Math.round(Number(durMatch[1]));
+    const unpackedOrMetaNum =
+      (unpacked && unpacked.match(/\bduration\s*[:=]\s*["']?(\d{1,6}(?:\.\d+)?)["']?/i)) ||
+      rawText.match(
+        /<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](\d+(?:\.\d+)?)["']/i
+      );
+    const isoDurMatch =
+      rawText.match(
+        /<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](P(?:\d+D)?T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)["']/i
+      ) ||
+      rawText.match(
+        /["']duration["']\s*:\s*["'](P(?:\d+D)?T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)["']/i
+      );
+
+    if (unpackedOrMetaNum?.[1]) {
+      const parsedDur = Math.round(Number(unpackedOrMetaNum[1]));
       if (Number.isFinite(parsedDur) && parsedDur > 0 && parsedDur <= 43200) {
         duration = parsedDur;
       }
-    } else {
-      const isoDurMatch = rawText.match(
-        /<meta[^>]+(?:property|itemprop)=["'](?:video:)?duration["'][^>]+content=["'](P(?:\d+D)?T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d+)?S)?)["']/i
+    } else if (isoDurMatch?.[1]) {
+      const isoParts = isoDurMatch[1].match(
+        /^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i
       );
-      if (isoDurMatch?.[1]) {
-        const isoParts = isoDurMatch[1].match(
-          /^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/i
+      if (isoParts) {
+        const totalSec = Math.round(
+          (Number(isoParts[1]) || 0) * 86400 +
+            (Number(isoParts[2]) || 0) * 3600 +
+            (Number(isoParts[3]) || 0) * 60 +
+            (Number(isoParts[4]) || 0)
         );
-        if (isoParts) {
-          const totalSec = Math.round(
-            (Number(isoParts[1]) || 0) * 86400 +
-              (Number(isoParts[2]) || 0) * 3600 +
-              (Number(isoParts[3]) || 0) * 60 +
-              (Number(isoParts[4]) || 0)
-          );
-          if (totalSec > 0 && totalSec <= 43200) {
-            duration = totalSec;
-          }
+        if (totalSec > 0 && totalSec <= 43200) {
+          duration = totalSec;
+        }
+      }
+    } else {
+      const genericDurMatch = rawText.match(/\bduration\s*[:=]\s*["']?(\d{1,6}(?:\.\d+)?)["']?/i);
+      if (genericDurMatch?.[1]) {
+        const parsedGeneric = Math.round(Number(genericDurMatch[1]));
+        if (Number.isFinite(parsedGeneric) && parsedGeneric > 0 && parsedGeneric <= 43200) {
+          duration = parsedGeneric;
         }
       }
     }
   }
-  if (!isHd && /(?:_h\/master\.m3u8|\b(?:720|1080|1440|2160)p\b|for free in HD\b)/i.test(combined)) {
+  if (
+    !isHd &&
+    /(?:_h\/master\.m3u8|\b(?:720|1080|1440|2160)p\b|_(?:1920x1080|1280x720)_|for free in HD\b)/i.test(
+      combined
+    )
+  ) {
     isHd = true;
   }
   if (!isHd) {
@@ -7044,8 +7139,18 @@ async function scanUrlForVideos(
     extractedUrls = await resolveEpornerStreamsFromEmbedHtml(rawText, null, effectiveUrl);
   }
 
+  const isPornOneWatchPage = /(?:^|[./])pornone\.com\/[^/?#]+\/[^/?#]+\/\d+/i.test(effectiveUrl);
+  if (isPornOneWatchPage && extractedUrls.length > 1) {
+    extractedUrls = [...extractedUrls].sort((a, b) => {
+      const score = (u) =>
+        /(?:1920x1080|1280x720|1080p|720p)/i.test(u) ? 2 : /(?:480p|720x406|360p)/i.test(u) ? 1 : 0;
+      return score(b) - score(a);
+    });
+  }
+
   const voeStreams = decodeVoeEmbeddedStreams(rawText);
-  const isSingleEmbedHost = /(?:luluvid|luluvdo|lulustream|lulust)\.com\//i.test(effectiveUrl);
+  const isSingleEmbedHost =
+    /(?:luluvid|luluvdo|lulustream|lulust)\.com\//i.test(effectiveUrl) || isPornOneWatchPage;
   const collapseSingleEmbedStreams =
     voeStreams.length >= 1 || (isSingleEmbedHost && extractedUrls.length >= 1);
   const primaryStreamPool = voeStreams.length >= 1 ? voeStreams : extractedUrls;
@@ -7211,7 +7316,14 @@ async function scanUrlForVideos(
     let lm;
     while ((lm = linkRegex.exec(rawText)) !== null && candidateLinks.length < 30) {
       try {
-        const fullLink = new URL(lm[1].replace(/&amp;/g, '&'), trimmed).href;
+        const parsedWatch = new URL(lm[1].replace(/&amp;/g, '&'), trimmed);
+        if (
+          /^\/videos?\/?(?:$|search\b|incategories\b|categories\b)/i.test(parsedWatch.pathname) &&
+          !/\bviewkey=/i.test(parsedWatch.search)
+        ) {
+          continue;
+        }
+        const fullLink = parsedWatch.href;
         if (fullLink !== trimmed && !candidateLinks.includes(fullLink)) {
           candidateLinks.push(fullLink);
         }
@@ -7233,12 +7345,15 @@ async function scanUrlForVideos(
           const parsed = new URL(sm[1].replace(/&amp;/g, '&'), trimmed);
           if (baseHost && parsed.host !== baseHost) continue;
           const pathClean = parsed.pathname.replace(/^\/+|\/+$/g, '');
-          // Match single-segment hyphenated post slugs while excluding navigation/taxonomy/archive paths
-          if (
+          // Match single-segment hyphenated post slugs OR category/slug/numeric-id watch paths (e.g. pornone.com/female/slug/12345/)
+          const isCategorySlugIdWatch = /^[a-z0-9-]+\/[a-z0-9]+-[a-z0-9-]{3,}\/\d+$/i.test(pathClean);
+          const isSinglePostSlug =
             /^[a-z0-9]+-[a-z0-9-]{4,}$/i.test(pathClean) &&
             !/^(?:category|categories|tag|tags|actor|actors|star|stars|model|models|studio|studios|channel|channels|pornstar|pornstars|partner|partners|page|wp-[a-z0-9-]+|feed|about|contact(?:-us)?|privacy(?:-policy)?|terms(?:-of-(?:use|service))?|dmca(?:-\d+)?|2257|sitemap|login|register|most-viewed|top-rated|longest-videos|latest-videos|random-videos|popular-videos|trending-videos|all-videos|submit-video)$/i.test(
               pathClean
-            ) &&
+            );
+          if (
+            (isCategorySlugIdWatch || isSinglePostSlug) &&
             parsed.href !== trimmed &&
             !candidateLinks.includes(parsed.href)
           ) {
@@ -7334,6 +7449,10 @@ function extractCandidateWebPagesFromSearchHtml(rawHtml) {
         (!isCloudBackendConfigured() || settings.allowNsfw) &&
         /(?:^|\.)(?:youtube\.com|youtu\.be|tiktok\.com)$/i.test(host)
       ) {
+        return false;
+      }
+      // Browser-only CORS proxies mint foreign-IP hash= tokens on Pornhub (HTTP 474 on client <video>); require Private Cloud Bridge
+      if (!isCloudBackendConfigured() && /(?:^|\.)pornhub\.com$/i.test(host)) {
         return false;
       }
       // Strict 18+ Mode: reject all mainstream SFW video/reference/news sites so 18+ search stays strictly 18+
