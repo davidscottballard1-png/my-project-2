@@ -2927,7 +2927,9 @@ process.exit(0);
       };
       globalThis.setTimeout = (fn, ms, ...rest) => {
         if (ms === 2500) {
-          return origSetTimeout(fn, 0, ...rest);
+          const t = origSetTimeout(fn, 0, ...rest);
+          t.unref = () => t;
+          return t;
         }
         return origSetTimeout(fn, ms, ...rest);
       };
