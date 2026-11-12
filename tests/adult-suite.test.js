@@ -63,6 +63,7 @@ const {
   obtainIphoneReadyVideoBlob,
   saveAndCacheVideoToVault,
   rehydrateQueueOfflineBlobsFromVault,
+  searchFediverseVideos,
   loadState,
   getAppState,
   setAppState
@@ -1979,7 +1980,514 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       }
     });
   });
+
+  describe('63-Source Standalone Live Audit Regression Guardrails (v43)', () => {
+    it('rejects RedGIFs still-image uploads (type === 2 & .jpg URLs) in searchRedgifsVideos and resolveRedgifsUrlToMp4', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      const hitUrls = [];
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        hitUrls.push(u);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok-img' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/search')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'fullkookybat',
+                  type: 2,
+                  tags: ['3D', 'Anime', 'Art'],
+                  urls: {
+                    hd: 'https://media.redgifs.com/FullKookyBat-large.jpg',
+                    sd: 'https://media.redgifs.com/FullKookyBat-mobile.jpg'
+                  }
+                },
+                {
+                  id: 'untypedphoto',
+                  tags: ['Art'],
+                  urls: {
+                    hd: 'https://media.redgifs.com/UntypedPhoto-large.jpg'
+                  }
+                },
+                {
+                  id: 'real3dloop',
+                  type: 1,
+                  duration: 16,
+                  tags: ['3D', 'Anime', 'Loop'],
+                  urls: {
+                    hd: 'https://media.redgifs.com/Real3DLoop.mp4',
+                    sd: 'https://media.redgifs.com/Real3DLoop-mobile.mp4'
+                  }
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/fullkookybat')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gif: {
+                id: 'fullkookybat',
+                type: 2,
+                urls: { hd: 'https://media.redgifs.com/FullKookyBat-large.jpg' }
+              }
+            })
+          };
+        }
+        return { ok: false, status: 404, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        setAppState({ resetRedgifsToken: true });
+        const searchItems = await searchRedgifsVideos('anime 3d art loop 18+', 6);
+        assert.strictEqual(searchItems.length, 1);
+        assert.strictEqual(searchItems[0].id, 'rg-real3dloop');
+        assert.strictEqual(searchItems[0].videoUrl, 'https://media.redgifs.com/Real3DLoop.mp4');
+        assert.ok(hitUrls.some((u) => u.includes('api.redgifs.com/v2/gifs/search') && u.includes('type=g')));
+
+        const resolvedPhoto = await resolveRedgifsUrlToMp4('https://www.redgifs.com/watch/fullkookybat');
+        assert.strictEqual(resolvedPhoto, null);
+        assert.ok(
+          !hitUrls.some((u) => u.includes('/ifr/fullkookybat')),
+          'Still-image RedGIFs item must return null immediately without scraping /ifr/ HTML'
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('omits literal search_text=trending on RedGIFs trending feed and queries Title-Case Amateur tag + stripped search_text', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      const hitUrls = [];
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        hitUrls.push(u);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok-rg' }) };
+        }
+        if (u === 'https://api.redgifs.com/v2/gifs/search?type=g&order=trending&count=6') {
+          return { ok: true, json: async () => ({ gifs: [] }) };
+        }
+        if (u.includes('/v2/feeds/trending/popular?page=1&count=6')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'popclip1',
+                  type: 1,
+                  duration: 21,
+                  tags: ['Popular'],
+                  urls: { hd: 'https://media.redgifs.com/PopClip1.mp4' }
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('tags=Amateur&search_text=amateur&type=g&order=top28')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'amateurclip1',
+                  type: 1,
+                  duration: 25,
+                  tags: ['Amateur', 'Homemade'],
+                  urls: { hd: 'https://media.redgifs.com/AmateurClip1.mp4' }
+                }
+              ]
+            })
+          };
+        }
+        return { ok: true, json: async () => ({ gifs: [] }) };
+      };
+
+      try {
+        setAppState({ resetRedgifsToken: true });
+        const trendingItems = await searchRedgifsVideos('redgifs trending', 6);
+        assert.strictEqual(trendingItems.length, 1);
+        assert.strictEqual(trendingItems[0].id, 'rg-popclip1');
+        assert.ok(!hitUrls.some((u) => u.includes('search_text=trending')));
+
+        hitUrls.length = 0;
+        const amateurItems = await searchRedgifsVideos('redgifs amateur hd', 6);
+        assert.strictEqual(amateurItems.length, 1);
+        assert.strictEqual(amateurItems[0].id, 'rg-amateurclip1');
+        assert.ok(!hitUrls.some((u) => u.includes('amateur%20hd')));
+        assert.ok(hitUrls.some((u) => u.includes('tags=Amateur&search_text=amateur&type=g&order=top28')));
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('migrates dead r/sensual presets to r/passionx and cursor-paginates photo-heavy & multireddit archives via before=created_utc', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+
+      // 1. Built-in presets & directory entries use active r/passionx instead of dead r/sensual
+      const sensualPreset = ADULT_PRESET_SOURCES.find((s) => s.id === 'src-nsfw-sub-sensual');
+      assert.strictEqual(sensualPreset.value, 'passionx');
+      assert.strictEqual(findDirectoryEntry('dir-sub-sensual').value, 'passionx');
+      assert.strictEqual(
+        findDirectoryEntry('dir-fed-multireddit').value,
+        'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+passionx'
+      );
+
+      // 2. Saved localStorage sources from earlier builds migrate dead r/sensual -> r/passionx on loadState()
+      localStorage.setItem(
+        STORAGE_KEYS.SOURCES,
+        JSON.stringify([
+          {
+            id: 'src-nsfw-sub-sensual',
+            type: 'subreddit',
+            value: 'sensual',
+            label: '🔞 r/sensual Romantic',
+            enabled: true,
+            builtIn: true,
+            isNsfw: true
+          },
+          {
+            id: 'dir-fed-multireddit',
+            type: 'subreddit',
+            value: 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+sensual',
+            label: 'Reddit 18+ Mega-Mix (6-in-1)',
+            enabled: true,
+            isNsfw: true
+          }
+        ])
+      );
+      loadState();
+      const migratedSources = getAppState().sources;
+      assert.strictEqual(migratedSources[0].value, 'passionx');
+      assert.strictEqual(migratedSources[0].label, '🔞 r/passionx Sensual & Romantic');
+      assert.strictEqual(migratedSources[1].value, 'nsfw+NSFW_GIF+RealGirls+Amateur+gonewild+passionx');
+
+      // 3. Photo-heavy subreddit cursor-paginates via before=<created_utc> when page 1 has 20 still photos
+      const origFetch = globalThis.fetch;
+      const hitUrls = [];
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        hitUrls.push(u);
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=gonewild&limit=25')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: Array.from({ length: 20 }, (_, idx) => ({
+                id: `gw_img_${idx}`,
+                title: `Photo Post ${idx}`,
+                subreddit: 'gonewild',
+                over_18: true,
+                created_utc: 1776000500 - idx,
+                url: `https://i.redd.it/photo_${idx}.jpg`
+              }))
+            })
+          };
+        }
+        if (
+          u.includes(
+            'arctic-shift.photon-reddit.com/api/posts/search?subreddit=gonewild&limit=75&before=1776000481'
+          )
+        ) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                {
+                  id: 'gw_vid_1',
+                  title: 'Gonewild Video Post',
+                  subreddit: 'gonewild',
+                  over_18: true,
+                  created_utc: 1776000400,
+                  url: 'https://www.redgifs.com/watch/gonewildverified1',
+                  permalink: '/r/gonewild/comments/gw_vid_1/clip/'
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=emptysub&limit=25')) {
+          return { ok: true, json: async () => ({ data: [] }) };
+        }
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok-gw' }) };
+        }
+        if (u.includes('api.redgifs.com/v2/gifs/gonewildverified1')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gif: {
+                id: 'gonewildverified1',
+                type: 1,
+                duration: 18,
+                urls: { hd: 'https://media.redgifs.com/GonewildVerified1.mp4' }
+              }
+            })
+          };
+        }
+        if (u.includes('reddit.com/r/Unexpected/')) {
+          // Simulate old.reddit.com / www.reddit.com returning empty children:[] to datacenter proxy IPs
+          return { ok: true, json: async () => ({ data: { children: [] } }) };
+        }
+        if (u === 'https://v.redd.it/deleted403/CMAF_720.mp4?source=fallback') {
+          return {
+            ok: false,
+            status: 403,
+            headers: new Headers({ 'content-type': 'application/xml' })
+          };
+        }
+        if (u === 'https://v.redd.it/unexp1/CMAF_720.mp4?source=fallback') {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'content-type': 'video/mp4' })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=Unexpected&limit=25')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                {
+                  id: 'unexp_mod_removed',
+                  title: 'Removed Rule Violation',
+                  subreddit: 'Unexpected',
+                  over_18: false,
+                  removed_by_category: 'moderator',
+                  media: {
+                    reddit_video: {
+                      fallback_url: 'https://v.redd.it/modrem1/CMAF_720.mp4?source=fallback'
+                    }
+                  }
+                },
+                {
+                  id: 'unexp_s3_deleted',
+                  title: 'Deleted S3 AccessDenied Post',
+                  subreddit: 'Unexpected',
+                  over_18: false,
+                  media: {
+                    reddit_video: {
+                      fallback_url: 'https://v.redd.it/deleted403/CMAF_720.mp4?source=fallback'
+                    }
+                  }
+                },
+                {
+                  id: 'unexp_1',
+                  title: 'Safe Unexpected Clip',
+                  subreddit: 'Unexpected',
+                  over_18: false,
+                  media: {
+                    reddit_video: {
+                      fallback_url: 'https://v.redd.it/unexp1/CMAF_720.mp4?source=fallback',
+                      duration: 22,
+                      height: 720
+                    }
+                  },
+                  permalink: '/r/Unexpected/comments/unexp_1/safe_clip/'
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=photoflood&limit=25')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: Array.from({ length: 20 }, (_, idx) => ({
+                id: `pf_p1_${idx}`,
+                title: `Photo Flood P1 ${idx}`,
+                subreddit: 'photoflood',
+                over_18: true,
+                created_utc: 1776000900 - idx,
+                url: `https://i.redd.it/pf_p1_${idx}.jpg`
+              }))
+            })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=photoflood&limit=75&before=')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: Array.from({ length: 20 }, (_, idx) => ({
+                id: `pf_older_${idx}`,
+                title: `Photo Flood Older ${idx}`,
+                subreddit: 'photoflood',
+                over_18: true,
+                created_utc: 1776000700 - idx,
+                url: `https://i.redd.it/pf_older_${idx}.jpg`
+              }))
+            })
+          };
+        }
+        if (
+          u.includes(
+            'arctic-shift.photon-reddit.com/api/posts/search?subreddit=photoflood&url=https%3A%2F%2Fwww.redgifs.com%2F&limit=5'
+          )
+        ) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                {
+                  id: 'pf_rg_1',
+                  title: 'Photoflood RedGIFs Gem',
+                  subreddit: 'photoflood',
+                  over_18: true,
+                  created_utc: 1775999000,
+                  url: 'https://www.redgifs.com/watch/gonewildverified1',
+                  permalink: '/r/photoflood/comments/pf_rg_1/gem/'
+                }
+              ]
+            })
+          };
+        }
+        return { ok: false, status: 403, text: async () => '', json: async () => ({}) };
+      };
+
+      try {
+        const gwVideos = await fetchSubredditVideos('gonewild');
+        assert.strictEqual(gwVideos.length, 1);
+        assert.strictEqual(gwVideos[0].videoUrl, 'https://media.redgifs.com/GonewildVerified1.mp4');
+        assert.ok(hitUrls.some((u) => u.includes('&limit=75&before=1776000481')));
+
+        const pfVideos = await fetchSubredditVideos('photoflood');
+        assert.strictEqual(pfVideos.length, 1);
+        assert.strictEqual(pfVideos[0].videoUrl, 'https://media.redgifs.com/GonewildVerified1.mp4');
+        assert.strictEqual(pfVideos[0].sourceName, 'r/photoflood');
+        assert.ok(
+          hitUrls.some((u) =>
+            u.includes('subreddit=photoflood&url=https%3A%2F%2Fwww.redgifs.com%2F&limit=5')
+          )
+        );
+
+        const multiVideos = await fetchSubredditVideos('emptysub+gonewild');
+        assert.strictEqual(multiVideos.length, 1);
+        assert.strictEqual(multiVideos[0].videoUrl, 'https://media.redgifs.com/GonewildVerified1.mp4');
+
+        // 4. Safe Mode subreddit falls through to Arctic Shift when Reddit returns empty { children: [] }
+        settings.allowNsfw = false;
+        const safeUnexpected = await fetchSubredditVideos('Unexpected');
+        assert.strictEqual(safeUnexpected.length, 1);
+        assert.strictEqual(safeUnexpected[0].videoUrl, 'https://v.redd.it/unexp1/CMAF_720.mp4?source=fallback');
+        assert.strictEqual(safeUnexpected[0].isNsfw, false);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('enforces strict 18+ sensitive/nsfw filtering, Mastodon max_id pagination, and strips meta-words in searchFediverseVideos', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      const hitUrls = [];
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        hitUrls.push(u);
+        if (u === 'https://mastodon.social/api/v1/timelines/tag/nsfw?limit=40') {
+          // Page 1 burst of 20 still-image posts + 1 non-sensitive video -> triggers max_id page 2
+          return {
+            ok: true,
+            json: async () => [
+              {
+                id: 'masto_sfw_1',
+                sensitive: false,
+                content: '<p>SFW untagged clip</p>',
+                media_attachments: [
+                  { id: 'att_sfw', type: 'video', url: 'https://files.mastodon.social/sfw.mp4' }
+                ]
+              },
+              ...Array.from({ length: 20 }, (_, idx) => ({
+                id: `masto_img_${1000 - idx}`,
+                sensitive: true,
+                content: '<p>Still artwork</p>',
+                media_attachments: [
+                  { id: `att_img_${idx}`, type: 'image', url: `https://files.mastodon.social/art_${idx}.jpg` }
+                ]
+              }))
+            ]
+          };
+        }
+        if (u === 'https://mastodon.social/api/v1/timelines/tag/nsfw?limit=40&max_id=masto_img_981') {
+          return {
+            ok: true,
+            json: async () => [
+              {
+                id: 'masto_nsfw_1',
+                sensitive: true,
+                content: '<p>Verified 18+ Mastodon clip</p>',
+                media_attachments: [
+                  { id: 'att_nsfw', type: 'video', url: 'https://files.mastodon.social/nsfw_valid.mp4' }
+                ]
+              }
+            ]
+          };
+        }
+        if (u.includes('lemmy.world/api/v3/search')) {
+          return {
+            ok: true,
+            json: async () => ({
+              posts: [
+                {
+                  post: {
+                    id: 'sfw_ext_post',
+                    name: 'Age verification browser extension demo',
+                    nsfw: false,
+                    url: 'https://furries.club/system/media_attachments/dead_sfw.mp4'
+                  },
+                  community: { name: 'software', nsfw: false }
+                },
+                {
+                  post: {
+                    id: 'nsfw_lemmy_post',
+                    name: 'Fediverse 18+ Clip',
+                    nsfw: true,
+                    url: 'https://cdn.lemmy.example/nsfw_clip.mp4'
+                  },
+                  community: { name: 'adult', nsfw: true }
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('lemmynsfw.com/api/v3/search')) {
+          return { ok: false, status: 502, text: async () => '<html>502</html>' };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      };
+
+      try {
+        const items = await searchFediverseVideos('lemmy fediverse nsfw');
+        assert.strictEqual(items.length, 2);
+        assert.ok(!items.some((i) => i.videoUrl.includes('furries.club') || i.videoUrl.includes('sfw.mp4')));
+        assert.ok(items.some((i) => i.videoUrl === 'https://files.mastodon.social/nsfw_valid.mp4'));
+        assert.ok(items.every((i) => i.isNsfw === true));
+        assert.ok(
+          hitUrls.some((u) => u === 'https://mastodon.social/api/v1/timelines/tag/nsfw?limit=40&max_id=masto_img_981')
+        );
+        assert.ok(
+          hitUrls.some((u) => u.includes('lemmy.world/api/v3/search?q=nsfw&') && u.includes('show_nsfw=true'))
+        );
+        assert.ok(
+          hitUrls.some((u) => u.includes('lemmynsfw.com/api/v3/search?q=nsfw&') && u.includes('show_nsfw=true'))
+        );
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+  });
 });
+
 
 
 
