@@ -129,6 +129,8 @@ curl -fsSL "${RAW_BASE}/Dockerfile" -o "${INSTALL_DIR}/Dockerfile"
 curl -fsSL "${RAW_BASE}/bridge.js" -o "${INSTALL_DIR}/bridge.js"
 curl -fsSL "${RAW_BASE}/Caddyfile" -o "${INSTALL_DIR}/Caddyfile"
 curl -fsSL "${RAW_BASE}/docker-compose.yml" -o "${INSTALL_DIR}/docker-compose.yml"
+curl -fsSL "${RAW_BASE}/auto-update.sh" -o "${INSTALL_DIR}/auto-update.sh"
+chmod 755 "${INSTALL_DIR}/auto-update.sh"
 
 write_env_file() {
   local domain_val="$1"
@@ -220,6 +222,8 @@ if echo "$HEALTH_JSON" | grep -q '"updatedPrefs":\["'; then
   done
   sync_plex_bridge >/dev/null 2>&1 || true
 fi
+
+"${INSTALL_DIR}/auto-update.sh" --install >/dev/null 2>&1 || true
 
 echo ""
 echo "============================================================"

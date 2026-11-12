@@ -2949,5 +2949,678 @@ process.exit(0);
       globalThis.fetch = origFetch;
     }
   });
+
+  it('auto-creates ReelVault Clips and ReelVault 18+ Vault on modern PMS 1.43+ (tv.plex.agents.none) with legacy agent fallback and reports library failures truthfully (Patch 1)', async () => {
+    globalThis.fetch = origFetch;
+
+    let serverMode = 'modern_143';
+    let sections = [];
+    let nextSectionKey = 1;
+    const postAttempts = [];
+
+    const mockPlex = http.createServer((req, res) => {
+      const u = new URL(req.url || '/', 'http://127.0.0.1');
+      if (u.searchParams.get('X-Plex-Token') !== 'plex_tok_patch1') {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Unauthorized' }));
+      }
+
+      if (req.method === 'GET' && u.pathname === '/library/sections') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            MediaContainer: {
+              size: sections.length,
+              ...(sections.length > 0 ? { Directory: sections } : {})
+            }
+          })
+        );
+      }
+
+      if (req.method === 'POST' && u.pathname === '/library/sections') {
+        const entry = {
+          name: u.searchParams.get('name'),
+          type: u.searchParams.get('type'),
+          agent: u.searchParams.get('agent'),
+          scanner: u.searchParams.get('scanner'),
+          language: u.searchParams.get('language'),
+          location: u.searchParams.get('location'),
+          includeInGlobal: u.searchParams.get('prefs[includeInGlobal]')
+        };
+        postAttempts.push(entry);
+
+        if (serverMode === 'broken') {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          return res.end('Database locked');
+        }
+
+        if (serverMode === 'modern_143') {
+          // PMS 1.43+ rejects legacy com.plexapp.agents.none and requires tv.plex.agents.none + Plex Video Files
+          if (entry.agent !== 'tv.plex.agents.none' || entry.scanner !== 'Plex Video Files') {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            return res.end('Legacy agent disabled in PMS 1.43+');
+          }
+          sections.push({
+            key: String(nextSectionKey++),
+            title: entry.name,
+            type: entry.type,
+            agent: entry.agent,
+            scanner: entry.scanner,
+            Location: [{ id: nextSectionKey * 10, path: entry.location }]
+          });
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ MediaContainer: { size: 1 } }));
+        }
+
+        if (serverMode === 'legacy_pms') {
+          // Older PMS rejects tv.plex.agents.none (400 on /data/safe, silent 200 no-op on /data/vault-18)
+          if (entry.agent === 'tv.plex.agents.none') {
+            if (entry.location === '/data/vault-18') {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              return res.end(JSON.stringify({ MediaContainer: { size: 0 } }));
+            }
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            return res.end('Unknown agent tv.plex.agents.none');
+          }
+          if (
+            entry.agent === 'com.plexapp.agents.none' &&
+            entry.scanner === 'Plex Video Files Scanner'
+          ) {
+            sections.push({
+              key: String(nextSectionKey++),
+              title: entry.name,
+              type: entry.type,
+              agent: entry.agent,
+              scanner: entry.scanner,
+              Location: [{ id: nextSectionKey * 10, path: entry.location }]
+            });
+            res.writeHead(201, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ MediaContainer: { size: 1 } }));
+          }
+          res.writeHead(400);
+          return res.end();
+        }
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockPlex.listen(0, '127.0.0.1', resolve));
+    const plexPort = mockPlex.address().port;
+    const plexUrl = `http://127.0.0.1:${plexPort}`;
+    const origDocument = globalThis.document;
+
+    try {
+      // 1. Modern PMS 1.43+ succeeds on first try using tv.plex.agents.none + Plex Video Files + language=xn
+      const modernHealth = await bridge.ensurePlexLibraries({
+        plexUrl,
+        token: 'plex_tok_patch1',
+        safeDir: '/data/safe/',
+        nsfwDir: '/data/vault-18/',
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(modernHealth.reachable, true);
+      assert.strictEqual(modernHealth.claimed, true);
+      assert.strictEqual(modernHealth.librariesReady, true);
+      assert.strictEqual(modernHealth.missingLibraries, undefined);
+      assert.strictEqual(postAttempts.length, 2, 'PMS 1.43+ must succeed on first modern profile per library');
+      assert.strictEqual(postAttempts[0].agent, 'tv.plex.agents.none');
+      assert.strictEqual(postAttempts[0].scanner, 'Plex Video Files');
+      assert.strictEqual(postAttempts[0].language, 'xn');
+      assert.strictEqual(postAttempts[0].location, '/data/safe');
+      assert.strictEqual(postAttempts[0].includeInGlobal, null);
+      assert.strictEqual(postAttempts[1].name, 'ReelVault 18+ Vault');
+      assert.strictEqual(postAttempts[1].location, '/data/vault-18');
+      assert.strictEqual(
+        postAttempts[1].includeInGlobal,
+        '0',
+        'ReelVault 18+ Vault must always pass prefs[includeInGlobal]=0'
+      );
+
+      // 2. Older PMS rejecting tv.plex.agents.none (both HTTP 400 and silent HTTP 200 no-op) falls back cleanly to com.plexapp.agents.none
+      serverMode = 'legacy_pms';
+      sections = [];
+      postAttempts.length = 0;
+
+      const legacyHealth = await bridge.ensurePlexLibraries({
+        plexUrl,
+        token: 'plex_tok_patch1',
+        safeDir: '/data/safe',
+        nsfwDir: '/data/vault-18',
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(legacyHealth.reachable, true);
+      assert.strictEqual(legacyHealth.librariesReady, true);
+      assert.deepStrictEqual(
+        legacyHealth.libraries.map((l) => l.title),
+        ['ReelVault Clips', 'ReelVault 18+ Vault']
+      );
+      const legacyAccepted = postAttempts.filter((a) => a.agent === 'com.plexapp.agents.none');
+      assert.strictEqual(legacyAccepted.length, 2);
+      assert.strictEqual(legacyAccepted[1].includeInGlobal, '0');
+
+      // 3. Broken PMS rejecting all section creation profiles reports librariesReady: false & surfaces UI warning
+      serverMode = 'broken';
+      sections = [];
+      postAttempts.length = 0;
+
+      const brokenHealth = await bridge.ensurePlexLibraries({
+        plexUrl,
+        token: 'plex_tok_patch1',
+        safeDir: '/data/safe',
+        nsfwDir: '/data/vault-18',
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(brokenHealth.reachable, true);
+      assert.strictEqual(brokenHealth.claimed, true);
+      assert.strictEqual(brokenHealth.librariesReady, false);
+      assert.deepStrictEqual(brokenHealth.missingLibraries, [
+        'ReelVault Clips',
+        'ReelVault 18+ Vault'
+      ]);
+
+      const mockBadge = {
+        textContent: '',
+        classList: { add: () => {}, remove: () => {}, toggle: () => {} }
+      };
+      globalThis.document = {
+        getElementById: (id) => (id === 'cloudStatusBadge' ? mockBadge : null),
+        querySelectorAll: () => []
+      };
+
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          authenticated: true,
+          plex: brokenHealth,
+          residentialProxy: false
+        })
+      });
+      await app.testCloudBackendConnection('https://85-239-249-225.nip.io', 'rv_secret_abc');
+      assert.strictEqual(mockBadge.textContent, '🟢 Connected • Plex Library Issue');
+
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          authenticated: true,
+          plex: { reachable: false, claimed: false, librariesReady: false, libraries: [] },
+          residentialProxy: false
+        })
+      });
+      await app.testCloudBackendConnection('https://85-239-249-225.nip.io', 'rv_secret_abc');
+      assert.strictEqual(mockBadge.textContent, '🟢 Connected • Plex Unclaimed');
+    } finally {
+      globalThis.document = origDocument;
+      await new Promise((resolve) => mockPlex.close(resolve));
+    }
+  });
+
+  it('verifies matching Plex library scans before reporting Saved in Plex and surfaces clear warnings when MP4s save on server without a Plex scan (Patch 2)', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+
+    globalThis.fetch = origFetch;
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-plex-scan-truth-'));
+    const binDir = path.join(testRoot, 'bin');
+    const safeDir = path.join(testRoot, 'safe');
+    const nsfwDir = path.join(testRoot, 'vault-18');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(safeDir, { recursive: true });
+    fs.mkdirSync(nsfwDir, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(binDir, 'yt-dlp'),
+      `#!/usr/bin/env bash
+for ((i=1; i<=$#; i++)); do
+  if [ "\${!i}" = "-o" ]; then
+    next=$((i+1))
+    tpl="\${!next}"
+    printf 'DIRECT_PLAY_H264_MP4' > "\${tpl//%(ext)s/mp4}"
+    exit 0
+  fi
+done
+exit 1
+`,
+      { mode: 0o755 }
+    );
+    fs.writeFileSync(path.join(binDir, 'ffprobe'), '#!/usr/bin/env bash\necho "h264"\n', {
+      mode: 0o755
+    });
+    fs.writeFileSync(
+      path.join(binDir, 'ffmpeg'),
+      '#!/usr/bin/env bash\ndest="${@: -1}"\nprintf "FASTSTART_MP4_OK" > "$dest"\nexit 0\n',
+      { mode: 0o755 }
+    );
+
+    let allowSectionCreate = false;
+    let refreshStatus = 200;
+    let sections = [
+      {
+        key: '99',
+        title: 'Unrelated Personal Movies',
+        type: 'movie',
+        Location: [{ id: 990, path: '/unrelated/movies' }]
+      }
+    ];
+    let nextKey = 10;
+    const refreshedSectionKeys = [];
+
+    const mockPlex = http.createServer((req, res) => {
+      const u = new URL(req.url || '/', 'http://127.0.0.1');
+      if (u.searchParams.get('X-Plex-Token') !== 'plex_tok_patch2') {
+        res.writeHead(401);
+        return res.end();
+      }
+      if (req.method === 'GET' && u.pathname === '/library/sections') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            MediaContainer: {
+              size: sections.length,
+              ...(sections.length > 0 ? { Directory: sections } : {})
+            }
+          })
+        );
+      }
+      if (req.method === 'POST' && u.pathname === '/library/sections') {
+        if (
+          !allowSectionCreate ||
+          u.searchParams.get('agent') !== 'tv.plex.agents.none'
+        ) {
+          res.writeHead(500);
+          return res.end('Section creation blocked');
+        }
+        sections.push({
+          key: String(nextKey++),
+          title: u.searchParams.get('name'),
+          type: 'movie',
+          Location: [{ id: nextKey * 10, path: u.searchParams.get('location') }]
+        });
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ MediaContainer: { size: 1 } }));
+      }
+      const refreshMatch = u.pathname.match(/^\/library\/sections\/([^/]+)\/refresh$/);
+      if (req.method === 'GET' && refreshMatch) {
+        refreshedSectionKeys.push(refreshMatch[1]);
+        res.writeHead(refreshStatus);
+        return res.end();
+      }
+      if (u.pathname === '/:/prefs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ MediaContainer: { Setting: [] } }));
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockPlex.listen(0, '127.0.0.1', resolve));
+    const plexPort = mockPlex.address().port;
+    const plexUrl = `http://127.0.0.1:${plexPort}`;
+
+    const prevPath = process.env.PATH;
+    const prevKey = process.env.REELVAULT_API_KEY;
+    const prevSafe = process.env.MEDIA_SAFE_DIR;
+    const prevNsfw = process.env.MEDIA_NSFW_DIR;
+    const prevPlexUrl = process.env.PLEX_URL;
+    const prevPlexTok = process.env.PLEX_TOKEN;
+    const origDocument = globalThis.document;
+
+    process.env.PATH = `${binDir}:${prevPath}`;
+    process.env.REELVAULT_API_KEY = 'rv_unit_test_secret_key_123456';
+    process.env.MEDIA_SAFE_DIR = safeDir;
+    process.env.MEDIA_NSFW_DIR = nsfwDir;
+    process.env.PLEX_URL = plexUrl;
+    process.env.PLEX_TOKEN = 'plex_tok_patch2';
+
+    const bridgePath = require.resolve('../server/bridge.js');
+    delete require.cache[bridgePath];
+    const isolatedBridge = require(bridgePath);
+    const srv = isolatedBridge.createBridgeServer();
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const bridgePort = srv.address().port;
+    const bridgeBase = `http://127.0.0.1:${bridgePort}`;
+
+    try {
+      // 1. Direct scanPlexFolder / triggerPlexScan edge-case verification:
+      // 1a. Unclaimed server (empty token) -> false
+      const unclaimedRes = await isolatedBridge.scanPlexFolder(safeDir, {
+        plexUrl,
+        token: '',
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(unclaimedRes.scanned, false);
+      assert.match(unclaimedRes.error || '', /not claimed/i);
+
+      // 1b. Only unrelated section (/unrelated/movies) exists -> must NOT scan section 99 and must return false
+      const unrelatedRes = await isolatedBridge.scanPlexFolder(safeDir, {
+        plexUrl,
+        token: 'plex_tok_patch2',
+        safeDir,
+        nsfwDir,
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(unrelatedRes.scanned, false);
+      assert.match(unrelatedRes.error || '', /No matching Plex library section/);
+      assert.deepStrictEqual(
+        refreshedSectionKeys,
+        [],
+        'Unrelated Plex library sections must never be refreshed when target folder has no section'
+      );
+
+      // 1c. Empty sections list (dirs = []) -> must return false (never vacuous Promise.allSettled([]) === true)
+      sections = [];
+      const emptyDirsOk = await isolatedBridge.triggerPlexScan(safeDir, {
+        plexUrl,
+        token: 'plex_tok_patch2',
+        safeDir,
+        nsfwDir,
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(emptyDirsOk, false);
+
+      // 2. End-to-end /plex/save + pollPlexJobUntilDone + renderPlexJobsBox when section creation fails:
+      const mockSendBtn = {
+        dataset: {},
+        textContent: '🎬 Send Video to My Plex Server',
+        disabled: false
+      };
+      const mockJobsBox = {
+        innerHTML: '',
+        classList: { remove: () => {}, contains: () => false }
+      };
+      const mockToast = {
+        textContent: '',
+        classList: { remove: () => {}, add: () => {} }
+      };
+      globalThis.document = {
+        getElementById: (id) => {
+          if (id === 'sendToPlexBtn') return mockSendBtn;
+          if (id === 'cloudJobsBox') return mockJobsBox;
+          if (id === 'toast') return mockToast;
+          return null;
+        },
+        querySelectorAll: () => []
+      };
+
+      app.setCloudBackendConfig(bridgeBase, 'rv_unit_test_secret_key_123456');
+      app.setAppState({
+        videoQueue: [{ id: 'v-safe', title: 'Unscanned Safe Clip', videoUrl: 'http://93.184.216.34/clip1.mp4' }],
+        currentIndex: 0
+      });
+
+      const save1 = await fetch(`${bridgeBase}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/clip1.mp4',
+          title: 'Unscanned Safe Clip',
+          isNsfw: false
+        })
+      });
+      const save1Json = await save1.json();
+      assert.strictEqual(save1Json.ok, true);
+
+      const job1 = await app.pollPlexJobUntilDone(save1Json.jobId, 'ReelVault Clips', {
+        intervalMs: 30,
+        maxAttempts: 40
+      });
+      assert.strictEqual(job1?.status, 'ready');
+      assert.strictEqual(job1?.plexScanned, false);
+      assert.match(job1?.scanWarning || '', /No matching Plex library section/);
+      assert.strictEqual(fs.readdirSync(safeDir).length, 1, 'MP4 must still be saved safely on disk');
+      assert.strictEqual(
+        mockSendBtn.textContent,
+        '⚠️ Saved on Server (Plex Not Scanned)',
+        'Button must never claim ✅ Saved in ReelVault Clips! when Plex scan did not run'
+      );
+      assert.match(mockToast.textContent, /⚠️ Saved MP4 on server.*No matching Plex library section/);
+      assert.ok(
+        mockJobsBox.innerHTML.includes('⚠️ Saved (Plex Unscanned)'),
+        `Expected unscanned badge in jobs box, got: ${mockJobsBox.innerHTML}`
+      );
+      assert.ok(
+        !mockJobsBox.innerHTML.includes('✅ In Plex'),
+        'Unscanned job must never display ✅ In Plex in the queue box'
+      );
+
+      // 3. When /refresh returns HTTP 500 on a matching section, scanPlexFolder still reports scanned: false
+      allowSectionCreate = true;
+      refreshStatus = 500;
+      const failedRefreshRes = await isolatedBridge.scanPlexFolder(safeDir, {
+        plexUrl,
+        token: 'plex_tok_patch2',
+        safeDir,
+        nsfwDir,
+        skipRemoteConnectivity: true
+      });
+      assert.strictEqual(failedRefreshRes.scanned, false);
+      assert.match(failedRefreshRes.error || '', /refresh request failed/i);
+
+      // 4. End-to-end verified success: matching ReelVault 18+ Vault section exists AND /refresh returns HTTP 200
+      refreshStatus = 200;
+      refreshedSectionKeys.length = 0;
+
+      const save2 = await fetch(`${bridgeBase}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'http://93.184.216.34/clip2.mp4',
+          title: 'Verified Vault Clip',
+          isNsfw: true
+        })
+      });
+      const save2Json = await save2.json();
+      assert.strictEqual(save2Json.ok, true);
+
+      const job2 = await app.pollPlexJobUntilDone(save2Json.jobId, 'ReelVault 18+ Vault', {
+        intervalMs: 30,
+        maxAttempts: 40
+      });
+      assert.strictEqual(job2?.status, 'ready');
+      assert.strictEqual(job2?.plexScanned, true);
+      assert.strictEqual(job2?.scanWarning, null);
+      assert.strictEqual(fs.readdirSync(nsfwDir).length, 1);
+
+      const nsfwSec = sections.find((s) => s.Location?.[0]?.path === nsfwDir);
+      assert.ok(nsfwSec, 'ReelVault 18+ Vault section must exist in mock Plex');
+      assert.deepStrictEqual(
+        refreshedSectionKeys,
+        [nsfwSec.key],
+        'Only the matching ReelVault 18+ Vault section should be refreshed'
+      );
+      assert.strictEqual(mockSendBtn.textContent, '✅ Saved in ReelVault 18+ Vault!');
+      assert.match(mockToast.textContent, /✅ Ready in Plex \(ReelVault 18\+ Vault/);
+      assert.ok(mockJobsBox.innerHTML.includes('✅ In Plex'));
+      assert.ok(mockJobsBox.innerHTML.includes('⚠️ Saved (Plex Unscanned)'));
+    } finally {
+      globalThis.document = origDocument;
+      await new Promise((resolve) => srv.close(resolve));
+      await new Promise((resolve) => mockPlex.close(resolve));
+      process.env.PATH = prevPath;
+      process.env.REELVAULT_API_KEY = prevKey;
+      if (prevSafe === undefined) delete process.env.MEDIA_SAFE_DIR;
+      else process.env.MEDIA_SAFE_DIR = prevSafe;
+      if (prevNsfw === undefined) delete process.env.MEDIA_NSFW_DIR;
+      else process.env.MEDIA_NSFW_DIR = prevNsfw;
+      if (prevPlexUrl === undefined) delete process.env.PLEX_URL;
+      else process.env.PLEX_URL = prevPlexUrl;
+      if (prevPlexTok === undefined) delete process.env.PLEX_TOKEN;
+      else process.env.PLEX_TOKEN = prevPlexTok;
+      fs.rmSync(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('auto-updates server/bridge.js safely via server/auto-update.sh while deferring active Plex jobs, blocking broken syntax, and rolling back failed health checks', async () => {
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const util = require('node:util');
+    const { execFile } = require('node:child_process');
+    const execFileAsync = util.promisify(execFile);
+
+    const repoServerDir = path.resolve(__dirname, '../server');
+    const autoUpdateScript = path.join(repoServerDir, 'auto-update.sh');
+    const realDockerfile = fs.readFileSync(path.join(repoServerDir, 'Dockerfile'), 'utf8');
+    const realCaddyfile = fs.readFileSync(path.join(repoServerDir, 'Caddyfile'), 'utf8');
+    const realCompose = fs.readFileSync(path.join(repoServerDir, 'docker-compose.yml'), 'utf8');
+
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-auto-update-'));
+    const installDir = path.join(testRoot, 'install');
+    const binDir = path.join(testRoot, 'bin');
+    const dockerLog = path.join(testRoot, 'docker.log');
+    const healthStateFile = path.join(testRoot, 'health_state.json');
+    fs.mkdirSync(installDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+
+    const v1Bridge = `// v1\nconst k = process.env.REELVAULT_API_KEY;\nfunction createBridgeServer() { return 1; }\nmodule.exports = { createBridgeServer };\n`;
+    const v2Bridge = `// v2\nconst k = process.env.REELVAULT_API_KEY;\nfunction createBridgeServer() { return 2; }\nmodule.exports = { createBridgeServer };\n`;
+    const badSyntaxBridge = `// broken\nconst k = process.env.REELVAULT_API_KEY;\nfunction createBridgeServer( { return ; }\n`;
+    const v3UnhealthyBridge = `// v3\nconst k = process.env.REELVAULT_API_KEY;\nfunction createBridgeServer() { return 3; }\nmodule.exports = { createBridgeServer };\n`;
+
+    fs.writeFileSync(path.join(installDir, 'bridge.js'), v1Bridge);
+    fs.writeFileSync(path.join(installDir, 'Dockerfile'), realDockerfile);
+    fs.writeFileSync(path.join(installDir, 'Caddyfile'), realCaddyfile);
+    fs.writeFileSync(path.join(installDir, 'docker-compose.yml'), realCompose);
+    fs.writeFileSync(path.join(installDir, 'auto-update.sh'), fs.readFileSync(autoUpdateScript, 'utf8'), {
+      mode: 0o755
+    });
+    fs.writeFileSync(path.join(installDir, '.env'), 'REELVAULT_API_KEY=rv_autoupdate_tok\n');
+
+    fs.writeFileSync(
+      healthStateFile,
+      JSON.stringify({ ok: true, service: 'reelvault-bridge', activeJobs: 0 })
+    );
+
+    // Mock docker CLI recording compose/exec calls and reading healthStateFile
+    fs.writeFileSync(
+      path.join(binDir, 'docker'),
+      `#!/usr/bin/env bash
+echo "$*" >> "${dockerLog}"
+if [ "$1" = "ps" ]; then
+  echo "reelvault-bridge"
+  exit 0
+fi
+if [ "$1" = "exec" ]; then
+  cat "${healthStateFile}"
+  exit 0
+fi
+if [ "$1" = "compose" ]; then
+  if grep -q "// v3" "${installDir}/bridge.js" 2>/dev/null; then
+    printf '{"ok":false}' > "${healthStateFile}"
+  else
+    printf '{"ok":true,"service":"reelvault-bridge","activeJobs":0}' > "${healthStateFile}"
+  fi
+  exit 0
+fi
+exit 0
+`,
+      { mode: 0o755 }
+    );
+
+    let remoteFiles = {
+      'bridge.js': v1Bridge,
+      Dockerfile: realDockerfile,
+      Caddyfile: realCaddyfile,
+      'docker-compose.yml': realCompose,
+      'auto-update.sh': fs.readFileSync(autoUpdateScript, 'utf8')
+    };
+
+    const mockGitHub = http.createServer((req, res) => {
+      const u = new URL(req.url || '/', 'http://127.0.0.1');
+      const name = u.pathname.replace(/^\/+/, '');
+      if (Object.prototype.hasOwnProperty.call(remoteFiles, name)) {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end(remoteFiles[name]);
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockGitHub.listen(0, '127.0.0.1', resolve));
+    const ghPort = mockGitHub.address().port;
+    const rawBase = `http://127.0.0.1:${ghPort}`;
+
+    const runUpdater = async (extraArgs = []) => {
+      const { stdout } = await execFileAsync('bash', [autoUpdateScript, ...extraArgs], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          INSTALL_DIR: installDir,
+          RAW_BASE: rawBase,
+          LOCK_FILE: path.join(testRoot, 'update.lock'),
+          HEALTH_RETRIES: '2',
+          HEALTH_SLEEP_SEC: '0',
+          NO_PROXY: '127.0.0.1,localhost',
+          no_proxy: '127.0.0.1,localhost'
+        },
+        encoding: 'utf8'
+      });
+      return stdout;
+    };
+
+    try {
+      // 1. Identical SHA-256 -> fast no-op with zero docker calls
+      await runUpdater();
+      assert.strictEqual(fs.existsSync(dockerLog), false, 'No docker commands should run when unchanged');
+
+      // 2. Active Plex job (activeJobs: 1) -> defers update without restarting container
+      remoteFiles['bridge.js'] = v2Bridge;
+      fs.writeFileSync(
+        healthStateFile,
+        JSON.stringify({ ok: true, service: 'reelvault-bridge', activeJobs: 1 })
+      );
+      const deferOut = await runUpdater();
+      assert.match(deferOut, /Deferring update/);
+      assert.strictEqual(fs.readFileSync(path.join(installDir, 'bridge.js'), 'utf8'), v1Bridge);
+      const logAfterDefer = fs.readFileSync(dockerLog, 'utf8');
+      assert.ok(!logAfterDefer.includes('compose up'), 'Must never run docker compose up during active job');
+
+      // 3. Broken JS syntax in remote bridge.js -> rejected by node --check before touching live bridge.js
+      remoteFiles['bridge.js'] = badSyntaxBridge;
+      fs.writeFileSync(
+        healthStateFile,
+        JSON.stringify({ ok: true, service: 'reelvault-bridge', activeJobs: 0 })
+      );
+      await assert.rejects(() => runUpdater());
+      assert.strictEqual(fs.readFileSync(path.join(installDir, 'bridge.js'), 'utf8'), v1Bridge);
+
+      // 4. Idle server + valid v2 bridge.js -> updates atomically & rebuilds ONLY reelvault-bridge
+      remoteFiles['bridge.js'] = v2Bridge;
+      fs.writeFileSync(dockerLog, '');
+      const okOut = await runUpdater();
+      assert.match(okOut, /Update complete and verified healthy/);
+      assert.strictEqual(fs.readFileSync(path.join(installDir, 'bridge.js'), 'utf8'), v2Bridge);
+      const composeCalls = fs.readFileSync(dockerLog, 'utf8');
+      assert.ok(
+        composeCalls.includes('compose up -d --build reelvault-bridge'),
+        `Expected targeted reelvault-bridge rebuild, got:\n${composeCalls}`
+      );
+      assert.ok(composeCalls.includes('?refreshPlex=1'));
+
+      // 5. Post-update health failure (v3UnhealthyBridge) -> automatically rolls back to v2Bridge
+      remoteFiles['bridge.js'] = v3UnhealthyBridge;
+      await assert.rejects(() => runUpdater());
+      assert.strictEqual(
+        fs.readFileSync(path.join(installDir, 'bridge.js'), 'utf8'),
+        v2Bridge,
+        'Failed post-update health check must roll back to previous known-good bridge.js'
+      );
+    } finally {
+      await new Promise((resolve) => mockGitHub.close(resolve));
+      fs.rmSync(testRoot, { recursive: true, force: true });
+    }
+  });
 });
 

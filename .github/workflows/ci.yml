@@ -37,6 +37,7 @@ jobs:
           node --check scripts/smoke-live-proxies.mjs
           node --check scripts/check-layout-overflow.mjs
           bash -n server/setup.sh
+          bash -n server/auto-update.sh
 
       - name: Run full unit & regression test suite
         run: node --test tests/*.js

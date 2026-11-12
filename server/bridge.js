@@ -2108,9 +2108,29 @@ function readPlexToken() {
   return '';
 }
 
-async function getPlexSections(token) {
+const PLEX_PERSONAL_VIDEO_PROFILES = [
+  { agent: 'tv.plex.agents.none', scanner: 'Plex Video Files', language: 'xn' },
+  { agent: 'com.plexapp.agents.none', scanner: 'Plex Video Files Scanner', language: 'xn' },
+  { agent: 'com.plexapp.agents.none', scanner: 'Plex Video Files', language: 'xn' }
+];
+
+function normalizePlexFolderPath(rawPath) {
+  return String(rawPath || '').trim().replace(/\/+$/, '');
+}
+
+function hasPlexSectionForPath(sections, targetPath) {
+  const cleanTarget = normalizePlexFolderPath(targetPath);
+  if (!cleanTarget || !Array.isArray(sections)) return false;
+  return sections.some((sec) =>
+    (sec.Location || []).some((loc) => normalizePlexFolderPath(loc?.path) === cleanTarget)
+  );
+}
+
+async function getPlexSections(token, plexUrl = PLEX_URL) {
   if (!token) return null;
-  const res = await fetch(`${PLEX_URL}/library/sections?X-Plex-Token=${encodeURIComponent(token)}`, {
+  const basePlexUrl = String(plexUrl !== undefined ? plexUrl : PLEX_URL).replace(/\/+$/, '');
+  if (!basePlexUrl) return null;
+  const res = await fetch(`${basePlexUrl}/library/sections?X-Plex-Token=${encodeURIComponent(token)}`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(5000)
   });
@@ -2284,112 +2304,218 @@ async function ensurePlexRemoteConnectivity(token, opts = {}) {
   };
 }
 
-async function ensurePlexLibraries(opts = {}) {
-  const token = readPlexToken();
-  if (!token) {
-    return { reachable: false, claimed: false, libraries: [] };
+async function createPlexPersonalVideoSection(
+  basePlexUrl,
+  token,
+  { name, location, hiddenFromGlobal = false }
+) {
+  const cleanLocation = normalizePlexFolderPath(location);
+  if (!basePlexUrl || !token || !name || !cleanLocation) {
+    return { created: false, sections: null, agent: null, scanner: null };
   }
 
+  for (const profile of PLEX_PERSONAL_VIDEO_PROFILES) {
+    const params = new URLSearchParams({
+      name,
+      type: 'movie',
+      agent: profile.agent,
+      scanner: profile.scanner,
+      language: profile.language,
+      location: cleanLocation,
+      ...(hiddenFromGlobal ? { 'prefs[includeInGlobal]': '0' } : {}),
+      'X-Plex-Token': token
+    });
+    try {
+      const addRes = await fetch(`${basePlexUrl}/library/sections?${params.toString()}`, {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(8000)
+      });
+      if (!addRes.ok) continue;
+
+      const refreshed = await getPlexSections(token, basePlexUrl);
+      if (Array.isArray(refreshed) && hasPlexSectionForPath(refreshed, cleanLocation)) {
+        return {
+          created: true,
+          sections: refreshed,
+          agent: profile.agent,
+          scanner: profile.scanner
+        };
+      }
+    } catch {
+      // Fall back to next agent/scanner profile
+    }
+  }
+
+  return { created: false, sections: null, agent: null, scanner: null };
+}
+
+async function ensurePlexLibraries(opts = {}) {
+  const token = opts.token !== undefined ? String(opts.token || '').trim() : readPlexToken();
+  if (!token) {
+    return { reachable: false, claimed: false, librariesReady: false, libraries: [] };
+  }
+
+  const basePlexUrl = String(opts.plexUrl !== undefined ? opts.plexUrl : PLEX_URL).replace(/\/+$/, '');
+  if (!basePlexUrl) {
+    return { reachable: false, claimed: Boolean(token), librariesReady: false, libraries: [] };
+  }
+
+  const safeDir = normalizePlexFolderPath(
+    opts.safeDir !== undefined ? opts.safeDir : MEDIA_SAFE_DIR
+  );
+  const nsfwDir = normalizePlexFolderPath(
+    opts.nsfwDir !== undefined ? opts.nsfwDir : MEDIA_NSFW_DIR
+  );
+
   try {
-    let dirs = await getPlexSections(token);
+    let dirs = await getPlexSections(token, basePlexUrl);
     if (!dirs) {
-      return { reachable: false, claimed: true, libraries: [] };
+      return { reachable: false, claimed: true, librariesReady: false, libraries: [] };
     }
 
     let remoteAccess = null;
-    const now = Date.now();
-    if (opts.forceRefresh || now - lastPlexConnectivityCheckAt > 45000) {
-      lastPlexConnectivityCheckAt = now;
-      remoteAccess = await ensurePlexRemoteConnectivity(token, {
-        force: Boolean(opts.forceRefresh)
-      }).catch(() => null);
+    if (!opts.skipRemoteConnectivity) {
+      const now = Date.now();
+      const useDefaultThrottle = opts.plexUrl === undefined;
+      if (opts.forceRefresh || !useDefaultThrottle || now - lastPlexConnectivityCheckAt > 45000) {
+        if (useDefaultThrottle) {
+          lastPlexConnectivityCheckAt = now;
+        }
+        remoteAccess = await ensurePlexRemoteConnectivity(token, {
+          plexUrl: basePlexUrl,
+          force: Boolean(opts.forceRefresh)
+        }).catch(() => null);
+      }
     }
 
-    const hasPath = (sections, targetPath) =>
-      sections.some((sec) =>
-        (sec.Location || []).some((loc) => String(loc.path || '').replace(/\/+$/, '') === targetPath)
-      );
-
-    let createdAny = false;
-    if (!hasPath(dirs, MEDIA_SAFE_DIR)) {
-      const params = new URLSearchParams({
+    if (safeDir && !hasPlexSectionForPath(dirs, safeDir)) {
+      const safeCreated = await createPlexPersonalVideoSection(basePlexUrl, token, {
         name: 'ReelVault Clips',
-        type: 'movie',
-        agent: 'com.plexapp.agents.none',
-        scanner: 'Plex Video Files Scanner',
-        language: 'xn',
-        location: MEDIA_SAFE_DIR,
-        'X-Plex-Token': token
+        location: safeDir,
+        hiddenFromGlobal: false
       });
-      const addSafe = await fetch(`${PLEX_URL}/library/sections?${params.toString()}`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(8000)
-      });
-      if (addSafe.ok) createdAny = true;
+      if (Array.isArray(safeCreated.sections)) {
+        dirs = safeCreated.sections;
+      }
     }
 
-    if (!hasPath(dirs, MEDIA_NSFW_DIR)) {
-      const params = new URLSearchParams({
+    if (nsfwDir && !hasPlexSectionForPath(dirs, nsfwDir)) {
+      const nsfwCreated = await createPlexPersonalVideoSection(basePlexUrl, token, {
         name: 'ReelVault 18+ Vault',
-        type: 'movie',
-        agent: 'com.plexapp.agents.none',
-        scanner: 'Plex Video Files Scanner',
-        language: 'xn',
-        location: MEDIA_NSFW_DIR,
-        'prefs[includeInGlobal]': '0',
-        'X-Plex-Token': token
+        location: nsfwDir,
+        hiddenFromGlobal: true
       });
-      const addNsfw = await fetch(`${PLEX_URL}/library/sections?${params.toString()}`, {
-        method: 'POST',
-        signal: AbortSignal.timeout(8000)
-      });
-      if (addNsfw.ok) createdAny = true;
+      if (Array.isArray(nsfwCreated.sections)) {
+        dirs = nsfwCreated.sections;
+      }
     }
 
-    if (createdAny) {
-      dirs = (await getPlexSections(token)) || dirs;
-    }
+    const safeReady = !safeDir || hasPlexSectionForPath(dirs, safeDir);
+    const nsfwReady = !nsfwDir || hasPlexSectionForPath(dirs, nsfwDir);
+    const librariesReady = Boolean(safeReady && nsfwReady);
+    const missingLibraries = [];
+    if (!safeReady) missingLibraries.push('ReelVault Clips');
+    if (!nsfwReady) missingLibraries.push('ReelVault 18+ Vault');
 
     return {
       reachable: true,
       claimed: true,
+      librariesReady,
+      ...(missingLibraries.length > 0 ? { missingLibraries } : {}),
       friendlyName: remoteAccess?.friendlyName || undefined,
       updatedPrefs: remoteAccess?.updated || undefined,
       libraries: dirs.map((d) => ({ id: d.key, title: d.title }))
     };
   } catch {
-    return { reachable: false, claimed: Boolean(token), libraries: [] };
+    return { reachable: false, claimed: Boolean(token), librariesReady: false, libraries: [] };
   }
 }
 
-async function triggerPlexScan(targetFolder) {
-  const token = readPlexToken();
-  if (!token) return false;
+async function scanPlexFolder(targetFolder, opts = {}) {
+  const cleanFolder = normalizePlexFolderPath(targetFolder);
+  if (!cleanFolder) {
+    return { scanned: false, error: 'Missing target media folder' };
+  }
+
+  const token = opts.token !== undefined ? String(opts.token || '').trim() : readPlexToken();
+  if (!token) {
+    return {
+      scanned: false,
+      error: 'Plex server is not claimed yet (missing PlexOnlineToken)'
+    };
+  }
+
+  const basePlexUrl = String(opts.plexUrl !== undefined ? opts.plexUrl : PLEX_URL).replace(/\/+$/, '');
+  if (!basePlexUrl) {
+    return {
+      scanned: false,
+      error: 'PLEX_URL is not configured on Cloud Bridge'
+    };
+  }
+
   try {
-    await ensurePlexLibraries();
-    const dirs = await getPlexSections(token);
-    if (!dirs) return false;
+    await ensurePlexLibraries({ ...opts, token, plexUrl: basePlexUrl });
+    const dirs = await getPlexSections(token, basePlexUrl);
+    if (!Array.isArray(dirs)) {
+      return {
+        scanned: false,
+        error: 'Could not reach Plex Media Server on port 32400'
+      };
+    }
 
-    const cleanFolder = targetFolder.replace(/\/+$/, '');
     const matched = dirs.filter((sec) =>
-      (sec.Location || []).some((loc) => String(loc.path || '').replace(/\/+$/, '') === cleanFolder)
+      (sec.Location || []).some((loc) => normalizePlexFolderPath(loc?.path) === cleanFolder)
     );
-    const targets = matched.length > 0 ? matched : dirs;
+    if (matched.length === 0) {
+      return {
+        scanned: false,
+        error: `No matching Plex library section exists for ${cleanFolder}`
+      };
+    }
 
-    await Promise.allSettled(
-      targets.map((sec) =>
+    const results = await Promise.allSettled(
+      matched.map((sec) =>
         fetch(
-          `${PLEX_URL}/library/sections/${encodeURIComponent(sec.key)}/refresh?X-Plex-Token=${encodeURIComponent(
+          `${basePlexUrl}/library/sections/${encodeURIComponent(sec.key)}/refresh?X-Plex-Token=${encodeURIComponent(
             token
           )}`,
           { signal: AbortSignal.timeout(5000) }
         )
       )
     );
-    return true;
+
+    const refreshedKeys = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === 'fulfilled' && r.value?.ok) {
+        refreshedKeys.push(String(matched[i].key));
+      }
+    }
+
+    if (refreshedKeys.length === 0) {
+      return {
+        scanned: false,
+        error: 'Plex library refresh request failed'
+      };
+    }
+
+    return {
+      scanned: true,
+      error: null,
+      sectionKeys: refreshedKeys
+    };
   } catch {
-    return false;
+    return {
+      scanned: false,
+      error: 'Plex library refresh failed'
+    };
   }
+}
+
+async function triggerPlexScan(targetFolder, opts = {}) {
+  const res = await scanPlexFolder(targetFolder, opts);
+  return Boolean(res.scanned);
 }
 
 function sanitizeFilenameTitle(rawTitle, fallback = 'ReelVault_Clip') {
@@ -2712,7 +2838,9 @@ async function processPlexSaveJob(job) {
     job.fileName = finalFileName;
 
     job.status = 'scanning';
-    job.plexScanned = await triggerPlexScan(destDir);
+    const scanRes = await scanPlexFolder(destDir);
+    job.plexScanned = Boolean(scanRes.scanned);
+    job.scanWarning = scanRes.scanned ? null : scanRes.error || 'Plex library was not scanned';
     job.status = 'ready';
     job.finishedAt = Date.now();
   } finally {
@@ -2851,6 +2979,7 @@ async function handlePlexSaveRequest(req, res) {
     sizeBytes: 0,
     fileName: null,
     plexScanned: false,
+    scanWarning: null,
     error: null,
     referer: safeReferer,
     pageUrl: safePageUrl,
@@ -2997,5 +3126,9 @@ module.exports = {
   isGenericContainerOrVpsName,
   buildDesiredCustomConnections,
   ensurePlexRemoteConnectivity,
+  PLEX_PERSONAL_VIDEO_PROFILES,
+  ensurePlexLibraries,
+  scanPlexFolder,
+  triggerPlexScan,
   createBridgeServer
 };

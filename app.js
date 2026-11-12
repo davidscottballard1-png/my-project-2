@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v39';
+const APP_BUILD_VERSION = 'v40';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -2686,9 +2686,11 @@ async function testCloudBackendConnection(rawUrl = cloudConfig.backendUrl, rawKe
 
     const parts = ['🟢 Connected'];
     if (data.plex?.reachable) {
-      parts.push('Plex Ready');
+      parts.push(data.plex.librariesReady === false ? 'Plex Library Issue' : 'Plex Ready');
     } else if (data.plex?.claimed) {
       parts.push('Plex Starting');
+    } else if (data.plex && data.plex.claimed === false) {
+      parts.push('Plex Unclaimed');
     }
     if (data.residentialProxy) {
       parts.push('US Proxy On');
@@ -2750,8 +2752,16 @@ async function pollPlexJobUntilDone(jobId, libLabel = 'Plex', opts = {}) {
 
     if (match.status === 'ready') {
       const mb = match.sizeBytes ? ` • ${(match.sizeBytes / (1024 * 1024)).toFixed(1)} MB` : '';
-      setSendBtnLabel(`✅ Saved in ${libLabel}!`, false);
-      showToast(`✅ Ready in Plex (${libLabel}${mb})!`);
+      if (match.plexScanned === true) {
+        setSendBtnLabel(`✅ Saved in ${libLabel}!`, false);
+        showToast(`✅ Ready in Plex (${libLabel}${mb})!`);
+      } else {
+        const warnDetail = match.scanWarning
+          ? String(match.scanWarning).slice(0, 100)
+          : 'Plex library was not scanned — check Plex claim or library setup';
+        setSendBtnLabel('⚠️ Saved on Server (Plex Not Scanned)', false);
+        showToast(`⚠️ Saved MP4 on server${mb}, but ${warnDetail}`);
+      }
       if (intervalMs > 0) {
         const resetTimer = setTimeout(() => {
           setSendBtnLabel('🎬 Send Video to My Plex Server', false);
@@ -2886,7 +2896,7 @@ function renderPlexJobsBox(jobs) {
   const statusTextFor = (j) => {
     if (j.status === 'ready') {
       const mb = j.sizeBytes ? ` (${(j.sizeBytes / (1024 * 1024)).toFixed(1)} MB)` : '';
-      return `✅ In Plex${mb}`;
+      return j.plexScanned === true ? `✅ In Plex${mb}` : `⚠️ Saved (Plex Unscanned)${mb}`;
     }
     if (j.status === 'downloading') return '⬇️ Downloading...';
     if (j.status === 'optimizing') return '⚙️ Direct-Play MP4...';
@@ -2896,14 +2906,18 @@ function renderPlexJobsBox(jobs) {
   };
 
   box.innerHTML = list
-    .map(
-      (j) => `
+    .map((j) => {
+      const detailAttr =
+        j.scanWarning || j.error
+          ? ` title="${escapeHtml(j.scanWarning || j.error)}"`
+          : '';
+      return `
       <div class="cloud-job-row">
         <span class="cloud-job-title">${j.isNsfw ? '🔞 ' : '🎬 '}${escapeHtml(j.title || 'Clip')}</span>
-        <span class="cloud-job-status">${escapeHtml(statusTextFor(j))}</span>
+        <span class="cloud-job-status"${detailAttr}>${escapeHtml(statusTextFor(j))}</span>
       </div>
-    `
-    )
+    `;
+    })
     .join('');
 }
 
