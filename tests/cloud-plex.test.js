@@ -2659,7 +2659,9 @@ exit 0
     );
     globalThis.fetch = origFetch;
 
-    // 3. End-to-end POST /plex/save verification with strict mock yt-dlp enforcing -4, Accept-Language, Referer, and NO --proxy on .m3u8
+    // 3. End-to-end POST /plex/save + GET /extract verification (zero external network calls; deterministic on CI)
+    const dns = require('node:dns');
+    const origLookup = dns.promises.lookup;
     const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-plex-fulltaboo-'));
     const binDir = path.join(testRoot, 'bin');
     const safeDir = path.join(testRoot, 'safe');
@@ -2676,11 +2678,11 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(argsLogFile)}, JSON.stringify(args) + '\\n');
 const target = args[args.length - 1] || '';
-if (target.includes('watch-wrapper')) {
+if (target.includes('fulltaboo.tv')) {
   process.stderr.write('ERROR: Unsupported URL: ' + target + '\\n');
   process.exit(1);
 }
-if (target.includes('expired.m3u8')) {
+if (target.includes('t=expired_bad_token')) {
   process.stderr.write('ERROR: [generic] master.m3u8: HTTP Error 403: Forbidden\\n');
   process.exit(1);
 }
@@ -2690,7 +2692,7 @@ const hasAcceptLang = hdrIdx >= 0 && String(args[hdrIdx + 1] || '').includes('Ac
 const refIdx = args.indexOf('--referer');
 const refVal = refIdx >= 0 ? String(args[refIdx + 1] || '') : '';
 const hasProxy = args.includes('--proxy');
-if (!hasIpv4 || !hasAcceptLang || hasProxy || !refVal.includes('/e/2mqr4bnonsmo')) {
+if (!hasIpv4 || !hasAcceptLang || hasProxy || !refVal.includes('https://luluvid.com/e/2mqr4bnonsmo')) {
   process.stderr.write('ERROR: [generic] master.m3u8: HTTP Error 403: Forbidden\\n');
   process.exit(1);
 }
@@ -2721,6 +2723,19 @@ process.exit(0);
     process.env.PLEX_URL = '';
     process.env.PLEX_TOKEN = '';
 
+    dns.promises.lookup = async (host, opts) => {
+      if (
+        host === 'fulltaboo.tv' ||
+        host === 'luluvid.com' ||
+        host === 'iihbzqjhkqull.tnmr.org'
+      ) {
+        return opts && opts.all
+          ? [{ address: '93.184.216.34', family: 4 }]
+          : { address: '93.184.216.34', family: 4 };
+      }
+      return origLookup.call(dns.promises, host, opts);
+    };
+
     const bridgePath = require.resolve('../server/bridge.js');
     delete require.cache[bridgePath];
     const isolatedBridge = require(bridgePath);
@@ -2728,38 +2743,61 @@ process.exit(0);
     await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
     const port = srv.address().port;
 
+    globalThis.fetch = async (input, init = {}) => {
+      const u = String(input);
+      if (u.startsWith(`http://127.0.0.1:${port}/`)) {
+        return origFetch(input, init);
+      }
+      if (u === 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/') {
+        return new Response(
+          `<!doctype html><html><head><title>Mandy Madison - Daddy's Gone - FullTaboo.tv</title><meta itemprop="duration" content="PT0H16M0S" /><meta property="og:video:height" content="720" /></head><body><iframe src="https://luluvid.com/e/2mqr4bnonsmo"></iframe></body></html>`,
+          { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }
+        );
+      }
+      if (u === 'https://luluvid.com/e/2mqr4bnonsmo') {
+        return new Response(
+          `<html><head><title>LuluVid</title></head><body>${packedLuluScript}</body></html>`,
+          { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }
+        );
+      }
+      return new Response('404 Not Found', { status: 404 });
+    };
+
+    const waitForPlexJob = async (jobId) => {
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+        const jr = await origFetch(`http://127.0.0.1:${port}/plex/jobs`, {
+          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
+        });
+        const jd = await jr.json();
+        const found = jd.jobs.find((j) => j.id === jobId);
+        if (found && (found.status === 'error' || found.status === 'ready')) {
+          return found;
+        }
+      }
+      return null;
+    };
+
     try {
-      // 3a. Valid LuluVid/FullTaboo .m3u8 succeeds with -4 + Accept-Language + streamReferer and NEVER uses --proxy
-      const saveRes = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+      // 3a. Valid LuluVid/FullTaboo .m3u8 succeeds on first attempt with -4 + Accept-Language + streamReferer and NEVER uses --proxy
+      const saveRes = await origFetch(`http://127.0.0.1:${port}/plex/save`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: 'Bearer rv_unit_test_secret_key_123456'
         },
         body: JSON.stringify({
-          url: 'http://93.184.216.34/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=valid_hmac',
-          originalUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
-          pageUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
-          streamReferer: 'http://93.184.216.34/e/2mqr4bnonsmo',
+          url: 'https://iihbzqjhkqull.tnmr.org/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=valid_hmac',
+          originalUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+          pageUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+          streamReferer: 'https://luluvid.com/e/2mqr4bnonsmo',
           title: "Mandy Madison - Daddy's Gone",
           sourceName: '🔞 FullTaboo.tv Full-Length',
           isNsfw: true
         })
       });
       const saveJson = await saveRes.json();
-      let doneJob = null;
-      for (let i = 0; i < 40; i++) {
-        await new Promise((r) => setTimeout(r, 40));
-        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
-          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
-        });
-        const jd = await jr.json();
-        const found = jd.jobs.find((j) => j.id === saveJson.jobId);
-        if (found && (found.status === 'error' || found.status === 'ready')) {
-          doneJob = found;
-          break;
-        }
-      }
+      const doneJob = await waitForPlexJob(saveJson.jobId);
       assert.strictEqual(doneJob?.status, 'ready');
       assert.strictEqual(doneJob?.pageUrl, undefined, 'Internal pageUrl must be stripped from /plex/jobs');
       assert.strictEqual(
@@ -2767,40 +2805,50 @@ process.exit(0);
         undefined,
         'Internal streamReferer must be stripped from /plex/jobs'
       );
-      const savedFiles = fs.readdirSync(nsfwDir);
-      assert.strictEqual(savedFiles.length, 1);
-      assert.ok(savedFiles[0].startsWith("Mandy Madison - Daddy's Gone ["));
 
-      // 3b. When an .m3u8 genuinely 403s and watch-wrapper returns Unsupported URL, job reports the real 403 media error instead of Unsupported URL
-      const errRes = await fetch(`http://127.0.0.1:${port}/plex/save`, {
+      // 3b. Stale/expired .m3u8 token in open queue (403) + fulltaboo.tv Unsupported URL -> server automatically re-mints fresh token and reaches ready!
+      const recoverRes = await origFetch(`http://127.0.0.1:${port}/plex/save`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: 'Bearer rv_unit_test_secret_key_123456'
         },
         body: JSON.stringify({
-          url: 'http://93.184.216.34/hls2/03/expired.m3u8?t=bad',
-          originalUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
-          pageUrl: 'http://93.184.216.34/watch-wrapper/mandy-madison-daddys-gone-1/',
-          streamReferer: 'http://93.184.216.34/e/2mqr4bnonsmo',
-          title: 'Expired Token Clip',
+          url: 'https://iihbzqjhkqull.tnmr.org/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=expired_bad_token',
+          originalUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+          pageUrl: 'https://fulltaboo.tv/mandy-madison-daddys-gone-1/',
+          streamReferer: 'https://luluvid.com/e/2mqr4bnonsmo',
+          title: 'Recovered Queued Episode',
+          isNsfw: true
+        })
+      });
+      const recoverJson = await recoverRes.json();
+      const recoveredJob = await waitForPlexJob(recoverJson.jobId);
+      assert.strictEqual(
+        recoveredJob?.status,
+        'ready',
+        `Expired queued .m3u8 must recover via resolveFreshEmbedStreamsServer, got: ${JSON.stringify(recoveredJob)}`
+      );
+      assert.strictEqual(fs.readdirSync(nsfwDir).length, 2);
+
+      // 3c. When an .m3u8 403s AND embed/watch pages are genuinely 404, job reports the real 403 media error instead of Unsupported URL
+      const errRes = await origFetch(`http://127.0.0.1:${port}/plex/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer rv_unit_test_secret_key_123456'
+        },
+        body: JSON.stringify({
+          url: 'https://iihbzqjhkqull.tnmr.org/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=expired_bad_token',
+          originalUrl: 'https://fulltaboo.tv/dead-scene/',
+          pageUrl: 'https://fulltaboo.tv/dead-scene/',
+          streamReferer: 'https://luluvid.com/e/dead999999',
+          title: 'Dead Embed Clip',
           isNsfw: true
         })
       });
       const errJson = await errRes.json();
-      let failedJob = null;
-      for (let i = 0; i < 50; i++) {
-        await new Promise((r) => setTimeout(r, 50));
-        const jr = await fetch(`http://127.0.0.1:${port}/plex/jobs`, {
-          headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' }
-        });
-        const jd = await jr.json();
-        const found = jd.jobs.find((j) => j.id === errJson.jobId);
-        if (found && (found.status === 'error' || found.status === 'ready')) {
-          failedJob = found;
-          break;
-        }
-      }
+      const failedJob = await waitForPlexJob(errJson.jobId);
       assert.strictEqual(failedJob?.status, 'error');
       assert.ok(
         !/Unsupported URL/i.test(failedJob?.error || ''),
@@ -2808,17 +2856,33 @@ process.exit(0);
       );
       assert.match(failedJob?.error || '', /403/);
 
+      // 3d. GET /extract on FullTaboo watch page falls back to resolveFreshEmbedStreamsServer when yt-dlp returns Unsupported URL
+      const extractHttpRes = await origFetch(
+        `http://127.0.0.1:${port}/extract?url=${encodeURIComponent('https://fulltaboo.tv/mandy-madison-daddys-gone-1/')}`,
+        { headers: { Authorization: 'Bearer rv_unit_test_secret_key_123456' } }
+      );
+      const extractHttpJson = await extractHttpRes.json();
+      assert.strictEqual(extractHttpJson.ok, true);
+      assert.strictEqual(extractHttpJson.items?.length, 1);
+      assert.strictEqual(
+        extractHttpJson.items[0].videoUrl,
+        'https://iihbzqjhkqull.tnmr.org/hls2/03/2mqr4bnonsmo_h/master.m3u8?t=fresh_vps_hmac&s=1760000000'
+      );
+      assert.strictEqual(extractHttpJson.items[0].streamReferer, 'https://luluvid.com/e/2mqr4bnonsmo');
+
       const allInvocations = fs
         .readFileSync(argsLogFile, 'utf8')
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line));
       const m3u8Calls = allInvocations.filter((a) => String(a[a.length - 1]).includes('.m3u8'));
-      assert.ok(m3u8Calls.length >= 2);
+      assert.ok(m3u8Calls.length >= 3);
       for (const call of m3u8Calls) {
         assert.ok(!call.includes('--proxy'), '.m3u8 streams must never be routed over RESIDENTIAL_PROXY_URL');
       }
     } finally {
+      dns.promises.lookup = origLookup;
+      globalThis.fetch = origFetch;
       await new Promise((resolve) => srv.close(resolve));
       process.env.PATH = prevPath;
       process.env.REELVAULT_API_KEY = prevKey;
@@ -2834,10 +2898,54 @@ process.exit(0);
       else process.env.PLEX_TOKEN = prevPlexTok;
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
+
+    // 4. Verify pollPlexJobUntilDone default poll window supports multi-minute full-length HD episodes (>36 polls / >90s)
+    const origSetTimeout = globalThis.setTimeout;
+    let pollHits = 0;
+    try {
+      app.setCloudBackendConfig('https://85-239-249-225.nip.io', 'rv_secret_abc');
+      globalThis.fetch = async (url) => {
+        if (String(url).endsWith('/plex/jobs')) {
+          pollHits++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              ok: true,
+              jobs: [
+                {
+                  id: 'long_fulltaboo_job',
+                  status: pollHits >= 60 ? 'ready' : 'downloading',
+                  sizeBytes: 185 * 1024 * 1024,
+                  library: 'ReelVault 18+ Vault'
+                }
+              ]
+            })
+          };
+        }
+        throw new Error(`Unexpected poll fetch: ${url}`);
+      };
+      globalThis.setTimeout = (fn, ms, ...rest) => {
+        if (ms === 2500) {
+          return origSetTimeout(fn, 0, ...rest);
+        }
+        return origSetTimeout(fn, ms, ...rest);
+      };
+
+      const longPollDone = await app.pollPlexJobUntilDone(
+        'long_fulltaboo_job',
+        'ReelVault 18+ Vault'
+      );
+      assert.strictEqual(
+        longPollDone?.status,
+        'ready',
+        'Default pollPlexJobUntilDone must continue past 36 polls (90s) so 15-35 min FullTaboo episodes finish cleanly'
+      );
+      assert.strictEqual(pollHits, 60);
+    } finally {
+      globalThis.setTimeout = origSetTimeout;
+      globalThis.fetch = origFetch;
+    }
   });
 });
-
-
-
-
 
