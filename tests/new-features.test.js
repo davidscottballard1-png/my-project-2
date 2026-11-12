@@ -6,6 +6,7 @@ const {
   STORAGE_KEYS,
   DEFAULT_SOURCES,
   ADULT_PRESET_SOURCES,
+  ADULT_DIRECTORY_CATALOG,
   settings,
   extractRedditVideosFromListing,
   fetchSubredditVideos,
@@ -1669,6 +1670,12 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
                 })
               };
             }
+            if (targetPreset.type === 'url' && u === targetPreset.value) {
+              const safeVids = [1, 2, 3, 4, 5]
+                .map((n) => `<video src="https://cdn.safe-source.example/${targetPreset.id}-${n}.mp4"></video>`)
+                .join('\n');
+              return { ok: true, text: async () => `<html><title>${targetPreset.label}</title><body>${safeVids}</body></html>` };
+            }
             if (u.includes('reddit.com/search.json')) {
               return { ok: true, json: async () => ({ data: { children: [] } }) };
             }
@@ -1705,6 +1712,12 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
               hitUrls.every((u) => u.toLowerCase().includes(`/r/${targetPreset.value.toLowerCase()}/`)),
               `Subreddit source ${targetPreset.id} must ONLY query r/${targetPreset.value}`
             );
+          } else if (targetPreset.type === 'url') {
+            const expectedHost = new URL(targetPreset.value).hostname;
+            assert.ok(
+              hitUrls.every((u) => u.includes(expectedHost)),
+              `URL source ${targetPreset.id} must ONLY crawl ${expectedHost}`
+            );
           } else if (targetPreset.id === 'src-kw-space') {
             assert.ok(
               hitUrls.every((u) => u.includes('nasa.gov')),
@@ -1735,7 +1748,7 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
       }
     });
 
-    it('should pull and randomize independently from EVERY single 18+ preset source (all 11 presets + PeerTube & Lemmy, 1-by-1 in isolation) with zero cross-source bleed', async () => {
+    it('should pull and randomize independently from EVERY single 18+ preset & directory source (all 57+ built-in 18+ sources, 1-by-1 in isolation) with zero cross-source bleed', async () => {
       const origFetch = globalThis.fetch;
       const origAllowNsfw = settings.allowNsfw;
       const origPrebuffer = settings.prebuffer;
@@ -1748,11 +1761,19 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
         getElementById: (id) => (id === 'engPeerTube' ? { checked: false } : null)
       };
 
-      const allAdultToTest = [
+      const seenAdultIds = new Set();
+      const allAdultToTest = [];
+      for (const s of [
         ...structuredClone(ADULT_PRESET_SOURCES),
-        { id: 'dir-fed-peertube', type: 'keyword', value: 'peertube nsfw adult', label: 'PeerTube Federated 18+', enabled: true, isNsfw: true },
-        { id: 'dir-fed-lemmy', type: 'keyword', value: 'lemmy fediverse nsfw', label: 'Lemmy & Mastodon 18+', enabled: true, isNsfw: true }
-      ];
+        ...ADULT_DIRECTORY_CATALOG.flatMap((g) =>
+          (g.items || []).map((item) => ({ ...structuredClone(item), enabled: true, isNsfw: true }))
+        )
+      ]) {
+        if (!seenAdultIds.has(s.id)) {
+          seenAdultIds.add(s.id);
+          allAdultToTest.push(s);
+        }
+      }
 
       try {
         for (const targetPreset of allAdultToTest) {
@@ -1774,12 +1795,14 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
             if (u.includes('api.redgifs.com/v2/auth/temporary')) {
               return { ok: true, json: async () => ({ token: 'tok' }) };
             }
-            if (u.includes('api.redgifs.com/v2/gifs/search')) {
+            if (u.includes('api.redgifs.com/v2/gifs/search') || u.includes('api.redgifs.com/v2/feeds/')) {
               return {
                 ok: true,
                 json: async () => ({
                   gifs: [1, 2, 3, 4, 5].map((n) => ({
                     id: `rg-${targetPreset.id}-${n}`,
+                    type: 1,
+                    hasAudio: true,
                     duration: 20 + n,
                     tags: ['HD'],
                     urls: { hd: `https://thumbs4.redgifs.com/${targetPreset.id}_${n}.mp4` }
@@ -1869,6 +1892,15 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
                   `<html><title>Episode ${epNum}</title><body><video src="https://cdn.fulltaboo.example/ep-${epNum}.mp4"></video></body></html>`
               };
             }
+            if (targetPreset.type === 'url' && u === targetPreset.value) {
+              const vids = [1, 2, 3, 4, 5, 6]
+                .map((n) => `<video src="https://cdn.nsfw-source.example/${targetPreset.id}-${n}.mp4"></video>`)
+                .join('\n');
+              return {
+                ok: true,
+                text: async () => `<html><title>${targetPreset.label}</title><body>${vids}</body></html>`
+              };
+            }
             if (u.includes('sepiasearch.org')) {
               return {
                 ok: true,
@@ -1936,7 +1968,18 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
               hitUrls.every((u) => u.toLowerCase().includes(`/r/${targetPreset.value.toLowerCase()}/`)),
               `18+ subreddit ${targetPreset.id} must ONLY query r/${targetPreset.value}`
             );
-          } else if (targetPreset.id === 'src-nsfw-redgifs' || targetPreset.id === 'src-nsfw-cosplay') {
+          } else if (targetPreset.type === 'url') {
+            const expectedHost = new URL(targetPreset.value).hostname;
+            assert.ok(
+              hitUrls.every((u) => u.includes(expectedHost)),
+              `18+ URL source ${targetPreset.id} must ONLY crawl ${expectedHost}`
+            );
+          } else if (
+            targetPreset.id === 'src-nsfw-redgifs' ||
+            targetPreset.id === 'src-nsfw-cosplay' ||
+            targetPreset.id.startsWith('dir-rg-') ||
+            targetPreset.id === 'dir-asmr-whisper'
+          ) {
             assert.ok(
               hitUrls.every((u) => u.includes('api.redgifs.com')),
               `${targetPreset.id} must ONLY query RedGIFs when RedGIFs responds`
@@ -1954,15 +1997,10 @@ describe('18+ Age Verification, HLS .M3U8 Snippet Stitcher & Free Tube Search Te
               ),
               `Free Tube preset ${targetPreset.id} must not bleed into unchecked FullTaboo, Reddit, RedGIFs, Archive, PeerTube, or Lemmy`
             );
-          } else if (targetPreset.id === 'src-nsfw-vintage') {
+          } else if (targetPreset.id === 'src-nsfw-vintage' || targetPreset.id === 'dir-fed-vintage') {
             assert.ok(
               hitUrls.every((u) => u.includes('archive.org')),
-              'Vintage 18+ Archive preset must ONLY query archive.org'
-            );
-          } else if (targetPreset.id === 'src-nsfw-fulltaboo') {
-            assert.ok(
-              hitUrls.every((u) => u.includes('fulltaboo.tv')),
-              'FullTaboo.tv preset must ONLY crawl fulltaboo.tv'
+              `Vintage 18+ Archive source ${targetPreset.id} must ONLY query archive.org`
             );
           } else if (targetPreset.id === 'dir-fed-peertube') {
             assert.ok(

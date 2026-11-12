@@ -61,3 +61,34 @@ jobs:
 
       - name: Verify production CORS proxy pool with Origin https://davidscottballard1-png.github.io
         run: node scripts/smoke-live-proxies.mjs
+
+  live-builtin-sources-verification:
+    name: Auto-Verify Added/Changed Sources & New App Versions Live
+    needs: unit-and-regression-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Standalone live verification (added/edited sources, version bumps, or scheduled sweep)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            node scripts/smoke-live-all-sources.mjs
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_REF" ]; then
+            node scripts/smoke-live-all-sources.mjs --auto-ci="origin/${BASE_REF}"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}:app.js" 2>/dev/null; then
+            node scripts/smoke-live-all-sources.mjs --auto-ci="${BEFORE_SHA}"
+          else
+            node scripts/smoke-live-all-sources.mjs --auto-ci="HEAD~1"
+          fi
+

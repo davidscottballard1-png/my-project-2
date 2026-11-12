@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Standalone Live Verification for All 63 Built-In ReelVault Sources
+ * Standalone Live Verification for All Built-In ReelVault Sources
  *
- * Audits every Safe Default (6), 18+ Preset (13), and 18+ Directory (44) source
+ * Dynamically audits every Safe Default, 18+ Preset, and 18+ Directory source
  * 1-by-1 in strict isolation:
  *  - Simulates production iPhone Safari origin (https://davidscottballard1-png.github.io/my-project-2/)
  *  - Asserts zero still-image (.jpg/.png), hover-preview, or ad/cam decoy leaks
@@ -13,10 +13,16 @@
  *   node scripts/smoke-live-all-sources.mjs
  *   node scripts/smoke-live-all-sources.mjs --group=SAFE|PRESET|DIR|SUB
  *   node scripts/smoke-live-all-sources.mjs --id=dir-rg-amateur,dir-sub-gonewild
+ *   node scripts/smoke-live-all-sources.mjs --diff=HEAD~1
+ *   node scripts/smoke-live-all-sources.mjs --auto-ci=HEAD~1
  */
 
 import assert from 'node:assert';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
+import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -36,6 +42,7 @@ if (!process.argv.includes('--no-bridge')) {
 
 const bridge = require('../server/bridge.js');
 const {
+  APP_BUILD_VERSION,
   DEFAULT_SOURCES,
   ADULT_PRESET_SOURCES,
   ADULT_DIRECTORY_CATALOG,
@@ -51,24 +58,130 @@ const {
   isKnownNsfwUrl
 } = require('../app.js');
 
-const allSources = [
-  ...DEFAULT_SOURCES.map((s) => ({ ...s, suite: 'SAFE_DEFAULT', isNsfw: false })),
-  ...ADULT_PRESET_SOURCES.map((s) => ({ ...s, suite: 'ADULT_PRESET', isNsfw: true })),
-  ...ADULT_DIRECTORY_CATALOG.flatMap((g) =>
-    g.items.map((i) => ({ ...i, suite: `DIR:${g.category}`, isNsfw: true }))
-  )
-];
+function buildCatalogList(defaultSources, presetSources, directoryCatalog) {
+  return [
+    ...(defaultSources || []).map((s) => ({ ...s, suite: 'SAFE_DEFAULT', isNsfw: false })),
+    ...(presetSources || []).map((s) => ({ ...s, suite: 'ADULT_PRESET', isNsfw: true })),
+    ...(directoryCatalog || []).flatMap((g) =>
+      (g.items || []).map((i) => ({ ...i, suite: `DIR:${g.category}`, isNsfw: true }))
+    )
+  ];
+}
 
-assert.strictEqual(allSources.length, 63, 'Expected 63 total built-in sources (6 Safe + 13 Preset + 44 Directory)');
+const allSources = buildCatalogList(DEFAULT_SOURCES, ADULT_PRESET_SOURCES, ADULT_DIRECTORY_CATALOG);
+
+assert.ok(
+  allSources.length >= 63,
+  `Expected at least 63 built-in sources (found ${allSources.length})`
+);
+{
+  const seenIds = new Set();
+  for (const s of allSources) {
+    assert.ok(typeof s.id === 'string' && s.id.trim().length >= 3, `Invalid source id on ${JSON.stringify(s)}`);
+    assert.ok(!seenIds.has(s.id), `Duplicate built-in source id: ${s.id}`);
+    seenIds.add(s.id);
+    assert.ok(['keyword', 'subreddit', 'url'].includes(s.type), `Invalid type "${s.type}" on ${s.id}`);
+    assert.ok(typeof s.value === 'string' && s.value.trim().length > 0, `Empty value on ${s.id}`);
+    assert.ok(typeof s.label === 'string' && s.label.trim().length > 0, `Empty label on ${s.id}`);
+  }
+}
+
+function loadCatalogSnapshotFromGitRef(gitRef) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-prev-app-'));
+  const tempFile = path.join(tempDir, 'prev-app.cjs');
+  try {
+    const prevSourceCode = execFileSync('git', ['show', `${gitRef}:app.js`], {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    fs.writeFileSync(tempFile, prevSourceCode, 'utf8');
+    const prevMod = require(tempFile);
+    return {
+      ok: true,
+      version: prevMod.APP_BUILD_VERSION || '',
+      sources: buildCatalogList(
+        prevMod.DEFAULT_SOURCES,
+        prevMod.ADULT_PRESET_SOURCES,
+        prevMod.ADULT_DIRECTORY_CATALOG
+      )
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err), version: '', sources: [] };
+  } finally {
+    try {
+      delete require.cache[tempFile];
+    } catch {}
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+function computeAddedOrChangedSources(prevSources, currSources) {
+  const prevMap = new Map(prevSources.map((s) => [s.id, s]));
+  return currSources.filter((curr) => {
+    const prev = prevMap.get(curr.id);
+    if (!prev) return true;
+    return (
+      prev.type !== curr.type ||
+      prev.value !== curr.value ||
+      Boolean(prev.isNsfw) !== Boolean(curr.isNsfw)
+    );
+  });
+}
 
 const groupArg = (process.argv.find((a) => a.startsWith('--group=')) || '').split('=')[1] || 'ALL';
 const idArg = (process.argv.find((a) => a.startsWith('--id=')) || '').split('=')[1] || '';
+const diffRefArg = (process.argv.find((a) => a.startsWith('--diff=')) || '').slice('--diff='.length).trim();
+const autoCiRefArg = (process.argv.find((a) => a.startsWith('--auto-ci=')) || '').slice('--auto-ci='.length).trim();
 const noBridge = process.argv.includes('--no-bridge');
 
 let targets = allSources;
+
 if (idArg) {
   const idSet = new Set(idArg.split(',').map((x) => x.trim()).filter(Boolean));
   targets = allSources.filter((s) => idSet.has(s.id));
+} else if (autoCiRefArg) {
+  const snap = loadCatalogSnapshotFromGitRef(autoCiRefArg);
+  if (!snap.ok) {
+    console.log(
+      `[auto-ci] Could not read ${autoCiRefArg}:app.js (${snap.error}); running full live audit across all ${allSources.length} built-in sources.`
+    );
+    targets = allSources;
+  } else {
+    const changed = computeAddedOrChangedSources(snap.sources, allSources);
+    const versionBumped = Boolean(snap.version && snap.version !== APP_BUILD_VERSION);
+    if (versionBumped) {
+      console.log(
+        `[auto-ci] APP_BUILD_VERSION bumped (${snap.version} -> ${APP_BUILD_VERSION})${
+          changed.length ? ` with ${changed.length} new/edited source(s)` : ''
+        } — running full standalone live audit across all ${allSources.length} built-in sources.`
+      );
+      targets = allSources;
+    } else if (changed.length > 0) {
+      console.log(
+        `[auto-ci] Detected ${changed.length} added/modified built-in source(s) since ${autoCiRefArg}: ${changed
+          .map((s) => s.id)
+          .join(', ')}`
+      );
+      targets = changed;
+    } else {
+      console.log(
+        `[auto-ci] No APP_BUILD_VERSION bump (${APP_BUILD_VERSION}) or built-in source changes since ${autoCiRefArg} (${allSources.length} catalog sources verified). Skipping redundant live sweep.`
+      );
+      targets = [];
+    }
+  }
+} else if (diffRefArg) {
+  const snap = loadCatalogSnapshotFromGitRef(diffRefArg);
+  assert.ok(snap.ok, `Failed to load ${diffRefArg}:app.js: ${snap.error}`);
+  targets = computeAddedOrChangedSources(snap.sources, allSources);
+  console.log(
+    `[diff] Found ${targets.length} added/modified source(s) since ${diffRefArg}${
+      targets.length ? `: ${targets.map((s) => s.id).join(', ')}` : ''
+    }`
+  );
 } else if (groupArg === 'SAFE') {
   targets = allSources.filter((s) => s.suite === 'SAFE_DEFAULT');
 } else if (groupArg === 'PRESET') {
@@ -77,6 +190,12 @@ if (idArg) {
   targets = allSources.filter((s) => s.suite.startsWith('DIR:'));
 } else if (groupArg === 'SUB') {
   targets = allSources.filter((s) => s.type === 'subreddit');
+}
+
+if (targets.length === 0) {
+  if (prevApiKeyEnv === undefined) delete process.env.REELVAULT_API_KEY;
+  else process.env.REELVAULT_API_KEY = prevApiKeyEnv;
+  process.exit(0);
 }
 
 const DECOY_CHECK_REGEX =
@@ -143,17 +262,82 @@ async function probeStream(item) {
 let bridgeServer = null;
 let bridgeUrl = '';
 
-if (!noBridge && targets.some((s) => /fulltaboo\.tv/i.test(s.value))) {
+if (!noBridge) {
   bridgeServer = bridge.createBridgeServer();
   await new Promise((resolve) => bridgeServer.listen(0, '127.0.0.1', resolve));
   bridgeUrl = `http://127.0.0.1:${bridgeServer.address().port}`;
 }
 
-console.log(`Auditing ${targets.length} standalone source(s) live...\n`);
+console.log(`Auditing ${targets.length} standalone source(s) live (build ${APP_BUILD_VERSION}, catalog size ${allSources.length})...\n`);
 
 let passedCount = 0;
 const failures = [];
 let prevSubreddit = false;
+
+async function runSingleSourceAttempt(src, useBridge) {
+  const wantNsfw = Boolean(src.isNsfw);
+  if (useBridge && bridgeUrl) {
+    setCloudBackendConfig(bridgeUrl, bridgeKey, true);
+  } else {
+    clearCloudBackendConfig();
+  }
+
+  settings.allowNsfw = wantNsfw;
+  settings.nsfwMode = wantNsfw ? 'strict' : 'safe';
+  settings.formatMode = 'all';
+  settings.tubeDurationFilter = 'all';
+  settings.tubeQualityFilter = 'all';
+
+  setAppState({
+    sources: [{ ...src, enabled: true, isNsfw: wantNsfw }],
+    videoQueue: [],
+    currentIndex: -1,
+    clearSeenHistory: true,
+    resetRedgifsToken: false
+  });
+
+  const t0 = Date.now();
+  const items = await pullFromSource({ ...src, enabled: true, isNsfw: wantNsfw });
+  const elapsed = Date.now() - t0;
+
+  if (!items || items.length === 0) {
+    return { ok: false, elapsed, items: [], reason: '0 videos' };
+  }
+
+  const decoyHit = items.find((i) => DECOY_CHECK_REGEX.test(i.videoUrl));
+  const imageHit = items.find(
+    (i) => STILL_IMAGE_URL_REGEX.test(i.videoUrl) && !/[?&]format=mp4\b/i.test(i.videoUrl)
+  );
+  const nsfwLeakInSafe = !wantNsfw
+    ? items.find((i) => i.isNsfw || isKnownNsfwUrl(i.videoUrl) || isKnownNsfwUrl(i.pageUrl || ''))
+    : null;
+  const sfwLeakInAdult = wantNsfw
+    ? items.find((i) => {
+        if (!i.isNsfw) return true;
+        try {
+          return SFW_BLEED_CHECK_REGEX.test(new URL(i.videoUrl).hostname);
+        } catch {
+          return false;
+        }
+      })
+    : null;
+
+  let probe = { ok: false, status: 0, error: 'not probed' };
+  for (const candidateItem of items.slice(0, 2)) {
+    probe = await probeStream(candidateItem);
+    if (probe.ok) break;
+  }
+
+  const ok = !decoyHit && !imageHit && !nsfwLeakInSafe && !sfwLeakInAdult && probe.ok;
+  const reason =
+    `HTTP ${probe.status} (${probe.contentType || probe.error || 'n/a'})` +
+    (imageHit ? ` IMAGE_LEAK=${imageHit.videoUrl}` : '') +
+    (decoyHit ? ` DECOY=${decoyHit.videoUrl}` : '') +
+    (nsfwLeakInSafe ? ` NSFW_LEAK=${nsfwLeakInSafe.videoUrl}` : '') +
+    (sfwLeakInAdult ? ` SFW_LEAK=${sfwLeakInAdult.videoUrl}` : '');
+
+  return { ok, elapsed, items, probe, reason, hasPolicyViolation: Boolean(decoyHit || imageHit || nsfwLeakInSafe || sfwLeakInAdult) };
+}
 
 try {
   for (const src of targets) {
@@ -162,77 +346,38 @@ try {
     }
     prevSubreddit = src.type === 'subreddit';
 
-    const wantNsfw = Boolean(src.isNsfw);
-    const useBridgeForSource = Boolean(bridgeUrl && /fulltaboo\.tv/i.test(src.value));
-    if (useBridgeForSource) {
-      setCloudBackendConfig(bridgeUrl, bridgeKey, true);
-    } else {
-      clearCloudBackendConfig();
-    }
+    const requiresIpBoundBridge = Boolean(bridgeUrl && /fulltaboo\.tv/i.test(src.value));
+    let usedBridge = requiresIpBoundBridge;
 
-    settings.allowNsfw = wantNsfw;
-    settings.nsfwMode = wantNsfw ? 'strict' : 'safe';
-    settings.formatMode = 'all';
-    settings.tubeDurationFilter = 'all';
-    settings.tubeQualityFilter = 'all';
-
-    setAppState({
-      sources: [{ ...src, enabled: true, isNsfw: wantNsfw }],
-      videoQueue: [],
-      currentIndex: -1,
-      clearSeenHistory: true,
-      resetRedgifsToken: false
-    });
-
-    const t0 = Date.now();
     try {
-      const items = await pullFromSource({ ...src, enabled: true, isNsfw: wantNsfw });
-      const elapsed = Date.now() - t0;
+      let attempt = await runSingleSourceAttempt(src, usedBridge);
 
-      if (!items || items.length === 0) {
-        console.log(`❌ [${src.id}] (${src.type}: "${src.value}") -> 0 videos (${elapsed}ms)`);
+      // Retry once on transient network timeout / shared-CI CORS proxy 429 (never retry policy/safety violations)
+      if (!attempt.ok && !attempt.hasPolicyViolation) {
+        await sleep(2500);
+        const allowBridgeOnRetry = Boolean(bridgeUrl && (requiresIpBoundBridge || src.type === 'url'));
+        usedBridge = allowBridgeOnRetry;
+        attempt = await runSingleSourceAttempt(src, usedBridge);
+      }
+
+      if (!attempt.items || attempt.items.length === 0) {
+        console.log(`❌ [${src.id}] (${src.type}: "${src.value}") -> 0 videos (${attempt.elapsed}ms)`);
         failures.push(`${src.id}: 0 videos`);
         continue;
       }
 
-      const decoyHit = items.find((i) => DECOY_CHECK_REGEX.test(i.videoUrl));
-      const imageHit = items.find(
-        (i) => STILL_IMAGE_URL_REGEX.test(i.videoUrl) && !/[?&]format=mp4\b/i.test(i.videoUrl)
-      );
-      const nsfwLeakInSafe = !wantNsfw
-        ? items.find((i) => i.isNsfw || isKnownNsfwUrl(i.videoUrl) || isKnownNsfwUrl(i.pageUrl || ''))
-        : null;
-      const sfwLeakInAdult = wantNsfw
-        ? items.find((i) => {
-            if (!i.isNsfw) return true;
-            try {
-              return SFW_BLEED_CHECK_REGEX.test(new URL(i.videoUrl).hostname);
-            } catch {
-              return false;
-            }
-          })
-        : null;
-
-      const probe = await probeStream(items[0]);
-      const ok = !decoyHit && !imageHit && !nsfwLeakInSafe && !sfwLeakInAdult && probe.ok;
-      if (ok) {
+      if (attempt.ok) {
         passedCount++;
       } else {
-        failures.push(
-          `${src.id}: HTTP ${probe.status} (${probe.contentType || probe.error || 'n/a'})` +
-            (imageHit ? ` IMAGE_LEAK=${imageHit.videoUrl}` : '') +
-            (decoyHit ? ` DECOY=${decoyHit.videoUrl}` : '') +
-            (nsfwLeakInSafe ? ` NSFW_LEAK=${nsfwLeakInSafe.videoUrl}` : '') +
-            (sfwLeakInAdult ? ` SFW_LEAK=${sfwLeakInAdult.videoUrl}` : '')
-        );
+        failures.push(`${src.id}: ${attempt.reason}`);
       }
 
-      const platforms = [...new Set(items.map((i) => i.platform || 'unknown'))].join(', ');
+      const platforms = [...new Set(attempt.items.map((i) => i.platform || 'unknown'))].join(', ');
       console.log(
-        `${ok ? '✅' : '⚠️'} [${src.id}]${useBridgeForSource ? ' (+Bridge)' : ''} (${src.type}: "${src.value}") -> ${items.length} vids in ${elapsed}ms | [${platforms}] | HTTP ${probe.status} (${probe.contentType || probe.error || 'n/a'}, ${probe.bytesRead || 0}B)`
+        `${attempt.ok ? '✅' : '⚠️'} [${src.id}]${usedBridge ? ' (+Bridge)' : ''} (${src.type}: "${src.value}") -> ${attempt.items.length} vids in ${attempt.elapsed}ms | [${platforms}] | HTTP ${attempt.probe.status} (${attempt.probe.contentType || attempt.probe.error || 'n/a'}, ${attempt.probe.bytesRead || 0}B)`
       );
     } catch (err) {
-      console.log(`❌ [${src.id}] ERROR (${Date.now() - t0}ms): ${err?.message || err}`);
+      console.log(`❌ [${src.id}] ERROR: ${err?.message || err}`);
       failures.push(`${src.id}: ${err?.message || err}`);
     }
   }

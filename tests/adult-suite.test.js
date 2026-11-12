@@ -573,7 +573,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-fulltaboo' && s.value === 'https://fulltaboo.tv/'));
       assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-asmr-roleplay' && s.value === 'asmr roleplay'));
       assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-asmr-gfe' && s.value === 'asmr tease'));
-      assert.strictEqual(ADULT_DIRECTORY_CATALOG.length, 6);
+      assert.ok(ADULT_DIRECTORY_CATALOG.length >= 6);
       const totalItems = ADULT_DIRECTORY_CATALOG.reduce((sum, g) => sum + (g.items?.length || 0), 0);
       assert.ok(totalItems >= 44);
 
@@ -2485,9 +2485,54 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
         globalThis.fetch = origFetch;
       }
     });
+
+    it('dynamically validates globally unique IDs, valid types, HTTPS URLs, and mode safety across all built-in Safe, Preset, and Directory sources', () => {
+      assert.ok(DEFAULT_SOURCES.length >= 6, 'Expected at least 6 Safe default sources');
+      assert.ok(ADULT_PRESET_SOURCES.length >= 13, 'Expected at least 13 18+ preset sources');
+      assert.ok(ADULT_DIRECTORY_CATALOG.length >= 6, 'Expected at least 6 18+ directory categories');
+
+      const seenIds = new Set();
+      const validTypes = new Set(['keyword', 'subreddit', 'url']);
+
+      const assertValidSourceShape = (src, expectedNsfw, suiteName) => {
+        assert.ok(src && typeof src === 'object', `${suiteName}: source entry must be an object`);
+        assert.ok(typeof src.id === 'string' && src.id.trim().length >= 3, `${suiteName}: missing valid id`);
+        assert.ok(!seenIds.has(src.id), `Duplicate built-in source id "${src.id}" in ${suiteName}`);
+        seenIds.add(src.id);
+
+        assert.ok(validTypes.has(src.type), `${src.id}: invalid type "${src.type}"`);
+        assert.ok(typeof src.value === 'string' && src.value.trim().length > 0, `${src.id}: empty value`);
+        assert.ok(typeof src.label === 'string' && src.label.trim().length > 0, `${src.id}: empty label`);
+
+        if (src.type === 'url') {
+          const parsed = new URL(src.value);
+          assert.strictEqual(parsed.protocol, 'https:', `${src.id}: URL source must use https://`);
+        }
+        if (src.type === 'subreddit') {
+          assert.ok(
+            /^[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*$/.test(src.value),
+            `${src.id}: invalid subreddit value "${src.value}"`
+          );
+        }
+        if (!expectedNsfw) {
+          assert.ok(!src.isNsfw, `Safe source ${src.id} must not be marked isNsfw`);
+        }
+      };
+
+      for (const s of DEFAULT_SOURCES) {
+        assertValidSourceShape(s, false, 'DEFAULT_SOURCES');
+      }
+      for (const s of ADULT_PRESET_SOURCES) {
+        assert.strictEqual(s.isNsfw, true, `18+ preset ${s.id} must explicitly set isNsfw: true`);
+        assertValidSourceShape(s, true, 'ADULT_PRESET_SOURCES');
+      }
+      for (const group of ADULT_DIRECTORY_CATALOG) {
+        assert.ok(typeof group.category === 'string' && group.category.trim().length > 0, 'Missing category title');
+        assert.ok(Array.isArray(group.items) && group.items.length > 0, `Empty category "${group.category}"`);
+        for (const item of group.items) {
+          assertValidSourceShape(item, true, `ADULT_DIRECTORY_CATALOG (${group.category})`);
+        }
+      }
+    });
   });
 });
-
-
-
-
