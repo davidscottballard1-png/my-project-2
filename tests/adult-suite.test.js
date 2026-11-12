@@ -50,7 +50,12 @@ const {
   deleteVaultVideoDB,
   clearVaultDB,
   scanUrlForVideos,
+  extractCandidateWebPagesFromSearchHtml,
   getVideoRefererUrl,
+  isIpBoundEmbedOrCdnUrl,
+  buildHttpsMediaProxyCandidates,
+  setCloudBackendConfig,
+  clearCloudBackendConfig,
   getSourceCacheKey,
   updateHeaderSummary,
   revokeVideoItemBlobUrls,
@@ -1742,12 +1747,16 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       }
     });
 
-    it('excludes silent Pornhub 180P hover WebMs and falls back to Arctic Shift when r/nsfwasmr search.json is blocked', async () => {
+    it('excludes silent Pornhub 180P/prev_* hover clips & ad banners, skips old.reddit NSFW redirect, and retries Arctic Shift on 422', async () => {
       setupTestEnv();
       settings.allowNsfw = true;
       const origFetch = globalThis.fetch;
+      const hitUrls = [];
+      let blockRedditCompletely = false;
+
       globalThis.fetch = async (url) => {
         const u = String(url);
+        hitUrls.push(u);
         if (u.includes('pornhub.com/video/search?search=asmr+tease')) {
           return {
             ok: true,
@@ -1757,6 +1766,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
                 <a href="/video/search?search=other">Search</a>
                 <video data-mediabook="https://ew.phncdn.com/c6541/videos/202610/11/65381995/180P_225K_65381995.webm"></video>
                 <video src="https://pix-fl.phncdn.com/c6531/videos/202610/11/65447405/original_65447405.mp4"></video>
+                <video src="https://cdn.example.net/thumbs/prev_34987065.mp4"></video>
                 <video src="https://video-b.flirtify.com/tok/media=hls4/index.m3u8"></video>
                 <a href="/view_video.php?viewkey=65381995">ASMR Tease Watch</a>
               </body></html>`
@@ -1772,6 +1782,9 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
           };
         }
         if (/reddit\.com\/r\/nsfwasmr\/(hot|top|new)\.json/i.test(u)) {
+          if (blockRedditCompletely) {
+            return { ok: false, status: 403, json: async () => ({}) };
+          }
           return {
             ok: true,
             json: async () => ({
@@ -1791,7 +1804,10 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
             })
           };
         }
-        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=nsfwasmr')) {
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=nsfwasmr&limit=25')) {
+          if (blockRedditCompletely) {
+            return { ok: false, status: 422, json: async () => ({ error: 'Shard timeout' }) };
+          }
           return {
             ok: true,
             json: async () => ({
@@ -1803,6 +1819,23 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
                   over_18: true,
                   url: 'https://www.redgifs.com/watch/gainsborobrightasiantrumpetfish',
                   permalink: '/r/nsfwasmr/comments/arch_rg_1/sensual_asmr/'
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('arctic-shift.photon-reddit.com/api/posts/search?subreddit=nsfwasmr&limit=18')) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                {
+                  id: 'arch_rg_retry_1',
+                  title: 'Soft Moan ASMR Retry Clip',
+                  subreddit: 'nsfwasmr',
+                  over_18: true,
+                  url: 'https://www.redgifs.com/watch/gainsborobrightasiantrumpetfish',
+                  permalink: '/r/nsfwasmr/comments/arch_rg_retry_1/soft_moan_asmr/'
                 }
               ]
             })
@@ -1839,9 +1872,12 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
           'https://ev.phncdn.com/videos/202610/11/65381995/720P_4000K_65381995.mp4'
         );
         assert.ok(
-          !phItems.some((i) => /ew\.phncdn\.com|pix-fl\.phncdn\.com|flirtify\.com|180P_/i.test(i.videoUrl))
+          !phItems.some((i) =>
+            /ew\.phncdn\.com|pix-fl\.phncdn\.com|flirtify\.com|180P_|prev_\d+\.mp4/i.test(i.videoUrl)
+          )
         );
 
+        hitUrls.length = 0;
         const subFallback = await fetchSubredditVideos('nsfwasmr');
         assert.strictEqual(subFallback.length, 1);
         assert.strictEqual(subFallback[0].id, 'rd-arch_rg_1');
@@ -1850,8 +1886,56 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
           'https://media.redgifs.com/GainsboroBrightAsiantrumpetfish.mp4'
         );
         assert.strictEqual(getVideoRefererUrl(subFallback[0]), 'https://www.redgifs.com/');
+        assert.ok(
+          !hitUrls.some((u) => u.includes('old.reddit.com')),
+          'NSFW subreddit fetch must not waste 7s on old.reddit.com /login/?reason=lor2 redirect'
+        );
+
+        // Also verify full 403 block on www.reddit.com + transient 422 on Arctic Shift limit=25 retries limit=18
+        hitUrls.length = 0;
+        blockRedditCompletely = true;
+        const retryFallback = await fetchSubredditVideos('nsfwasmr');
+        assert.strictEqual(retryFallback.length, 1);
+        assert.strictEqual(retryFallback[0].id, 'rd-arch_rg_retry_1');
+        assert.ok(hitUrls.some((u) => u.includes('subreddit=nsfwasmr&limit=25')));
+        assert.ok(hitUrls.some((u) => u.includes('subreddit=nsfwasmr&limit=18')));
+        assert.ok(!hitUrls.some((u) => u.includes('old.reddit.com')));
       } finally {
         globalThis.fetch = origFetch;
+      }
+    });
+
+    it('excludes foreign-IP HTTP-474 pornhub.com pages in browser-only open-web search and pins phncdn.com to Cloud /proxy when connected', () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      clearCloudBackendConfig();
+
+      const sampleSearchHtml = `
+        <html><body>
+          <a href="https://www.pornhub.com/view_video.php?viewkey=65381995">Pornhub ASMR</a>
+          <a href="https://pornone.com/female/asmr-peaches-sexy-roleplay/277874321/">PornOne ASMR</a>
+          <a href="https://www.eporner.com/video-epasmr1/sensual-asmr/">Eporner ASMR</a>
+        </body></html>`;
+
+      try {
+        // 1. Browser-only mode (no Cloud Bridge): pornhub.com excluded to prevent CORS-proxy foreign-IP HTTP 474 tokens
+        const browserOnlyUrls = extractCandidateWebPagesFromSearchHtml(sampleSearchHtml);
+        assert.ok(!browserOnlyUrls.some((u) => u.includes('pornhub.com')));
+        assert.ok(browserOnlyUrls.some((u) => u.includes('pornone.com/female/asmr-peaches-sexy-roleplay/277874321/')));
+        assert.ok(browserOnlyUrls.some((u) => u.includes('eporner.com/video-epasmr1/')));
+
+        // 2. Private Cloud Bridge connected: pornhub.com allowed and ev.phncdn.com pinned strictly to Cloud /proxy
+        setCloudBackendConfig('https://bridge.example.com', 'rv_test_secret_key_12345', true);
+        const cloudUrls = extractCandidateWebPagesFromSearchHtml(sampleSearchHtml);
+        assert.ok(cloudUrls.some((u) => u.includes('pornhub.com/view_video.php?viewkey=65381995')));
+
+        const phStream = 'https://ev.phncdn.com/videos/202610/11/65381995/720P_4000K_65381995.mp4?validfrom=1794511&hash=abc';
+        assert.strictEqual(isIpBoundEmbedOrCdnUrl(phStream), true);
+        const candidates = buildHttpsMediaProxyCandidates(phStream, { refererUrl: 'https://www.pornhub.com/' });
+        assert.strictEqual(candidates.length, 1, 'IP-bound phncdn.com stream must stay pinned solely to Cloud /proxy');
+        assert.ok(candidates[0].startsWith('https://bridge.example.com/proxy?'));
+      } finally {
+        clearCloudBackendConfig();
       }
     });
 
