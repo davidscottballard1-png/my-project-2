@@ -1,4 +1,4 @@
-const CACHE_NAME = 'reelvault-v40';
+const CACHE_NAME = 'reelvault-v41';
 const APP_BUILD = CACHE_NAME.replace(/^reelvault-/, '');
 const VERSIONED_QUERY = `?v=${APP_BUILD.replace(/^v/, '')}`;
 const APP_SHELL = [

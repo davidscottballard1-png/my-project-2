@@ -9,9 +9,12 @@ const {
   settings,
   extractRedgifsId,
   resolveRedgifsUrlToMp4,
+  isAudioEssentialQuery,
+  fetchDirectEpornerVideos,
   searchRedgifsVideos,
   filterAndSortTubeResults,
   extractRedditVideosFromListing,
+  fetchSubredditVideos,
   unlockAdultPresetSources,
   getEffectiveActiveSources,
   setNsfwPin,
@@ -559,16 +562,22 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       settings.allowNsfw = true;
       setAppState({ sources: structuredClone(DEFAULT_SOURCES), isAdultDirectoryExpanded: false });
 
-      assert.ok(ADULT_PRESET_SOURCES.length >= 11);
+      assert.ok(ADULT_PRESET_SOURCES.length >= 13);
       assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-fulltaboo' && s.value === 'https://fulltaboo.tv/'));
-      assert.strictEqual(ADULT_DIRECTORY_CATALOG.length, 5);
+      assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-asmr-roleplay' && s.value === 'asmr roleplay'));
+      assert.ok(ADULT_PRESET_SOURCES.some((s) => s.id === 'src-nsfw-asmr-gfe' && s.value === 'asmr tease'));
+      assert.strictEqual(ADULT_DIRECTORY_CATALOG.length, 6);
       const totalItems = ADULT_DIRECTORY_CATALOG.reduce((sum, g) => sum + (g.items?.length || 0), 0);
-      assert.ok(totalItems >= 31);
+      assert.ok(totalItems >= 44);
 
       const ftEntry = findDirectoryEntry('dir-tube-fulltaboo');
       assert.ok(ftEntry);
       assert.strictEqual(ftEntry.type, 'url');
       assert.strictEqual(ftEntry.value, 'https://fulltaboo.tv/');
+
+      const gfeEntry = findDirectoryEntry('dir-asmr-gfe');
+      assert.ok(gfeEntry);
+      assert.strictEqual(gfeEntry.value, 'girlfriend roleplay asmr');
 
       const entry = findDirectoryEntry('dir-sub-realgirls');
       assert.ok(entry);
@@ -580,6 +589,7 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(elements.get('adultDirectoryBody').classList.contains('hidden'), false);
       assert.ok(elements.get('adultDirectoryList').innerHTML.includes('r/RealGirls'));
       assert.ok(elements.get('adultDirectoryList').innerHTML.includes('FullTaboo.tv'));
+      assert.ok(elements.get('adultDirectoryList').innerHTML.includes('Girlfriend Experience (GFE) ASMR'));
 
       // 1-tap toggle adds and enables the source
       const addedSrc = toggleDirectorySource('dir-sub-realgirls');
@@ -594,6 +604,9 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       // Enable a single category
       const catCount = enableDirectoryCategory('🎬 RedGIFs HD & Loop Niches');
       assert.strictEqual(catCount, 8);
+
+      const asmrCatCount = enableDirectoryCategory('🎧 18+ ASMR, Roleplay & GFE');
+      assert.strictEqual(asmrCatCount, 8);
 
       // Enable all directory sources at once
       const enabledCount = enableAllDirectorySources();
@@ -1479,6 +1492,217 @@ describe('Full 18+ Feature Suite: Strict Mode, RedGIFs Resolver, Hidden Vault, P
       assert.strictEqual(getAppState().videoQueue[0].id, 'vault-general-clip-1');
     });
   });
+
+  describe('8. 18+ ASMR, Sensual Roleplay, GFE/BFE & Tease Video Sources', () => {
+    it('detects audio-essential ASMR/roleplay/GFE/BFE queries accurately without flagging general queries', () => {
+      assert.strictEqual(isAudioEssentialQuery('asmr roleplay'), true);
+      assert.strictEqual(isAudioEssentialQuery('girlfriend roleplay asmr'), true);
+      assert.strictEqual(isAudioEssentialQuery('boyfriend roleplay asmr'), true);
+      assert.strictEqual(isAudioEssentialQuery('r/nsfwasmr'), true);
+      assert.strictEqual(isAudioEssentialQuery('redgifs asmr tease'), true);
+      assert.strictEqual(isAudioEssentialQuery('amateur hd'), false);
+      assert.strictEqual(isAudioEssentialQuery('r/RealGirls'), false);
+    });
+
+    it('skips silent hasAudio:false RedGIFs loops on ASMR queries and falls back to voiced ASMR clips', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      const hitUrls = [];
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        hitUrls.push(u);
+        if (u.includes('api.redgifs.com/v2/auth/temporary')) {
+          return { ok: true, json: async () => ({ token: 'tok-asmr' }) };
+        }
+        if (u.includes('search_text=asmr%20tease') && u.includes('order=trending')) {
+          // Only silent GIF loops in trending
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'silentloop1',
+                  hasAudio: false,
+                  duration: 14,
+                  tags: ['tease'],
+                  urls: { hd: 'https://thumbs4.redgifs.com/SilentLoop1.mp4' }
+                }
+              ]
+            })
+          };
+        }
+        if (u.includes('search_text=asmr') && u.includes('order=best')) {
+          return {
+            ok: true,
+            json: async () => ({
+              gifs: [
+                {
+                  id: 'voicedasmr1',
+                  hasAudio: true,
+                  duration: 28,
+                  tags: ['asmr', 'roleplay', 'tease'],
+                  urls: { hd: 'https://thumbs4.redgifs.com/VoicedAsmr1.mp4' }
+                }
+              ]
+            })
+          };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      };
+
+      try {
+        setAppState({ resetRedgifsToken: true });
+        const items = await searchRedgifsVideos('redgifs asmr tease', 5);
+        assert.strictEqual(items.length, 1);
+        assert.strictEqual(items[0].id, 'rg-voicedasmr1');
+        assert.ok(!items.some((i) => i.id === 'rg-silentloop1'));
+        assert.ok(hitUrls.some((u) => u.includes('search_text=asmr&order=best')));
+      } finally {
+        setAppState({ resetRedgifsToken: true });
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('prefers muxed HLSPlaylist.m3u8 audio streams on Reddit ASMR feeds, skips silent GIFs, and falls back to subreddit video search when top slice is non-video', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+
+      // 1. Direct listing extraction on r/nsfwasmr prefers HLSPlaylist.m3u8 over silent DASH MP4 and skips is_gif/has_audio:false
+      const sampleListing = {
+        data: {
+          children: [
+            {
+              data: {
+                id: 'silent_gif_1',
+                title: 'Silent visual loop',
+                subreddit: 'nsfwasmr',
+                over_18: true,
+                permalink: '/r/nsfwasmr/comments/silent_gif_1/',
+                secure_media: {
+                  reddit_video: {
+                    fallback_url: 'https://v.redd.it/silent1/DASH_720.mp4',
+                    hls_url: 'https://v.redd.it/silent1/HLSPlaylist.m3u8',
+                    is_gif: true,
+                    has_audio: false,
+                    duration: 12,
+                    height: 720
+                  }
+                }
+              }
+            },
+            {
+              data: {
+                id: 'voiced_roleplay_1',
+                title: '[F4M] Soft Spoken Girlfriend Roleplay ASMR',
+                subreddit: 'nsfwasmr',
+                over_18: true,
+                permalink: '/r/nsfwasmr/comments/voiced_roleplay_1/',
+                secure_media: {
+                  reddit_video: {
+                    fallback_url: 'https://v.redd.it/voiced1/DASH_720.mp4?source=fallback',
+                    hls_url: 'https://v.redd.it/voiced1/HLSPlaylist.m3u8',
+                    is_gif: false,
+                    has_audio: true,
+                    duration: 95,
+                    height: 1080
+                  }
+                }
+              }
+            }
+          ]
+        }
+      };
+
+      const extracted = extractRedditVideosFromListing(sampleListing, 'r/nsfwasmr');
+      assert.strictEqual(extracted.length, 1);
+      assert.strictEqual(extracted[0].id, 'rd-voiced_roleplay_1');
+      assert.strictEqual(extracted[0].format, 'm3u8');
+      assert.strictEqual(extracted[0].videoUrl, 'https://v.redd.it/voiced1/HLSPlaylist.m3u8');
+      assert.strictEqual(extracted[0].convertedUrl, 'https://v.redd.it/voiced1/DASH_720.mp4?source=fallback');
+
+      // 2. fetchSubredditVideos('nsfwasmr') falls back to restrict_sr=on video search when hot/top/new only had external links
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (/reddit\.com\/r\/nsfwasmr\/(hot|top|new)\.json/i.test(u)) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: {
+                children: [
+                  {
+                    data: {
+                      id: 'ext_text_1',
+                      title: 'External text post',
+                      subreddit: 'nsfwasmr',
+                      over_18: true,
+                      url: 'https://www.reddit.com/r/nsfwasmr/comments/ext_text_1/'
+                    }
+                  }
+                ]
+              }
+            })
+          };
+        }
+        if (u.includes('reddit.com/r/nsfwasmr/search.json') && u.includes('restrict_sr=on')) {
+          return { ok: true, json: async () => sampleListing };
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      };
+
+      try {
+        const subVideos = await fetchSubredditVideos('nsfwasmr');
+        assert.strictEqual(subVideos.length, 1);
+        assert.strictEqual(subVideos[0].id, 'rd-voiced_roleplay_1');
+        assert.strictEqual(subVideos[0].videoUrl, 'https://v.redd.it/voiced1/HLSPlaylist.m3u8');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('retains asmr keyword in fetchDirectEpornerVideos fallback candidates for multi-word GFE/BFE ASMR queries', async () => {
+      setupTestEnv();
+      settings.allowNsfw = true;
+      const origFetch = globalThis.fetch;
+      const queried = [];
+
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        const m = u.match(/query=([^&]+)/);
+        if (m) queried.push(decodeURIComponent(m[1]));
+        if (u.includes('query=asmr%20girlfriend')) {
+          return {
+            ok: true,
+            json: async () => ({
+              videos: [
+                {
+                  id: 'epasmr1',
+                  title: 'Sensual Girlfriend Roleplay ASMR HD',
+                  length_sec: 900,
+                  hd: true,
+                  mp4: 'https://s1.eporner.com/dload/epasmr1/720p.mp4',
+                  url: 'https://www.eporner.com/video-epasmr1/'
+                }
+              ]
+            })
+          };
+        }
+        return { ok: true, json: async () => ({ videos: [] }) };
+      };
+
+      try {
+        const items = await fetchDirectEpornerVideos('girlfriend roleplay asmr', 4, 'GFE ASMR');
+        assert.strictEqual(items.length, 1);
+        assert.strictEqual(items[0].id, 'ep-epasmr1');
+        assert.deepStrictEqual(queried.slice(0, 2), ['girlfriend roleplay asmr', 'asmr girlfriend']);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+  });
 });
+
 
 

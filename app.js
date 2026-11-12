@@ -1,6 +1,6 @@
 // ReelVault — iPhone Random Video Discovery, Multi-Format Puller, Auto-Converter, Reels Mode & Offline Vault PWA
 
-const APP_BUILD_VERSION = 'v40';
+const APP_BUILD_VERSION = 'v41';
 
 const STORAGE_KEYS = {
   SOURCES: 'reelvault_sources_v1',
@@ -194,6 +194,24 @@ const ADULT_PRESET_SOURCES = [
     enabled: true,
     builtIn: true,
     isNsfw: true
+  },
+  {
+    id: 'src-nsfw-asmr-roleplay',
+    type: 'keyword',
+    value: 'asmr roleplay',
+    label: '🔞 ASMR & Sensual Roleplay HD',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
+  },
+  {
+    id: 'src-nsfw-asmr-gfe',
+    type: 'keyword',
+    value: 'asmr tease',
+    label: '🔞 GFE, BFE & Tease ASMR 18+',
+    enabled: true,
+    builtIn: true,
+    isNsfw: true
   }
 ];
 
@@ -214,6 +232,19 @@ const ADULT_DIRECTORY_CATALOG = [
       { id: 'dir-sub-gwcouples', type: 'subreddit', value: 'GWCouples', label: 'r/GWCouples — Real Partners', isNsfw: true },
       { id: 'dir-sub-nsfwcosplay', type: 'subreddit', value: 'nsfwcosplay', label: 'r/nsfwcosplay — Cosplay 18+', isNsfw: true },
       { id: 'dir-sub-altgonewild', type: 'subreddit', value: 'altgonewild', label: 'r/altgonewild — Goth & Alt', isNsfw: true }
+    ]
+  },
+  {
+    category: '🎧 18+ ASMR, Roleplay & GFE',
+    items: [
+      { id: 'dir-tube-asmr-roleplay', type: 'keyword', value: 'asmr roleplay', label: 'Sensual Roleplay ASMR (Full-Length)', isNsfw: true },
+      { id: 'dir-asmr-gfe', type: 'keyword', value: 'girlfriend roleplay asmr', label: 'Girlfriend Experience (GFE) ASMR', isNsfw: true },
+      { id: 'dir-asmr-bfe', type: 'keyword', value: 'boyfriend roleplay asmr', label: 'Boyfriend Experience (BFE) ASMR', isNsfw: true },
+      { id: 'dir-asmr-tease', type: 'keyword', value: 'sensual tease asmr', label: 'Sensual Tease & Whisper ASMR', isNsfw: true },
+      { id: 'dir-tube-gfe-pov', type: 'keyword', value: 'pov girlfriend tease', label: 'POV Girlfriend & Tease Scenes', isNsfw: true },
+      { id: 'dir-rg-asmr-voice', type: 'keyword', value: 'redgifs asmr roleplay', label: 'RedGIFs ASMR & Roleplay (Audio)', isNsfw: true },
+      { id: 'dir-rg-gfe-tease', type: 'keyword', value: 'redgifs asmr tease', label: 'RedGIFs GFE & Tease ASMR (Audio)', isNsfw: true },
+      { id: 'dir-sub-nsfwasmr', type: 'subreddit', value: 'nsfwasmr', label: 'r/nsfwasmr — 18+ ASMR Videos', isNsfw: true }
     ]
   },
   {
@@ -5074,8 +5105,15 @@ const SUBREDDIT_NICHE_QUERY_MAP = {
   petitegonewild: 'petite cute',
   palegirls: 'pale skin girl',
   redheads: 'redhead',
-  latinas: 'latina'
+  latinas: 'latina',
+  nsfwasmr: 'asmr roleplay tease'
 };
+
+function isAudioEssentialQuery(rawText) {
+  return /\b(?:asmr|nsfwasmr|whisper\w*|binaural|roleplay|gfe|bfe|pillow\s*talk|soft\s*spoken|ear\s*lick\w*)\b/i.test(
+    String(rawText || '')
+  );
+}
 
 function getSubredditNicheQuery(rawSubreddit) {
   const clean = String(rawSubreddit || '')
@@ -5209,8 +5247,25 @@ async function fetchDirectEpornerVideos(
 
   const queryCandidates = [primaryQuery];
   const words = primaryQuery.split(' ').filter((w) => w.length >= 3);
+  if (words.length > 2) {
+    const hasAsmr = words.some((w) => /^asmr$/i.test(w));
+    if (hasAsmr) {
+      const nonAsmr = words.find((w) => !/^asmr$/i.test(w));
+      if (nonAsmr) {
+        const pair = `asmr ${nonAsmr.toLowerCase()}`;
+        if (!queryCandidates.includes(pair)) queryCandidates.push(pair);
+      }
+    } else {
+      const pair = `${words[0]} ${words[1]}`;
+      if (!queryCandidates.includes(pair)) queryCandidates.push(pair);
+    }
+  }
   if (words.length > 1) {
-    queryCandidates.push(words[0]);
+    const asmrOrRoleplayWord = words.find((w) => /^(?:asmr|roleplay)$/i.test(w));
+    const singleFallback = asmrOrRoleplayWord ? asmrOrRoleplayWord.toLowerCase() : words[0];
+    if (!queryCandidates.includes(singleFallback)) {
+      queryCandidates.push(singleFallback);
+    }
   }
   if (!queryCandidates.includes('amateur hd')) {
     queryCandidates.push('amateur hd');
@@ -5295,11 +5350,13 @@ async function searchRedgifsVideos(keyword, limit = 6) {
   const results = [];
   const seenIds = new Set();
   const cleanKw = String(keyword || '').replace(/\b(redgifs|nsfw|18\+)\b/gi, '').trim() || 'trending';
+  const requireAudio = isAudioEssentialQuery(keyword);
 
   const appendGifsFromList = (gifs) => {
     if (!Array.isArray(gifs)) return;
     for (const g of gifs) {
       if (!g?.id || seenIds.has(g.id)) continue;
+      if (requireAudio && g.hasAudio === false) continue;
       const hdUrl = g?.urls?.hd || null;
       const sdUrl = g?.urls?.sd || null;
       const mp4Url = hdUrl || sdUrl;
@@ -5338,12 +5395,17 @@ async function searchRedgifsVideos(keyword, limit = 6) {
       appendGifsFromList(data?.gifs);
     }
 
-    // 2. Niche/creator keywords (or when trending returns 0) fall back to 'best' and creator feeds
+    // 2. Niche/creator keywords (or when trending returns 0 voiced clips) fall back to 'best', core ASMR tag, and creator feeds
     if (results.length === 0) {
       const activeToken = cachedRedgifsToken || token;
       const fallbackUrls = [
         `https://api.redgifs.com/v2/gifs/search?search_text=${encodeURIComponent(cleanKw)}&order=best&count=${limit}`
       ];
+      if (requireAudio && cleanKw.includes(' ') && cleanKw.toLowerCase() !== 'asmr') {
+        fallbackUrls.push(
+          `https://api.redgifs.com/v2/gifs/search?search_text=asmr&order=best&count=${limit}`
+        );
+      }
       if (cleanKw.toLowerCase() !== 'trending' && /^[a-zA-Z0-9_.-]{3,30}$/.test(cleanKw)) {
         fallbackUrls.push(
           `https://api.redgifs.com/v2/users/${encodeURIComponent(cleanKw.toLowerCase())}/search?order=new&count=${limit}`
@@ -5390,6 +5452,7 @@ async function searchRedgifsVideos(keyword, limit = 6) {
 function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = false) {
   const children = json?.data?.children || [];
   const results = [];
+  const preferAudioStream = isAudioEssentialQuery(sourceLabel);
 
   for (const child of children) {
     const post = child?.data;
@@ -5398,17 +5461,45 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
     if (!allowSfwFallback && settings.allowNsfw && post.over_18 === false) continue;
 
     const mediaPost = post.crosspost_parent_list?.[0] || post;
+    const redditVid =
+      mediaPost?.secure_media?.reddit_video ||
+      mediaPost?.media?.reddit_video ||
+      null;
 
-    let rawVideoUrl =
-      mediaPost?.secure_media?.reddit_video?.fallback_url ||
-      mediaPost?.media?.reddit_video?.fallback_url ||
+    // Skip silent v.redd.it GIF/mute posts when pulling from an ASMR / roleplay / GFE source
+    if (preferAudioStream && redditVid && (redditVid.is_gif === true || redditVid.has_audio === false)) {
+      continue;
+    }
+
+    const fallbackMp4Url =
+      redditVid?.fallback_url ||
       mediaPost?.preview?.reddit_video_preview?.fallback_url ||
       mediaPost?.preview?.video_preview?.fallback_url ||
       mediaPost?.preview?.images?.[0]?.variants?.mp4?.source?.url ||
       null;
 
+    const hlsUrl = redditVid?.hls_url || null;
+    let rawVideoUrl = null;
+    let redditMp4FallbackUrl = null;
+
+    // On v.redd.it, DASH fallback_url is video-only (no audio track), whereas HLSPlaylist.m3u8 includes muxed audio
+    if (
+      preferAudioStream &&
+      hlsUrl &&
+      redditVid?.is_gif !== true &&
+      redditVid?.has_audio !== false &&
+      isFormatAllowedBySettings('m3u8')
+    ) {
+      rawVideoUrl = hlsUrl;
+      if (fallbackMp4Url && isFormatAllowedBySettings('mp4')) {
+        redditMp4FallbackUrl = fallbackMp4Url;
+      }
+    } else {
+      rawVideoUrl = fallbackMp4Url;
+    }
+
     // Support Reddit Gallery / media_metadata animated MP4 items
-    if (!rawVideoUrl && mediaPost?.media_metadata && typeof mediaPost.media_metadata === 'object') {
+    if (!rawVideoUrl && !preferAudioStream && mediaPost?.media_metadata && typeof mediaPost.media_metadata === 'object') {
       for (const metaItem of Object.values(mediaPost.media_metadata)) {
         const mp4Candidate = metaItem?.s?.mp4 || metaItem?.p?.[metaItem.p.length - 1]?.mp4;
         if (mp4Candidate && typeof mp4Candidate === 'string') {
@@ -5417,11 +5508,6 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         }
       }
     }
-
-    const hlsUrl =
-      mediaPost?.secure_media?.reddit_video?.hls_url ||
-      mediaPost?.media?.reddit_video?.hls_url ||
-      null;
 
     const candidateDirectUrl = mediaPost.url_overridden_by_dest || mediaPost.url;
     let redgifsMediaFallbackUrl = null;
@@ -5484,7 +5570,7 @@ function extractRedditVideosFromListing(json, sourceLabel, allowSfwFallback = fa
         title: post.title || 'Reddit Video Clip',
         videoUrl: normalized.videoUrl,
         originalUrl: normalized.originalUrl,
-        convertedUrl: normalized.convertedUrl || redgifsMediaFallbackUrl,
+        convertedUrl: normalized.convertedUrl || redgifsMediaFallbackUrl || redditMp4FallbackUrl,
         format: normalized.format,
         isAutoConverted: normalized.isAutoConverted,
         isNsfw: Boolean(post.over_18 || settings.allowNsfw),
@@ -5560,9 +5646,13 @@ async function fetchSubredditVideos(subreddit) {
     `https://old.reddit.com/r/${encodedSubPath}/${randomSort}.json?limit=35&include_over_18=${nsfwFlag}&raw_json=1`
   ];
 
+  let sawNonVideoPostsInListing = false;
   for (const url of endpoints) {
     try {
       const json = await fetchWithCorsFallback(url, false);
+      if (Array.isArray(json?.data?.children) && json.data.children.length > 0) {
+        sawNonVideoPostsInListing = true;
+      }
       const extracted = await upgradeUnsignedRedgifsItems(
         extractRedditVideosFromListing(json, `r/${cleanSub}`)
       );
@@ -5573,6 +5663,23 @@ async function fetchSubredditVideos(subreddit) {
       if (sfwOrAll.length > 0) return sfwOrAll;
     } catch {
       // Try alternate Reddit mirror
+    }
+  }
+
+  // If the subreddit listing only had text/audio/external links in its top slice (e.g. r/nsfwasmr),
+  // query v.redd.it & RedGIFs video posts inside that subreddit directly
+  if (sawNonVideoPostsInListing) {
+    try {
+      const videoSearchUrl = `https://www.reddit.com/r/${encodedSubPath}/search.json?q=${encodeURIComponent(
+        'site:redgifs.com OR site:v.redd.it'
+      )}&restrict_sr=on&sort=top&t=all&include_over_18=${nsfwFlag}&limit=35&raw_json=1`;
+      const searchJson = await fetchWithCorsFallback(videoSearchUrl, false);
+      const videoExtracted = await upgradeUnsignedRedgifsItems(
+        extractRedditVideosFromListing(searchJson, `r/${cleanSub}`)
+      );
+      if (videoExtracted.length > 0) return videoExtracted;
+    } catch {
+      // ignore subreddit video search fallback error
     }
   }
 
@@ -13281,6 +13388,7 @@ if (typeof module !== 'undefined' && module.exports) {
     fetchRedgifsApiJson,
     resolveRedgifsUrlToMp4,
     getSubredditNicheQuery,
+    isAudioEssentialQuery,
     fetchDirectEpornerVideos,
     searchRedgifsVideos,
     filterAndSortTubeResults,
