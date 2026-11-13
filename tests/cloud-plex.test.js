@@ -3630,5 +3630,265 @@ exit 0
       fs.rmSync(testRoot, { recursive: true, force: true });
     }
   });
+
+  it('mounts /dev/shm:/transcode in docker-compose.yml and switches Plex TranscoderTempDirectory from /config to /transcode RAM disk', async () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+
+    const composePath = path.resolve(__dirname, '../server/docker-compose.yml');
+    const composeContent = fs.readFileSync(composePath, 'utf8');
+    assert.match(composeContent, /\/dev\/shm:\/transcode/, 'Expected /dev/shm:/transcode volume mount in docker-compose.yml');
+    assert.match(composeContent, /PLEX_TRANSCODE_DIR=\/transcode/, 'Expected PLEX_TRANSCODE_DIR=/transcode in docker-compose.yml');
+
+    const prefsState = new Map([
+      ['FriendlyName', { id: 'FriendlyName', type: 'text', value: 'ReelVault Cloud' }],
+      ['acceptedEULA', { id: 'acceptedEULA', type: 'bool', value: true }],
+      ['PublishServerOnPlexOnlineKey', { id: 'PublishServerOnPlexOnlineKey', type: 'bool', value: true }],
+      ['ManualPortMappingMode', { id: 'ManualPortMappingMode', type: 'bool', value: true }],
+      ['ManualPortMappingPort', { id: 'ManualPortMappingPort', type: 'int', value: 32400 }],
+      ['secureConnections', { id: 'secureConnections', type: 'int', value: 1 }],
+      [
+        'customConnections',
+        {
+          id: 'customConnections',
+          type: 'text',
+          value: 'https://plex-85-239-249-225.nip.io:443,http://85.239.249.225:32400'
+        }
+      ],
+      [
+        'TranscoderTempDirectory',
+        {
+          id: 'TranscoderTempDirectory',
+          type: 'text',
+          value: '/config/Library/Application Support/Plex Media Server/Cache/Transcode'
+        }
+      ]
+    ]);
+
+    const mockPlex = http.createServer((req, res) => {
+      const u = new URL(req.url, 'http://127.0.0.1');
+      if (u.searchParams.get('X-Plex-Token') !== 'plex_ramdisk_tok') {
+        res.writeHead(401);
+        return res.end();
+      }
+      if (req.method === 'GET' && u.pathname === '/:/prefs') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(
+          JSON.stringify({
+            MediaContainer: { Setting: Array.from(prefsState.values()) }
+          })
+        );
+      }
+      if (req.method === 'PUT' && u.pathname === '/:/prefs') {
+        for (const [k, v] of u.searchParams.entries()) {
+          if (k === 'X-Plex-Token') continue;
+          const existing = prefsState.get(k);
+          if (!existing) {
+            res.writeHead(400);
+            return res.end(`unknown preference ${k}`);
+          }
+          existing.value = v;
+        }
+        res.writeHead(200);
+        return res.end();
+      }
+      if (req.method === 'PUT' && u.pathname === '/myplex/refreshReachability') {
+        res.writeHead(200);
+        return res.end();
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockPlex.listen(0, '127.0.0.1', resolve));
+    const plexUrl = `http://127.0.0.1:${mockPlex.address().port}`;
+
+    try {
+      // 1. Migrates /config/... NVMe transcode path to /transcode RAM disk
+      const sync1 = await bridge.ensurePlexRemoteConnectivity('plex_ramdisk_tok', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+      assert.strictEqual(sync1.synced, true);
+      assert.ok(sync1.updated.includes('TranscoderTempDirectory'));
+      assert.strictEqual(sync1.transcodeDir, '/transcode');
+      assert.strictEqual(prefsState.get('TranscoderTempDirectory').value, '/transcode');
+
+      // 2. Idempotent on subsequent syncs
+      const sync2 = await bridge.ensurePlexRemoteConnectivity('plex_ramdisk_tok', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+      assert.deepStrictEqual(sync2.updated, []);
+
+      // 3. Also upgrades empty default "" TranscoderTempDirectory to /transcode
+      prefsState.get('TranscoderTempDirectory').value = '';
+      const sync3 = await bridge.ensurePlexRemoteConnectivity('plex_ramdisk_tok', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+      assert.deepStrictEqual(sync3.updated, ['TranscoderTempDirectory']);
+      assert.strictEqual(prefsState.get('TranscoderTempDirectory').value, '/transcode');
+
+      // 4. Preserves custom non-/config paths if manually configured by operator
+      prefsState.get('TranscoderTempDirectory').value = '/mnt/custom-ramdisk';
+      const sync4 = await bridge.ensurePlexRemoteConnectivity('plex_ramdisk_tok', {
+        plexUrl,
+        plexDomain: 'plex-85-239-249-225.nip.io',
+        vpsIp: '85.239.249.225'
+      });
+      assert.deepStrictEqual(sync4.updated, []);
+      assert.strictEqual(prefsState.get('TranscoderTempDirectory').value, '/mnt/custom-ramdisk');
+    } finally {
+      await new Promise((resolve) => mockPlex.close(resolve));
+    }
+  });
+
+  it('enforces per-IP brute-force auth rate limiting with Retry-After, anti-spoofing IP extraction, and bounded memory', async () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+
+    // 1. Caddyfile injects X-Real-Client-Ip from real TCP {remote_host}
+    const caddyPath = path.resolve(__dirname, '../server/Caddyfile');
+    const caddyContent = fs.readFileSync(caddyPath, 'utf8');
+    assert.match(caddyContent, /header_up\s+X-Real-Client-Ip\s+\{remote_host\}/);
+
+    // 2. Anti-spoofing IP extraction unit checks
+    assert.strictEqual(bridge.isTrustedLocalProxyPeer('127.0.0.1'), true);
+    assert.strictEqual(bridge.isTrustedLocalProxyPeer('::ffff:172.18.0.3'), true);
+    assert.strictEqual(bridge.isTrustedLocalProxyPeer('198.51.100.99'), false);
+    assert.strictEqual(bridge.isTrustedLocalProxyPeer('85.239.249.225'), false);
+
+    // Direct non-proxy peer trying to spoof X-Real-Client-Ip & X-Forwarded-For is ignored
+    assert.strictEqual(
+      bridge.extractClientIp({
+        socket: { remoteAddress: '203.0.113.42' },
+        headers: {
+          'x-real-client-ip': '1.1.1.1',
+          'x-forwarded-for': '1.1.1.1'
+        }
+      }),
+      '203.0.113.42'
+    );
+
+    // Trusted Docker Caddy peer with X-Real-Client-Ip overrides spoofed X-Forwarded-For
+    assert.strictEqual(
+      bridge.extractClientIp({
+        socket: { remoteAddress: '::ffff:172.18.0.3' },
+        headers: {
+          'x-real-client-ip': '198.51.100.99',
+          'x-forwarded-for': '1.1.1.1, 198.51.100.99'
+        }
+      }),
+      '198.51.100.99'
+    );
+
+    // Fallback X-Forwarded-For without X-Real-Client-Ip takes rightmost non-proxy hop (never leftmost spoofed IP)
+    assert.strictEqual(
+      bridge.extractClientIp({
+        socket: { remoteAddress: '127.0.0.1' },
+        headers: {
+          'x-forwarded-for': '1.1.1.1, 198.51.100.99'
+        }
+      }),
+      '198.51.100.99'
+    );
+
+    // 3. Bounded memory check (hard cap of 5,000 tracked IPs)
+    let unitClock = 1_000_000;
+    const boundedLimiter = bridge.createAuthRateLimiter({
+      maxFailures: 10,
+      windowMs: 10 * 60 * 1000,
+      lockoutMs: 15 * 60 * 1000,
+      maxEntries: 5000,
+      now: () => unitClock
+    });
+    for (let i = 0; i < 5250; i++) {
+      const octet2 = Math.floor(i / 65536) % 256;
+      const octet3 = Math.floor(i / 256) % 256;
+      const octet4 = (i % 254) + 1;
+      boundedLimiter.recordFailure(`45.${octet2}.${octet3}.${octet4}`);
+    }
+    assert.strictEqual(boundedLimiter.size(), 5000, 'Tracked IP map must never exceed 5,000 entries');
+
+    // 4. End-to-end HTTP lockout, Retry-After header, open unauthenticated /health, and 15m expiry
+    let fakeNow = 2_000_000_000;
+    const srv = bridge.createBridgeServer({
+      now: () => fakeNow
+    });
+    await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${srv.address().port}`;
+
+    try {
+      // First 9 wrong attempts in 10m return 401
+      for (let attempt = 1; attempt <= 9; attempt++) {
+        const res = await fetch(`${base}/plex/jobs`, {
+          headers: {
+            Authorization: `Bearer bad_attempt_${attempt}`,
+            'X-Real-Client-Ip': '198.51.100.55'
+          }
+        });
+        assert.strictEqual(res.status, 401, `Expected 401 on attempt ${attempt}`);
+      }
+
+      // 10th failed attempt within 10m triggers 15m lockout with HTTP 429 + Retry-After: 900
+      const tenth = await fetch(`${base}/plex/jobs`, {
+        headers: {
+          Authorization: 'Bearer bad_attempt_10',
+          'X-Real-Client-Ip': '198.51.100.55'
+        }
+      });
+      assert.strictEqual(tenth.status, 429);
+      assert.strictEqual(tenth.headers.get('retry-after'), '900');
+      assert.match(tenth.headers.get('access-control-expose-headers') || '', /Retry-After/);
+      const tenthBody = await tenth.json();
+      assert.strictEqual(tenthBody.ok, false);
+      assert.strictEqual(tenthBody.retryAfterSeconds, 900);
+
+      // Even the VALID API key from locked-out IP is rejected with 429 during the 15m lockout
+      fakeNow += 5 * 60 * 1000; // +5m -> 10m (600s) remaining
+      const blockedValid = await fetch(`${base}/plex/jobs`, {
+        headers: {
+          Authorization: 'Bearer rv_unit_test_secret_key_123456',
+          'X-Real-Client-Ip': '198.51.100.55'
+        }
+      });
+      assert.strictEqual(blockedValid.status, 429);
+      assert.strictEqual(blockedValid.headers.get('retry-after'), '600');
+
+      // Unauthenticated /health probe remains open (200) for auto-update.sh & Caddy uptime checks
+      const openHealth = await fetch(`${base}/health`, {
+        headers: { 'X-Real-Client-Ip': '198.51.100.55' }
+      });
+      assert.strictEqual(openHealth.status, 200);
+      const openHealthJson = await openHealth.json();
+      assert.strictEqual(openHealthJson.ok, true);
+      assert.strictEqual(openHealthJson.service, 'reelvault-bridge');
+
+      // Other client IPs are completely unaffected
+      const otherIpOk = await fetch(`${base}/plex/jobs`, {
+        headers: {
+          Authorization: 'Bearer rv_unit_test_secret_key_123456',
+          'X-Real-Client-Ip': '203.0.113.88'
+        }
+      });
+      assert.strictEqual(otherIpOk.status, 200);
+
+      // Once 15 minutes have elapsed, lockout expires cleanly
+      fakeNow += 10 * 60 * 1000 + 1000; // total +15m 1s
+      const recovered = await fetch(`${base}/plex/jobs`, {
+        headers: {
+          Authorization: 'Bearer rv_unit_test_secret_key_123456',
+          'X-Real-Client-Ip': '198.51.100.55'
+        }
+      });
+      assert.strictEqual(recovered.status, 200);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  });
 });
 

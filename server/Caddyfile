@@ -1,6 +1,7 @@
 {$BRIDGE_DOMAIN} {
 	encode zstd gzip
 	reverse_proxy reelvault-bridge:8787 {
+		header_up X-Real-Client-Ip {remote_host}
 		flush_interval -1
 	}
 }

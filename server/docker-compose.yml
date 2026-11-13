@@ -9,8 +9,10 @@ services:
       - TZ=${TZ:-America/New_York}
       - VERSION=docker
       - PLEX_CLAIM=${PLEX_CLAIM:-}
+      - PLEX_TRANSCODE_DIR=/transcode
     volumes:
       - ./plex-config:/config
+      - /dev/shm:/transcode
       - ./media/safe:/data/safe
       - ./media/vault-18:/data/vault-18
     restart: unless-stopped
@@ -31,6 +33,7 @@ services:
       - VPS_IP=${VPS_IP:-}
       - PLEX_DOMAIN=${PLEX_DOMAIN:-}
       - PLEX_PREFS_PATH=/plex-config/Library/Application Support/Plex Media Server/Preferences.xml
+      - PLEX_TRANSCODE_DIR=/transcode
       - MEDIA_SAFE_DIR=/data/safe
       - MEDIA_NSFW_DIR=/data/vault-18
     volumes:

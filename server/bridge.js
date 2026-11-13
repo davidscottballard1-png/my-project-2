@@ -25,8 +25,14 @@ const PLEX_DOMAIN = String(process.env.PLEX_DOMAIN || '').trim();
 const PLEX_PREFS_PATH =
   process.env.PLEX_PREFS_PATH ||
   '/plex-config/Library/Application Support/Plex Media Server/Preferences.xml';
+const PLEX_TRANSCODE_DIR = String(process.env.PLEX_TRANSCODE_DIR || '/transcode').trim();
 const MEDIA_SAFE_DIR = process.env.MEDIA_SAFE_DIR || '/data/safe';
 const MEDIA_NSFW_DIR = process.env.MEDIA_NSFW_DIR || '/data/vault-18';
+
+const AUTH_RATE_LIMIT_MAX_FAILURES = 10;
+const AUTH_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const AUTH_RATE_LIMIT_LOCKOUT_MS = 15 * 60 * 1000;
+const AUTH_RATE_LIMIT_MAX_IPS = 5000;
 
 const BROWSER_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
@@ -190,20 +196,258 @@ function setCorsHeaders(res) {
   );
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Content-Length, Content-Range, Accept-Ranges, Content-Type'
+    'Content-Length, Content-Range, Accept-Ranges, Content-Type, Retry-After'
   );
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res, statusCode, payload, extraHeaders = null) {
   setCorsHeaders(res);
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
+    'Content-Length': Buffer.byteLength(body),
+    ...(extraHeaders && typeof extraHeaders === 'object' ? extraHeaders : {})
   });
   res.end(body);
+}
+
+function normalizeIpAddress(rawIp) {
+  let clean = String(rawIp || '').trim();
+  if (!clean) return '';
+
+  const bracketedV6 = clean.match(/^\[([^\]]+)\](?::\d+)?$/);
+  if (bracketedV6) {
+    clean = bracketedV6[1].trim();
+  } else {
+    const v4WithPort = clean.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/);
+    if (v4WithPort) {
+      clean = v4WithPort[1];
+    }
+  }
+
+  clean = clean.replace(/%[0-9a-z_.-]+$/i, '').toLowerCase();
+
+  const v4Mapped = clean.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (v4Mapped) {
+    clean = v4Mapped[1];
+  } else {
+    const v4MappedHex = clean.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (v4MappedHex) {
+      const hi = parseInt(v4MappedHex[1], 16);
+      const lo = parseInt(v4MappedHex[2], 16);
+      clean = `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`;
+    }
+  }
+
+  return net.isIP(clean) ? clean : '';
+}
+
+function isTrustedLocalProxyPeer(ip) {
+  const clean = normalizeIpAddress(ip);
+  if (!clean) return false;
+
+  const ver = net.isIP(clean);
+  if (ver === 4) {
+    const [a, b] = clean.split('.').map(Number);
+    if (a === 127 || a === 10) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+
+  if (ver === 6) {
+    if (clean === '::1') return true;
+    if (clean.startsWith('fc') || clean.startsWith('fd')) return true;
+    if (/^fe[89ab]/i.test(clean)) return true;
+    return false;
+  }
+
+  return false;
+}
+
+function extractClientIp(req) {
+  const peerIp = normalizeIpAddress(
+    req?.socket?.remoteAddress || req?.connection?.remoteAddress || ''
+  );
+  if (!peerIp) return 'unknown';
+
+  if (!isTrustedLocalProxyPeer(peerIp)) {
+    return peerIp;
+  }
+
+  const realHeader = req?.headers?.['x-real-client-ip'];
+  const rawReal = Array.isArray(realHeader) ? realHeader[realHeader.length - 1] : realHeader;
+  if (rawReal) {
+    const realTokens = String(rawReal).split(',');
+    for (let i = realTokens.length - 1; i >= 0; i--) {
+      const candidate = normalizeIpAddress(realTokens[i]);
+      if (candidate) return candidate;
+    }
+  }
+
+  const xffHeader = req?.headers?.['x-forwarded-for'];
+  const rawXff = Array.isArray(xffHeader) ? xffHeader.join(',') : xffHeader;
+  if (rawXff) {
+    const hops = String(rawXff).split(',');
+    let rightmostValid = '';
+    for (let i = hops.length - 1; i >= 0; i--) {
+      const candidate = normalizeIpAddress(hops[i]);
+      if (!candidate) continue;
+      if (!rightmostValid) rightmostValid = candidate;
+      if (!isTrustedLocalProxyPeer(candidate)) {
+        return candidate;
+      }
+    }
+    if (rightmostValid) return rightmostValid;
+  }
+
+  return peerIp;
+}
+
+function createAuthRateLimiter(opts = {}) {
+  const maxFailures =
+    Number.isInteger(opts.maxFailures) && opts.maxFailures > 0
+      ? opts.maxFailures
+      : AUTH_RATE_LIMIT_MAX_FAILURES;
+  const windowMs =
+    Number.isFinite(opts.windowMs) && opts.windowMs > 0
+      ? opts.windowMs
+      : AUTH_RATE_LIMIT_WINDOW_MS;
+  const lockoutMs =
+    Number.isFinite(opts.lockoutMs) && opts.lockoutMs > 0
+      ? opts.lockoutMs
+      : AUTH_RATE_LIMIT_LOCKOUT_MS;
+  const maxEntries =
+    Number.isInteger(opts.maxEntries) && opts.maxEntries > 0
+      ? opts.maxEntries
+      : AUTH_RATE_LIMIT_MAX_IPS;
+  const nowFn = typeof opts.now === 'function' ? opts.now : () => Date.now();
+
+  const entries = new Map();
+
+  const isExpired = (entry, ts) => {
+    if (entry.blockedUntil > 0) {
+      return entry.blockedUntil <= ts;
+    }
+    return ts - entry.firstFailureAt >= windowMs;
+  };
+
+  const pruneForCapacity = (ts) => {
+    if (entries.size < maxEntries) return;
+    for (const [k, v] of entries) {
+      if (isExpired(v, ts)) {
+        entries.delete(k);
+      }
+    }
+    while (entries.size >= maxEntries) {
+      const oldestKey = entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      entries.delete(oldestKey);
+    }
+  };
+
+  const normalizeKey = (ip) => normalizeIpAddress(ip) || String(ip || 'unknown').trim() || 'unknown';
+
+  return {
+    check(ip) {
+      const key = normalizeKey(ip);
+      const entry = entries.get(key);
+      if (!entry) {
+        return { allowed: true, remaining: maxFailures, retryAfterSec: 0 };
+      }
+      const ts = nowFn();
+      if (entry.blockedUntil > ts) {
+        const retryAfterSec = Math.max(1, Math.ceil((entry.blockedUntil - ts) / 1000));
+        return {
+          allowed: false,
+          remaining: 0,
+          retryAfterSec,
+          blockedUntil: entry.blockedUntil
+        };
+      }
+      if (isExpired(entry, ts)) {
+        entries.delete(key);
+        return { allowed: true, remaining: maxFailures, retryAfterSec: 0 };
+      }
+      return {
+        allowed: true,
+        remaining: Math.max(0, maxFailures - entry.count),
+        retryAfterSec: 0
+      };
+    },
+
+    recordFailure(ip) {
+      const key = normalizeKey(ip);
+      const ts = nowFn();
+      let entry = entries.get(key);
+
+      if (entry && entry.blockedUntil > ts) {
+        entries.delete(key);
+        entries.set(key, entry);
+        const retryAfterSec = Math.max(1, Math.ceil((entry.blockedUntil - ts) / 1000));
+        return {
+          blocked: true,
+          count: entry.count,
+          remaining: 0,
+          retryAfterSec,
+          blockedUntil: entry.blockedUntil
+        };
+      }
+
+      if (!entry || isExpired(entry, ts)) {
+        if (entry) entries.delete(key);
+        pruneForCapacity(ts);
+        entry = {
+          count: 1,
+          firstFailureAt: ts,
+          lastFailureAt: ts,
+          blockedUntil: 0
+        };
+      } else {
+        entry.count += 1;
+        entry.lastFailureAt = ts;
+        entries.delete(key);
+      }
+
+      if (entry.count >= maxFailures) {
+        entry.blockedUntil = ts + lockoutMs;
+        entries.set(key, entry);
+        const retryAfterSec = Math.max(1, Math.ceil(lockoutMs / 1000));
+        return {
+          blocked: true,
+          count: entry.count,
+          remaining: 0,
+          retryAfterSec,
+          blockedUntil: entry.blockedUntil
+        };
+      }
+
+      entries.set(key, entry);
+      return {
+        blocked: false,
+        count: entry.count,
+        remaining: Math.max(0, maxFailures - entry.count),
+        retryAfterSec: 0,
+        blockedUntil: 0
+      };
+    },
+
+    recordSuccess(ip) {
+      const key = normalizeKey(ip);
+      const entry = entries.get(key);
+      if (!entry) return;
+      const ts = nowFn();
+      if (entry.blockedUntil <= ts) {
+        entries.delete(key);
+      }
+    },
+
+    size() {
+      return entries.size;
+    }
+  };
 }
 
 function buildUpstreamReferer(parsedUrl, rawRefererOverride = '') {
@@ -2243,6 +2487,21 @@ async function ensurePlexRemoteConnectivity(token, opts = {}) {
     updates.push([secureSetting.id, '1']);
   }
 
+  const desiredTranscodeDir = String(
+    opts.transcodeDir !== undefined ? opts.transcodeDir : PLEX_TRANSCODE_DIR
+  ).trim();
+  const transcodeSetting = findSetting('TranscoderTempDirectory');
+  let transcodeDir = String(transcodeSetting?.value || '').trim();
+  if (
+    transcodeSetting &&
+    desiredTranscodeDir &&
+    (!transcodeDir || /^\/config(?:\/|$)/i.test(transcodeDir)) &&
+    transcodeDir !== desiredTranscodeDir
+  ) {
+    transcodeDir = desiredTranscodeDir;
+    updates.push([transcodeSetting.id, desiredTranscodeDir]);
+  }
+
   const customConnSetting = findSetting('customConnections');
   const desiredUrls = buildDesiredCustomConnections(plexDomain, vpsIp);
   let customConnections = String(customConnSetting?.value || '').trim();
@@ -2300,7 +2559,8 @@ async function ensurePlexRemoteConnectivity(token, opts = {}) {
     synced: true,
     updated: appliedKeys,
     friendlyName: friendlyName || null,
-    customConnections: customConnections || null
+    customConnections: customConnections || null,
+    transcodeDir: transcodeDir || null
   };
 }
 
@@ -2999,7 +3259,19 @@ async function handlePlexSaveRequest(req, res) {
   });
 }
 
-function createBridgeServer() {
+function createBridgeServer(options = {}) {
+  const expectedKey = options.apiKey !== undefined ? String(options.apiKey || '').trim() : API_KEY;
+  const authLimiter =
+    options.authRateLimiter ||
+    options.rateLimiter ||
+    createAuthRateLimiter({
+      maxFailures: options.maxAuthFailures,
+      windowMs: options.authWindowMs,
+      lockoutMs: options.authLockoutMs,
+      maxEntries: options.maxTrackedAuthIps,
+      now: options.now
+    });
+
   return http.createServer(async (req, res) => {
     try {
       if (req.method === 'OPTIONS') {
@@ -3018,13 +3290,51 @@ function createBridgeServer() {
       const pathname = parsedUrl.pathname.replace(/\/+$/, '') || '/';
       const providedKey = extractProvidedApiKey(req, parsedUrl);
 
-      if (pathname === '/health' || pathname === '/') {
-        if (!providedKey) {
-          return sendJson(res, 200, { ok: true, service: 'reelvault-bridge' });
+      if ((pathname === '/health' || pathname === '/') && !providedKey) {
+        return sendJson(res, 200, { ok: true, service: 'reelvault-bridge' });
+      }
+
+      const clientIp = extractClientIp(req);
+      const preCheck = authLimiter.check(clientIp);
+      if (!preCheck.allowed) {
+        return sendJson(
+          res,
+          429,
+          {
+            ok: false,
+            error: 'Too many failed authentication attempts. Please try again later.',
+            retryAfterSeconds: preCheck.retryAfterSec
+          },
+          { 'Retry-After': String(preCheck.retryAfterSec) }
+        );
+      }
+
+      if (!verifyApiKey(providedKey, expectedKey)) {
+        const failure = authLimiter.recordFailure(clientIp);
+        if (failure.blocked) {
+          return sendJson(
+            res,
+            429,
+            {
+              ok: false,
+              error: 'Too many failed authentication attempts. Please try again later.',
+              retryAfterSeconds: failure.retryAfterSec
+            },
+            { 'Retry-After': String(failure.retryAfterSec) }
+          );
         }
-        if (!verifyApiKey(providedKey)) {
+        if (pathname === '/health' || pathname === '/') {
           return sendJson(res, 401, { ok: false, error: 'Invalid API Secret Key' });
         }
+        return sendJson(res, 401, {
+          ok: false,
+          error: 'Unauthorized: missing or invalid API Secret Key'
+        });
+      }
+
+      authLimiter.recordSuccess(clientIp);
+
+      if (pathname === '/health' || pathname === '/') {
         const forceRefresh = parsedUrl.searchParams.get('refreshPlex') === '1';
         const plex = await ensurePlexLibraries({ forceRefresh });
         return sendJson(res, 200, {
@@ -3035,10 +3345,6 @@ function createBridgeServer() {
           plex,
           activeJobs: activeWorkers + jobQueue.length
         });
-      }
-
-      if (!verifyApiKey(providedKey)) {
-        return sendJson(res, 401, { ok: false, error: 'Unauthorized: missing or invalid API Secret Key' });
       }
 
       if (pathname === '/proxy' && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -3099,6 +3405,9 @@ if (require.main === module) {
 
 module.exports = {
   isPrivateOrReservedIp,
+  isTrustedLocalProxyPeer,
+  extractClientIp,
+  createAuthRateLimiter,
   assertSafePublicUrl,
   verifyApiKey,
   extractProvidedApiKey,
